@@ -16,6 +16,7 @@ import (
 	"github.com/enjoys-in/cal-dev/internal/jmap"
 	"github.com/enjoys-in/cal-dev/internal/jobs"
 	"github.com/enjoys-in/cal-dev/internal/middleware"
+	"github.com/enjoys-in/cal-dev/internal/response"
 	"github.com/enjoys-in/cal-dev/internal/scheduling"
 	"github.com/enjoys-in/cal-dev/internal/store"
 	extsync "github.com/enjoys-in/cal-dev/internal/sync"
@@ -122,7 +123,7 @@ func main() {
 	// Health Check
 	// ============================================================
 	app.Get("/health", func(c *fiber.Ctx) error {
-		return c.JSON(fiber.Map{
+		return response.Success(c, "service is healthy", fiber.Map{
 			"status":  "ok",
 			"service": "caldev",
 			"time":    time.Now().UTC().Format(time.RFC3339),
@@ -189,6 +190,14 @@ func main() {
 	appPwGroup := app.Group("/api/app-passwords", middleware.JMAPAuth(authSvc, db))
 	appPwGroup.Post("/", createAppPasswordHandler(db))
 	appPwGroup.Delete("/:id", deleteAppPasswordHandler(db))
+
+	// ============================================================
+	// Scheduling — Inbound iMIP (RSVP replies) & User RSVP
+	// ============================================================
+	schedulingHandler := scheduling.NewHandler(schedulingSvc)
+	schedGroup := app.Group("/api/scheduling", middleware.JMAPAuth(authSvc, db))
+	schedGroup.Post("/incoming", schedulingHandler.IncomingIMIP)
+	schedGroup.Post("/rsvp", schedulingHandler.RSVPRespond)
 
 	// ============================================================
 	// Calendar Subscriptions — Import from Google/Outlook/any ICS
@@ -278,15 +287,15 @@ func createAppPasswordHandler(db *store.Store) fiber.Handler {
 			Password string `json:"password"`
 		}
 		if err := c.BodyParser(&req); err != nil {
-			return c.Status(400).JSON(fiber.Map{"error": "invalid request"})
+			return response.Error(c, 400, "invalid request")
 		}
 		if req.Password == "" {
-			return c.Status(400).JSON(fiber.Map{"error": "password required"})
+			return response.Error(c, 400, "password required")
 		}
 
 		hash, err := auth.HashPassword(req.Password)
 		if err != nil {
-			return c.Status(500).JSON(fiber.Map{"error": "password hash failed"})
+			return response.Error(c, 500, "password hash failed")
 		}
 
 		ap := &store.AppPasswordInput{
@@ -296,13 +305,12 @@ func createAppPasswordHandler(db *store.Store) fiber.Handler {
 		}
 
 		if err := db.CreateAppPasswordFromInput(c.UserContext(), ap); err != nil {
-			return c.Status(500).JSON(fiber.Map{"error": "create failed"})
+			return response.Error(c, 500, "create failed")
 		}
 
-		return c.Status(201).JSON(fiber.Map{
-			"id":      ap.ID,
-			"label":   ap.Label,
-			"message": "App password created. Use your email + this password for CalDAV Basic Auth.",
+		return response.Created(c, "App password created. Use your email + this password for CalDAV Basic Auth.", fiber.Map{
+			"id":    ap.ID,
+			"label": ap.Label,
 		})
 	}
 }
@@ -312,7 +320,7 @@ func deleteAppPasswordHandler(db *store.Store) fiber.Handler {
 	return func(c *fiber.Ctx) error {
 		id := c.Params("id")
 		if err := db.DeleteAppPassword(c.UserContext(), id); err != nil {
-			return c.Status(500).JSON(fiber.Map{"error": "delete failed"})
+			return response.Error(c, 500, "delete failed")
 		}
 		return c.SendStatus(204)
 	}

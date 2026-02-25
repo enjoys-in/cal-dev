@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/enjoys-in/cal-dev/internal/models"
+	"github.com/enjoys-in/cal-dev/internal/response"
 	"github.com/enjoys-in/cal-dev/internal/store"
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
@@ -28,13 +29,13 @@ func (h *Handler) List(c *fiber.Ctx) error {
 
 	subs, err := h.store.GetSubscriptionsByUser(c.UserContext(), tenantID, userID)
 	if err != nil {
-		return c.Status(500).JSON(fiber.Map{"error": "failed to list subscriptions"})
+		return response.Error(c, 500, "failed to list subscriptions")
 	}
 	if subs == nil {
 		subs = []*models.CalendarSubscription{}
 	}
 
-	return c.JSON(fiber.Map{
+	return response.Success(c, "subscriptions retrieved", fiber.Map{
 		"subscriptions": subs,
 		"help": fiber.Map{
 			"google_calendar": "Settings → calendar → Integrate → Secret address in iCal format",
@@ -61,10 +62,10 @@ func (h *Handler) Create(c *fiber.Ctx) error {
 		CalendarID      string `json:"calendar_id"` // optional — if empty, auto-create
 	}
 	if err := c.BodyParser(&req); err != nil {
-		return c.Status(400).JSON(fiber.Map{"error": "invalid request body"})
+		return response.Error(c, 400, "invalid request body")
 	}
 	if req.SourceURL == "" {
-		return c.Status(400).JSON(fiber.Map{"error": "source_url is required"})
+		return response.Error(c, 400, "source_url is required")
 	}
 
 	// Defaults
@@ -115,7 +116,7 @@ func (h *Handler) Create(c *fiber.Ctx) error {
 			SyncToken:           "",
 		}
 		if err := h.store.CreateCalendar(c.UserContext(), cal); err != nil {
-			return c.Status(500).JSON(fiber.Map{"error": "failed to create calendar"})
+			return response.Error(c, 500, "failed to create calendar")
 		}
 		calendarID = cal.ID
 	}
@@ -136,7 +137,7 @@ func (h *Handler) Create(c *fiber.Ctx) error {
 	}
 
 	if err := h.store.CreateSubscription(c.UserContext(), sub); err != nil {
-		return c.Status(500).JSON(fiber.Map{"error": "failed to create subscription"})
+		return response.Error(c, 500, "failed to create subscription")
 	}
 
 	// Trigger immediate first sync in background
@@ -147,10 +148,9 @@ func (h *Handler) Create(c *fiber.Ctx) error {
 		}
 	}()
 
-	return c.Status(201).JSON(fiber.Map{
+	return response.Created(c, "Subscription created. First sync is running in the background.", fiber.Map{
 		"subscription": sub,
 		"calendar_id":  calendarID,
-		"message":      "Subscription created. First sync is running in the background.",
 	})
 }
 
@@ -162,13 +162,13 @@ func (h *Handler) Get(c *fiber.Ctx) error {
 
 	sub, err := h.store.GetSubscription(c.UserContext(), tenantID, subID)
 	if err != nil {
-		return c.Status(500).JSON(fiber.Map{"error": "failed to get subscription"})
+		return response.Error(c, 500, "failed to get subscription")
 	}
 	if sub == nil {
-		return c.Status(404).JSON(fiber.Map{"error": "subscription not found"})
+		return response.Error(c, 404, "subscription not found")
 	}
 
-	return c.JSON(fiber.Map{"subscription": sub})
+	return response.Success(c, "subscription retrieved", fiber.Map{"subscription": sub})
 }
 
 // Update modifies a subscription.
@@ -179,7 +179,7 @@ func (h *Handler) Update(c *fiber.Ctx) error {
 
 	existing, err := h.store.GetSubscription(c.UserContext(), tenantID, subID)
 	if err != nil || existing == nil {
-		return c.Status(404).JSON(fiber.Map{"error": "subscription not found"})
+		return response.Error(c, 404, "subscription not found")
 	}
 
 	var req struct {
@@ -192,7 +192,7 @@ func (h *Handler) Update(c *fiber.Ctx) error {
 		SyncInterval    *int    `json:"sync_interval"`
 	}
 	if err := c.BodyParser(&req); err != nil {
-		return c.Status(400).JSON(fiber.Map{"error": "invalid request body"})
+		return response.Error(c, 400, "invalid request body")
 	}
 
 	if req.DisplayName != nil {
@@ -221,10 +221,10 @@ func (h *Handler) Update(c *fiber.Ctx) error {
 	}
 
 	if err := h.store.UpdateSubscription(c.UserContext(), existing); err != nil {
-		return c.Status(500).JSON(fiber.Map{"error": "failed to update subscription"})
+		return response.Error(c, 500, "failed to update subscription")
 	}
 
-	return c.JSON(fiber.Map{"subscription": existing})
+	return response.Success(c, "subscription updated", fiber.Map{"subscription": existing})
 }
 
 // Delete removes a subscription and optionally its calendar.
@@ -236,11 +236,11 @@ func (h *Handler) Delete(c *fiber.Ctx) error {
 
 	sub, err := h.store.GetSubscription(c.UserContext(), tenantID, subID)
 	if err != nil || sub == nil {
-		return c.Status(404).JSON(fiber.Map{"error": "subscription not found"})
+		return response.Error(c, 404, "subscription not found")
 	}
 
 	if err := h.store.DeleteSubscription(c.UserContext(), tenantID, subID); err != nil {
-		return c.Status(500).JSON(fiber.Map{"error": "failed to delete subscription"})
+		return response.Error(c, 500, "failed to delete subscription")
 	}
 
 	if deleteCalendar {
@@ -259,15 +259,12 @@ func (h *Handler) SyncNow(c *fiber.Ctx) error {
 
 	sub, err := h.store.GetSubscription(c.UserContext(), tenantID, subID)
 	if err != nil || sub == nil {
-		return c.Status(404).JSON(fiber.Map{"error": "subscription not found"})
+		return response.Error(c, 404, "subscription not found")
 	}
 
 	// Run sync synchronously so the user gets immediate feedback
 	if err := h.service.SyncSubscription(c.UserContext(), sub); err != nil {
-		return c.Status(500).JSON(fiber.Map{
-			"error":   "sync failed",
-			"details": err.Error(),
-		})
+		return response.Error(c, 500, "sync failed", err.Error())
 	}
 
 	// Refresh subscription state
@@ -276,8 +273,7 @@ func (h *Handler) SyncNow(c *fiber.Ctx) error {
 		updated = sub
 	}
 
-	return c.JSON(fiber.Map{
-		"message":      "Sync completed successfully",
+	return response.Success(c, "Sync completed successfully", fiber.Map{
 		"subscription": updated,
 	})
 }

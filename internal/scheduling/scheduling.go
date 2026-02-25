@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"log"
 	"net/smtp"
+	"strings"
+	"time"
 
 	"github.com/enjoys-in/cal-dev/internal/config"
 	"github.com/enjoys-in/cal-dev/internal/ics"
@@ -184,6 +186,92 @@ func (svc *Service) ProcessReply(ctx context.Context, tenantID, eventUID, attend
 // SendCancellation sends a METHOD:CANCEL for a deleted event.
 func (svc *Service) SendCancellation(ctx context.Context, event *models.Event) error {
 	return svc.ProcessEvent(ctx, event, "CANCEL")
+}
+
+// SendReplyToOrganizer sends a METHOD:REPLY email to the event organizer
+// when an attendee RSVPs (accept/decline/tentative).
+func (svc *Service) SendReplyToOrganizer(ctx context.Context, tenantID, eventUID, attendeeEmail, partstat string) error {
+	events, err := svc.store.QueryEvents(ctx, &models.EventFilter{
+		TenantID: tenantID,
+		UIDs:     []string{eventUID},
+	})
+	if err != nil || len(events) == 0 {
+		return fmt.Errorf("event not found: %s", eventUID)
+	}
+
+	event := events[0]
+
+	// Extract organizer email
+	organizerEmail := event.Organizer
+	if strings.HasPrefix(strings.ToLower(organizerEmail), "mailto:") {
+		organizerEmail = organizerEmail[7:]
+	}
+	if organizerEmail == "" {
+		return fmt.Errorf("no organizer email on event %s", eventUID)
+	}
+
+	// Generate a METHOD:REPLY ICS
+	replyICS := generateReplyICS(event, attendeeEmail, partstat)
+
+	msg := &models.SchedulingMessage{
+		ID:             uuid.New().String(),
+		TenantID:       tenantID,
+		SenderID:       event.UserID,
+		RecipientEmail: organizerEmail,
+		EventUID:       eventUID,
+		Method:         "REPLY",
+		Status:         "pending",
+		RawICS:         replyICS,
+	}
+
+	if err := svc.store.CreateSchedulingMessage(ctx, msg); err != nil {
+		return fmt.Errorf("create reply message: %w", err)
+	}
+
+	// Enqueue for background sending
+	if svc.queue != nil {
+		payload := &jobs.SchedulingEmailPayload{
+			MessageID: msg.ID,
+			TenantID:  tenantID,
+		}
+		if _, err := svc.queue.Enqueue(ctx, jobs.JobSendSchedulingEmail, payload); err != nil {
+			log.Printf("scheduling: failed to enqueue reply email: %v", err)
+		}
+	}
+
+	log.Printf("scheduling: queued REPLY (%s) from %s to organizer %s for event %s",
+		partstat, attendeeEmail, organizerEmail, eventUID)
+	return nil
+}
+
+// generateReplyICS generates a METHOD:REPLY ICS for an RSVP response.
+func generateReplyICS(event *models.Event, attendeeEmail, partstat string) string {
+	now := time.Now().UTC().Format("20060102T150405Z")
+	var b strings.Builder
+	b.WriteString("BEGIN:VCALENDAR\r\n")
+	b.WriteString("VERSION:2.0\r\n")
+	b.WriteString("PRODID:-//CalDev//CalDev 1.0//EN\r\n")
+	b.WriteString("METHOD:REPLY\r\n")
+	b.WriteString("BEGIN:VEVENT\r\n")
+	b.WriteString(fmt.Sprintf("UID:%s\r\n", event.UID))
+	b.WriteString(fmt.Sprintf("DTSTAMP:%s\r\n", now))
+	b.WriteString(fmt.Sprintf("DTSTART:%s\r\n", event.DTStart.UTC().Format("20060102T150405Z")))
+	if event.DTEnd != nil {
+		b.WriteString(fmt.Sprintf("DTEND:%s\r\n", event.DTEnd.UTC().Format("20060102T150405Z")))
+	}
+	b.WriteString(fmt.Sprintf("SUMMARY:%s\r\n", event.Summary))
+	if event.Organizer != "" {
+		org := event.Organizer
+		if !strings.HasPrefix(strings.ToLower(org), "mailto:") {
+			org = "mailto:" + org
+		}
+		b.WriteString(fmt.Sprintf("ORGANIZER:%s\r\n", org))
+	}
+	b.WriteString(fmt.Sprintf("ATTENDEE;PARTSTAT=%s:mailto:%s\r\n", partstat, attendeeEmail))
+	b.WriteString(fmt.Sprintf("SEQUENCE:%d\r\n", event.Sequence))
+	b.WriteString("END:VEVENT\r\n")
+	b.WriteString("END:VCALENDAR\r\n")
+	return b.String()
 }
 
 // HandleSendEmailJob is the worker handler for send_scheduling_email jobs.

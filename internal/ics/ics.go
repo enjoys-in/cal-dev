@@ -473,3 +473,82 @@ func ValidateICS(raw string) error {
 	}
 	return nil
 }
+
+// SchedulingReply holds the parsed data from a METHOD:REPLY ICS.
+type SchedulingReply struct {
+	Method        string // REPLY, CANCEL, REQUEST, etc.
+	EventUID      string
+	AttendeeEmail string
+	Partstat      string // ACCEPTED, DECLINED, TENTATIVE
+	Summary       string
+	Comment       string // optional reply comment
+}
+
+// ParseSchedulingICS parses an iMIP ICS (METHOD:REPLY, METHOD:CANCEL, etc.)
+// and extracts the event UID, attendee email, and participation status.
+func ParseSchedulingICS(rawICS string) (*SchedulingReply, error) {
+	if !strings.Contains(rawICS, "BEGIN:VCALENDAR") {
+		return nil, fmt.Errorf("invalid ICS: missing BEGIN:VCALENDAR")
+	}
+
+	reply := &SchedulingReply{}
+	lines := unfoldICS(rawICS)
+
+	var inVEvent bool
+
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+
+		if trimmed == "BEGIN:VEVENT" {
+			inVEvent = true
+			continue
+		}
+		if trimmed == "END:VEVENT" {
+			inVEvent = false
+			continue
+		}
+
+		name, params, value := parseLine(line)
+		upperName := strings.ToUpper(name)
+
+		// Calendar-level METHOD
+		if !inVEvent && upperName == "METHOD" {
+			reply.Method = strings.ToUpper(strings.TrimSpace(value))
+			continue
+		}
+
+		if !inVEvent {
+			continue
+		}
+
+		switch upperName {
+		case "UID":
+			reply.EventUID = value
+		case "SUMMARY":
+			reply.Summary = unescapeICS(value)
+		case "COMMENT":
+			reply.Comment = unescapeICS(value)
+		case "ATTENDEE":
+			// In a REPLY, there's typically one ATTENDEE — the one responding
+			email := extractCalAddress(value)
+			partstat := "NEEDS-ACTION"
+			if ps, ok := params["PARTSTAT"]; ok {
+				partstat = strings.ToUpper(ps)
+			}
+			// Only take the first attendee (the replier)
+			if reply.AttendeeEmail == "" {
+				reply.AttendeeEmail = email
+				reply.Partstat = partstat
+			}
+		}
+	}
+
+	if reply.EventUID == "" {
+		return nil, fmt.Errorf("no UID found in scheduling ICS")
+	}
+	if reply.Method == "" {
+		return nil, fmt.Errorf("no METHOD found in scheduling ICS")
+	}
+
+	return reply, nil
+}

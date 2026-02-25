@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/enjoys-in/cal-dev/internal/models"
+	"github.com/enjoys-in/cal-dev/internal/response"
 	"github.com/enjoys-in/cal-dev/internal/store"
 	"github.com/gofiber/fiber/v2"
 )
@@ -117,7 +118,7 @@ func (h *Handler) FeedIndex(c *fiber.Ctx) error {
 
 	calendars, err := h.store.GetCalendarsByUser(c.UserContext(), tenantID, userID)
 	if err != nil {
-		return c.Status(500).JSON(fiber.Map{"error": "failed to list calendars"})
+		return response.Error(c, 500, "failed to list calendars")
 	}
 
 	type feedInfo struct {
@@ -145,7 +146,7 @@ func (h *Handler) FeedIndex(c *fiber.Ctx) error {
 		})
 	}
 
-	return c.JSON(fiber.Map{
+	return response.Success(c, "feeds retrieved", fiber.Map{
 		"feeds": feeds,
 		"help": fiber.Map{
 			"outlook": "File → Account Settings → Internet Calendars → New → paste the feed_url",
