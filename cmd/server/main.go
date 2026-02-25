@@ -18,6 +18,7 @@ import (
 	"github.com/enjoys-in/cal-dev/internal/middleware"
 	"github.com/enjoys-in/cal-dev/internal/scheduling"
 	"github.com/enjoys-in/cal-dev/internal/store"
+	extsync "github.com/enjoys-in/cal-dev/internal/sync"
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/compress"
 	"github.com/gofiber/fiber/v2/middleware/recover"
@@ -46,6 +47,13 @@ func main() {
 			log.Println("Database migration applied successfully")
 		}
 	}
+	if migrationSQL, err := os.ReadFile("migrations/003_calendar_subscriptions.sql"); err == nil {
+		if err := db.RunMigration(string(migrationSQL)); err != nil {
+			log.Printf("Subscription migration warning (may already be applied): %v", err)
+		} else {
+			log.Println("Subscription migration applied successfully")
+		}
+	}
 
 	// Connect to Valkey (Redis-compatible)
 	jobQueue, err := jobs.NewQueue(&cfg.Redis, &cfg.Worker)
@@ -57,6 +65,7 @@ func main() {
 	// Initialize services
 	authSvc := auth.NewService(db, &cfg.Auth)
 	schedulingSvc := scheduling.NewService(db, &cfg.SMTP, jobQueue)
+	syncSvc := extsync.NewService(db, jobQueue)
 
 	// Initialize background worker
 	worker := jobs.NewWorker(jobQueue, db, &cfg.Worker)
@@ -69,6 +78,8 @@ func main() {
 	worker.Register(jobs.JobCleanupJobHistory, func(ctx context.Context, job *jobs.Job) error {
 		return db.CleanupJobHistory(ctx)
 	})
+	worker.Register(extsync.JobSyncExternalCalendar, syncSvc.HandleSyncJob)
+	worker.Register(extsync.JobEnqueueDueSyncs, syncSvc.HandleEnqueueDueSyncsJob)
 
 	// Start workers
 	ctx, cancel := context.WithCancel(context.Background())
@@ -178,6 +189,18 @@ func main() {
 	appPwGroup := app.Group("/api/app-passwords", middleware.JMAPAuth(authSvc, db))
 	appPwGroup.Post("/", createAppPasswordHandler(db))
 	appPwGroup.Delete("/:id", deleteAppPasswordHandler(db))
+
+	// ============================================================
+	// Calendar Subscriptions — Import from Google/Outlook/any ICS
+	// ============================================================
+	syncHandler := extsync.NewHandler(db, syncSvc)
+	subGroup := app.Group("/api/subscriptions", middleware.JMAPAuth(authSvc, db))
+	subGroup.Get("/", syncHandler.List)
+	subGroup.Post("/", syncHandler.Create)
+	subGroup.Get("/:id", syncHandler.Get)
+	subGroup.Put("/:id", syncHandler.Update)
+	subGroup.Delete("/:id", syncHandler.Delete)
+	subGroup.Post("/:id/sync", syncHandler.SyncNow)
 
 	// ============================================================
 	// Graceful Shutdown

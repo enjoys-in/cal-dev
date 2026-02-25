@@ -695,6 +695,150 @@ func (s *Store) GetCalendarSyncToken(ctx context.Context, tenantID, calendarID s
 var _ = json.Marshal
 
 // ============================================================
+// Calendar Subscription Operations
+// ============================================================
+
+// CreateSubscription creates a new external calendar subscription.
+func (s *Store) CreateSubscription(ctx context.Context, sub *models.CalendarSubscription) error {
+	if sub.ID == "" {
+		sub.ID = uuid.New().String()
+	}
+	query := `INSERT INTO caldev.calendar_subscriptions
+		(id, tenant_id, user_id, calendar_id, source_type, source_url, display_name, color,
+		 auth_type, auth_credentials, is_enabled, sync_interval)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+		RETURNING created_at, updated_at`
+	return s.db.QueryRowContext(ctx, query,
+		sub.ID, sub.TenantID, sub.UserID, sub.CalendarID,
+		sub.SourceType, sub.SourceURL, sub.DisplayName, sub.Color,
+		sub.AuthType, sub.AuthCredentials, sub.IsEnabled, sub.SyncInterval).
+		Scan(&sub.CreatedAt, &sub.UpdatedAt)
+}
+
+// GetSubscription returns a single subscription by ID.
+func (s *Store) GetSubscription(ctx context.Context, tenantID, subID string) (*models.CalendarSubscription, error) {
+	sub := &models.CalendarSubscription{}
+	query := `SELECT id, tenant_id, user_id, calendar_id, source_type, source_url,
+		display_name, color, auth_type, auth_credentials, is_enabled, sync_interval,
+		last_synced_at, last_etag, last_error, error_count, events_count, created_at, updated_at
+		FROM caldev.calendar_subscriptions WHERE tenant_id = $1 AND id = $2`
+	err := s.db.QueryRowContext(ctx, query, tenantID, subID).
+		Scan(&sub.ID, &sub.TenantID, &sub.UserID, &sub.CalendarID,
+			&sub.SourceType, &sub.SourceURL, &sub.DisplayName, &sub.Color,
+			&sub.AuthType, &sub.AuthCredentials, &sub.IsEnabled, &sub.SyncInterval,
+			&sub.LastSyncedAt, &sub.LastETag, &sub.LastError, &sub.ErrorCount,
+			&sub.EventsCount, &sub.CreatedAt, &sub.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return sub, err
+}
+
+// GetSubscriptionsByUser returns all subscriptions for a user.
+func (s *Store) GetSubscriptionsByUser(ctx context.Context, tenantID, userID string) ([]*models.CalendarSubscription, error) {
+	query := `SELECT id, tenant_id, user_id, calendar_id, source_type, source_url,
+		display_name, color, auth_type, '', is_enabled, sync_interval,
+		last_synced_at, last_etag, last_error, error_count, events_count, created_at, updated_at
+		FROM caldev.calendar_subscriptions WHERE tenant_id = $1 AND user_id = $2
+		ORDER BY display_name, created_at`
+	rows, err := s.db.QueryContext(ctx, query, tenantID, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var subs []*models.CalendarSubscription
+	for rows.Next() {
+		sub := &models.CalendarSubscription{}
+		if err := rows.Scan(&sub.ID, &sub.TenantID, &sub.UserID, &sub.CalendarID,
+			&sub.SourceType, &sub.SourceURL, &sub.DisplayName, &sub.Color,
+			&sub.AuthType, &sub.AuthCredentials, &sub.IsEnabled, &sub.SyncInterval,
+			&sub.LastSyncedAt, &sub.LastETag, &sub.LastError, &sub.ErrorCount,
+			&sub.EventsCount, &sub.CreatedAt, &sub.UpdatedAt); err != nil {
+			return nil, err
+		}
+		subs = append(subs, sub)
+	}
+	return subs, rows.Err()
+}
+
+// GetDueSubscriptions returns enabled subscriptions that need syncing.
+func (s *Store) GetDueSubscriptions(ctx context.Context, limit int) ([]*models.CalendarSubscription, error) {
+	query := `SELECT id, tenant_id, user_id, calendar_id, source_type, source_url,
+		display_name, color, auth_type, auth_credentials, is_enabled, sync_interval,
+		last_synced_at, last_etag, last_error, error_count, events_count, created_at, updated_at
+		FROM caldev.calendar_subscriptions
+		WHERE is_enabled = TRUE
+		  AND (last_synced_at IS NULL OR last_synced_at + (sync_interval * INTERVAL '1 second') < NOW())
+		  AND error_count < 10
+		ORDER BY last_synced_at ASC NULLS FIRST
+		LIMIT $1`
+	rows, err := s.db.QueryContext(ctx, query, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var subs []*models.CalendarSubscription
+	for rows.Next() {
+		sub := &models.CalendarSubscription{}
+		if err := rows.Scan(&sub.ID, &sub.TenantID, &sub.UserID, &sub.CalendarID,
+			&sub.SourceType, &sub.SourceURL, &sub.DisplayName, &sub.Color,
+			&sub.AuthType, &sub.AuthCredentials, &sub.IsEnabled, &sub.SyncInterval,
+			&sub.LastSyncedAt, &sub.LastETag, &sub.LastError, &sub.ErrorCount,
+			&sub.EventsCount, &sub.CreatedAt, &sub.UpdatedAt); err != nil {
+			return nil, err
+		}
+		subs = append(subs, sub)
+	}
+	return subs, rows.Err()
+}
+
+// UpdateSubscriptionSyncState updates sync state after a sync attempt.
+func (s *Store) UpdateSubscriptionSyncState(ctx context.Context, subID string, etag string, eventsCount int, syncErr string) error {
+	if syncErr != "" {
+		query := `UPDATE caldev.calendar_subscriptions
+			SET last_synced_at = NOW(), last_error = $2, error_count = error_count + 1
+			WHERE id = $1`
+		_, err := s.db.ExecContext(ctx, query, subID, syncErr)
+		return err
+	}
+	query := `UPDATE caldev.calendar_subscriptions
+		SET last_synced_at = NOW(), last_etag = $2, events_count = $3,
+		    last_error = '', error_count = 0
+		WHERE id = $1`
+	_, err := s.db.ExecContext(ctx, query, subID, etag, eventsCount)
+	return err
+}
+
+// UpdateSubscription updates a subscription's editable fields.
+func (s *Store) UpdateSubscription(ctx context.Context, sub *models.CalendarSubscription) error {
+	query := `UPDATE caldev.calendar_subscriptions SET
+		display_name = $3, color = $4, source_url = $5,
+		auth_type = $6, auth_credentials = $7,
+		is_enabled = $8, sync_interval = $9
+		WHERE tenant_id = $1 AND id = $2`
+	_, err := s.db.ExecContext(ctx, query,
+		sub.TenantID, sub.ID, sub.DisplayName, sub.Color, sub.SourceURL,
+		sub.AuthType, sub.AuthCredentials, sub.IsEnabled, sub.SyncInterval)
+	return err
+}
+
+// DeleteSubscription deletes a subscription (events in the linked calendar remain).
+func (s *Store) DeleteSubscription(ctx context.Context, tenantID, subID string) error {
+	query := `DELETE FROM caldev.calendar_subscriptions WHERE tenant_id = $1 AND id = $2`
+	_, err := s.db.ExecContext(ctx, query, tenantID, subID)
+	return err
+}
+
+// DeleteEventsByCalendar deletes all events in a calendar (used during re-sync).
+func (s *Store) DeleteEventsByCalendar(ctx context.Context, tenantID, calendarID string) error {
+	query := `DELETE FROM caldev.events WHERE tenant_id = $1 AND calendar_id = $2`
+	_, err := s.db.ExecContext(ctx, query, tenantID, calendarID)
+	return err
+}
+
+// ============================================================
 // Job History Operations
 // ============================================================
 

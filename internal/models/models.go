@@ -190,6 +190,31 @@ type Attendee struct {
 	Type        string `json:"type"` // INDIVIDUAL, GROUP, RESOURCE, ROOM
 }
 
+// CalendarSubscription represents an external calendar feed subscription.
+// Users can subscribe to ICS URLs (Google Calendar, Outlook, etc.)
+// and events are periodically synced into a local calendar.
+type CalendarSubscription struct {
+	ID              string     `json:"id" db:"id"`
+	TenantID        string     `json:"tenant_id" db:"tenant_id"`
+	UserID          string     `json:"user_id" db:"user_id"`
+	CalendarID      string     `json:"calendar_id" db:"calendar_id"`
+	SourceType      string     `json:"source_type" db:"source_type"` // ics_url, google, outlook
+	SourceURL       string     `json:"source_url" db:"source_url"`
+	DisplayName     string     `json:"display_name" db:"display_name"`
+	Color           string     `json:"color" db:"color"`
+	AuthType        string     `json:"auth_type" db:"auth_type"` // none, basic, bearer, api_key
+	AuthCredentials string     `json:"-" db:"auth_credentials"`  // never expose
+	IsEnabled       bool       `json:"is_enabled" db:"is_enabled"`
+	SyncInterval    int        `json:"sync_interval" db:"sync_interval"` // seconds
+	LastSyncedAt    *time.Time `json:"last_synced_at,omitempty" db:"last_synced_at"`
+	LastETag        string     `json:"last_etag" db:"last_etag"`
+	LastError       string     `json:"last_error,omitempty" db:"last_error"`
+	ErrorCount      int        `json:"error_count" db:"error_count"`
+	EventsCount     int        `json:"events_count" db:"events_count"`
+	CreatedAt       time.Time  `json:"created_at" db:"created_at"`
+	UpdatedAt       time.Time  `json:"updated_at" db:"updated_at"`
+}
+
 // Principal represents a WebDAV principal resource.
 type Principal struct {
 	Path            string
