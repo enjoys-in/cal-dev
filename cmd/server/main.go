@@ -12,6 +12,7 @@ import (
 	"github.com/enjoys-in/cal-dev/internal/auth"
 	"github.com/enjoys-in/cal-dev/internal/caldav"
 	"github.com/enjoys-in/cal-dev/internal/config"
+	"github.com/enjoys-in/cal-dev/internal/feeds"
 	"github.com/enjoys-in/cal-dev/internal/jmap"
 	"github.com/enjoys-in/cal-dev/internal/jobs"
 	"github.com/enjoys-in/cal-dev/internal/middleware"
@@ -154,6 +155,22 @@ func main() {
 
 	// JMAP API endpoint (RFC 8620 §3)
 	jmapGroup.Post("/api", jmapHandler.API)
+
+	// ============================================================
+	// ICS Feed Routes — /feeds/{tenant}/{user}/... (Outlook, Google, Apple)
+	// ============================================================
+	feedHandler := feeds.NewHandler(db)
+	feedGroup := app.Group("/feeds", middleware.DAVAuth(authSvc, db))
+
+	// Feed index — lists available feeds with subscribe URLs
+	feedGroup.Get("/:tenant/:user", feedHandler.FeedIndex)
+	feedGroup.Get("/:tenant/:user/", feedHandler.FeedIndex)
+
+	// Merged feed of all calendars
+	feedGroup.Get("/:tenant/:user/all.ics", feedHandler.AllCalendarsFeed)
+
+	// Single calendar feed
+	feedGroup.Get("/:tenant/:user/:calendar", feedHandler.CalendarFeed)
 
 	// ============================================================
 	// App Password Management (authenticated)

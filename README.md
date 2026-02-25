@@ -152,6 +152,15 @@ POST   /api/app-passwords/     → Create app password
 DELETE /api/app-passwords/:id  → Delete app password
 ```
 
+### ICS Feeds (Outlook, Google, Apple subscription)
+```
+GET /feeds/{tenant}/{user}/                        → JSON index of available feeds
+GET /feeds/{tenant}/{user}/{calendar}.ics           → Single calendar ICS feed
+GET /feeds/{tenant}/{user}/all.ics                  → Merged feed of all calendars
+```
+
+These are read-only polling feeds — clients fetch the full `.ics` file periodically. Supports `ETag` / `If-None-Match` for conditional GET (304 Not Modified).
+
 ## Authentication
 
 ### JWT (Bearer)
@@ -197,6 +206,25 @@ Then configure the CalDAV client:
 Session URL: http://localhost:8443/jmap/session
 API URL:     http://localhost:8443/jmap/api
 ```
+
+### Outlook (ICS Feed Subscription)
+Outlook does **not** support CalDAV natively. Use the ICS feed subscription:
+
+1. **File** → **Account Settings** → **Account Settings**
+2. Go to the **Internet Calendars** tab
+3. Click **New…**
+4. Paste the feed URL (Basic Auth credentials in the URL):
+   ```
+   http://user@example.com:app-password@yourserver:8443/feeds/{tenant}/{user}/{calendar}.ics
+   ```
+5. Give it a name and click **OK**
+
+> **Note:** This is **read-only** — Outlook will poll for changes but cannot create/edit events through this method. For full read-write CalDAV sync, use the [CalDav Synchronizer](https://caldavsynchronizer.org/) Outlook plugin.
+
+### Google Calendar (ICS Feed)
+1. Click **+** next to "Other calendars" → **From URL**
+2. Paste: `http://user:password@yourserver:8443/feeds/{tenant}/{user}/{calendar}.ics`
+3. Click **Add calendar**
 
 ## Background Jobs (Valkey)
 
