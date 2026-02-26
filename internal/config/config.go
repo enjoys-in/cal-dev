@@ -59,6 +59,7 @@ type AuthConfig struct {
 	TokenExpiry      time.Duration
 	OAuth2Enabled    bool
 	BasicAuthEnabled bool
+	AdminAPIKey      string // API key for admin endpoints (user provisioning, etc.)
 }
 
 // WorkerConfig holds background job worker settings.
@@ -142,6 +143,7 @@ func Load() *Config {
 			TokenExpiry:      envDuration("AUTH_TOKEN_EXPIRY", 24*time.Hour),
 			OAuth2Enabled:    envBool("AUTH_OAUTH2_ENABLED", false),
 			BasicAuthEnabled: envBool("AUTH_BASIC_ENABLED", true),
+			AdminAPIKey:      envStr("ADMIN_API_KEY", ""),
 		},
 		SMTP: SMTPConfig{
 			Host:     envStr("SMTP_HOST", "localhost"),

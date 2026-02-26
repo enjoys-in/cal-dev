@@ -1,5 +1,3 @@
-version: "3.9"
-
 name: enjoys-caldev
 services:
   # ============================================================
@@ -71,9 +69,11 @@ services:
       REDIS_HOST: valkey
       REDIS_PORT: "6379"
       # Auth — use same JWT secret & issuer as your mail/other services
-      AUTH_JWT_SECRET: "${AUTH_JWT_SECRET:-change-me-in-production-use-strong-secret}"
-      AUTH_JWT_ISSUER: "${AUTH_JWT_ISSUER:-}"
+      AUTH_JWT_SECRET: e783e9b23f8b14e6b245e8b479a503d402fad947758f9006e70d30a32d605661ac00645bbf2f1d3894aaff7b01fccabea47a7c417737fb0d9802e297a21b6167
+      AUTH_JWT_ISSUER: ENJOYS
       AUTH_BASIC_ENABLED: "true"
+      # Admin API key for user provisioning
+      ADMIN_API_KEY: "${ADMIN_API_KEY:-caldev-admin-secret-key-change-me}"
       # Worker
       WORKER_CONCURRENCY: "4"
       WORKER_QUEUE_PREFIX: "caldev:jobs"

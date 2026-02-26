@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/enjoys-in/cal-dev/internal/config"
+	"github.com/enjoys-in/cal-dev/internal/models"
 	"github.com/enjoys-in/cal-dev/internal/store"
 	"github.com/golang-jwt/jwt/v5"
 	"golang.org/x/crypto/bcrypt"
@@ -103,6 +104,11 @@ func (s *Service) ValidateToken(tokenString string) (*Claims, error) {
 		claims.UserID = claims.Subject
 	}
 
+	// Populate Email from Subject if subject looks like an email
+	if claims.Email == "" && claims.Subject != "" && strings.Contains(claims.Subject, "@") {
+		claims.Email = claims.Subject
+	}
+
 	return claims, nil
 }
 
@@ -171,17 +177,34 @@ func (s *Service) AuthenticateBasic(ctx context.Context, email, password string)
 }
 
 // ResolveUserFromToken looks up the user in public.users by the JWT claims.
+// Tries email first (most reliable), then falls back to user_id/subject.
 // This ensures the user still exists and fetches current tenant_id.
 func (s *Service) ResolveUserFromToken(ctx context.Context, claims *Claims) (*Claims, error) {
-	user, err := s.store.GetUserByID(ctx, claims.UserID)
-	if err != nil {
-		return nil, fmt.Errorf("auth: user resolve error: %w", err)
+	var user *models.User
+	var err error
+
+	// 1. Try by email first (most common identifier in tokens)
+	if claims.Email != "" {
+		user, err = s.store.GetUserByEmail(ctx, claims.Email)
+		if err != nil {
+			return nil, fmt.Errorf("auth: user resolve by email error: %w", err)
+		}
 	}
+
+	// 2. Fall back to user ID / subject
+	if user == nil && claims.UserID != "" {
+		user, err = s.store.GetUserByID(ctx, claims.UserID)
+		if err != nil {
+			return nil, fmt.Errorf("auth: user resolve by id error: %w", err)
+		}
+	}
+
 	if user == nil {
 		return nil, fmt.Errorf("auth: user not found in public.users")
 	}
 
-	// Always use the canonical tenant_id from public.users
+	// Always use canonical values from public.users
+	claims.UserID = user.ID
 	claims.TenantID = user.TenantID
 	claims.Email = user.Email
 	return claims, nil

@@ -106,6 +106,22 @@ func (s *Store) GetUserByEmail(ctx context.Context, email string) (*models.User,
 	return u, err
 }
 
+// CreateUser inserts a new user into public.users and returns it.
+func (s *Store) CreateUser(ctx context.Context, tenantID, email, displayName string) (*models.User, error) {
+	u := &models.User{}
+	id := uuid.New().String()
+	query := `INSERT INTO public.users (id, tenant_id, email, display_name)
+		VALUES ($1, $2, $3, $4)
+		ON CONFLICT (email) DO UPDATE SET display_name = EXCLUDED.display_name
+		RETURNING id, tenant_id, email, COALESCE(display_name, '') as display_name, created_at, updated_at`
+	err := s.db.QueryRowContext(ctx, query, id, tenantID, email, displayName).
+		Scan(&u.ID, &u.TenantID, &u.Email, &u.DisplayName, &u.CreatedAt, &u.UpdatedAt)
+	if err != nil {
+		return nil, fmt.Errorf("store: create user: %w", err)
+	}
+	return u, nil
+}
+
 func (s *Store) GetUserByID(ctx context.Context, id string) (*models.User, error) {
 	u := &models.User{}
 	query := `SELECT id, tenant_id, email, COALESCE(display_name, '') as display_name, created_at, updated_at

@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 	"github.com/enjoys-in/cal-dev/internal/jmap"
 	"github.com/enjoys-in/cal-dev/internal/jobs"
 	"github.com/enjoys-in/cal-dev/internal/middleware"
+	"github.com/enjoys-in/cal-dev/internal/models"
 	"github.com/enjoys-in/cal-dev/internal/response"
 	"github.com/enjoys-in/cal-dev/internal/scheduling"
 	"github.com/enjoys-in/cal-dev/internal/store"
@@ -23,6 +25,7 @@ import (
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/compress"
 	"github.com/gofiber/fiber/v2/middleware/recover"
+	"github.com/google/uuid"
 )
 
 func main() {
@@ -212,6 +215,12 @@ func main() {
 	subGroup.Post("/:id/sync", syncHandler.SyncNow)
 
 	// ============================================================
+	// Admin API — API-key protected user provisioning
+	// ============================================================
+	adminGroup := app.Group("/api/admin", middleware.APIKeyAuth(cfg.Auth.AdminAPIKey))
+	adminGroup.Post("/users", createUserHandler(db))
+
+	// ============================================================
 	// Graceful Shutdown
 	// ============================================================
 	quit := make(chan os.Signal, 1)
@@ -323,6 +332,65 @@ func deleteAppPasswordHandler(db *store.Store) fiber.Handler {
 			return response.Error(c, 500, "delete failed")
 		}
 		return c.SendStatus(204)
+	}
+}
+
+// createUserHandler provisions a new user + default calendar.
+func createUserHandler(db *store.Store) fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		var req struct {
+			Email       string `json:"email"`
+			DisplayName string `json:"display_name"`
+			TenantID    string `json:"tenant_id"`
+		}
+		if err := c.BodyParser(&req); err != nil {
+			return response.Error(c, 400, "invalid request body")
+		}
+		if req.Email == "" {
+			return response.Error(c, 400, "email is required")
+		}
+		// Default tenant
+		if req.TenantID == "" {
+			req.TenantID = "b0000000-0000-0000-0000-000000000001"
+		}
+		if req.DisplayName == "" {
+			req.DisplayName = strings.Split(req.Email, "@")[0]
+		}
+
+		// Create user
+		user, err := db.CreateUser(c.UserContext(), req.TenantID, req.Email, req.DisplayName)
+		if err != nil {
+			return response.Error(c, 500, "failed to create user: "+err.Error())
+		}
+
+		// Create default calendar
+		cal := &models.Calendar{
+			ID:                  uuid.New().String(),
+			TenantID:            req.TenantID,
+			UserID:              user.ID,
+			Name:                "Personal",
+			Description:         "Default calendar",
+			Color:               "#0078D4",
+			Timezone:            "UTC",
+			IsDefault:           true,
+			IsVisible:           true,
+			CTag:                uuid.New().String(),
+			SyncToken:           "sync-" + uuid.New().String(),
+			SupportedComponents: []string{"VEVENT", "VTODO"},
+			MaxResourceSize:     10485760,
+			Properties:          []byte("{}"),
+		}
+		if err := db.CreateCalendar(c.UserContext(), cal); err != nil {
+			log.Printf("Warning: default calendar may already exist: %v", err)
+		}
+
+		return response.Created(c, "User created", fiber.Map{
+			"user_id":      user.ID,
+			"email":        user.Email,
+			"tenant_id":    user.TenantID,
+			"display_name": user.DisplayName,
+			"calendar_id":  cal.ID,
+		})
 	}
 }
 

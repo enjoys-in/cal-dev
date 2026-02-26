@@ -1,0 +1,91 @@
+name: enjoys-caldev
+services:
+  # ============================================================
+  # PostgreSQL Database
+  # ============================================================
+  postgres:
+    image: postgres:16-alpine
+    container_name: caldev-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: caldev
+      POSTGRES_USER: caldev
+      POSTGRES_PASSWORD: caldev
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./migrations/000_public_users.sql:/docker-entrypoint-initdb.d/000_public_users.sql
+      - ./migrations/001_init.sql:/docker-entrypoint-initdb.d/001_init.sql
+      - ./migrations/002_seed.sql:/docker-entrypoint-initdb.d/002_seed.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U caldev"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ============================================================
+  # Valkey (Redis-compatible — job queue, caching, sync tokens)
+  # ============================================================
+  valkey:
+    image: valkey/valkey:8-alpine
+    container_name: caldev-valkey
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - valkeydata:/data
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ============================================================
+  # CalDAV + JMAP Server
+  # ============================================================
+  caldev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: caldev-server
+    restart: unless-stopped
+    ports:
+      - "8443:8443"
+    environment:
+      SERVER_HOST: "0.0.0.0"
+      SERVER_PORT: "8443"
+      # PostgreSQL
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_USER: caldev
+      DB_PASSWORD: caldev
+      DB_NAME: caldev
+      DB_SCHEMA: caldev
+      DB_SSLMODE: disable
+      DB_MAX_OPEN_CONNS: "50"
+      DB_MAX_IDLE_CONNS: "10"
+      # Valkey (Redis-compatible)
+      REDIS_HOST: valkey
+      REDIS_PORT: "6379"
+      # Auth — use same JWT secret & issuer as your mail/other services
+      AUTH_JWT_SECRET: "${AUTH_JWT_SECRET:-test}"
+      AUTH_JWT_ISSUER: "${AUTH_JWT_ISSUER:-test}"
+      AUTH_BASIC_ENABLED: "true"
+      # Worker
+      WORKER_CONCURRENCY: "4"
+      WORKER_QUEUE_PREFIX: "caldev:jobs"
+      WORKER_RETRY_MAX: "3"
+      # Server
+      TLS_ENABLED: "false"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      valkey:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+    driver: local
+  valkeydata:
+    driver: local

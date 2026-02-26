@@ -127,9 +127,43 @@ func DAVAuth(authSvc *auth.Service, s *store.Store) fiber.Handler {
 	}
 }
 
-// JMAPAuth provides JMAP authentication (Bearer + Basic).
+// JMAPAuth provides JMAP authentication (Bearer JWT only, no Basic Auth).
+// Accepts token from: Authorization: Bearer <token> header OR access_token cookie.
 func JMAPAuth(authSvc *auth.Service, s *store.Store) fiber.Handler {
-	return DAVAuth(authSvc, s) // Same behavior for now
+	return func(c *fiber.Ctx) error {
+		var token string
+
+		// 1. Try Authorization header first
+		if authHeader := c.Get("Authorization"); authHeader != "" {
+			if !strings.HasPrefix(authHeader, "Bearer ") {
+				return c.Status(401).JSON(fiber.Map{"error": "Bearer token required"})
+			}
+			token = strings.TrimPrefix(authHeader, "Bearer ")
+		}
+
+		// 2. Fall back to access_token cookie
+		if token == "" {
+			token = c.Cookies("access_token")
+		}
+
+		if token == "" {
+			return c.Status(401).JSON(fiber.Map{"error": "Authentication required"})
+		}
+		claims, err := authSvc.ValidateToken(token)
+		if err != nil {
+			return c.Status(401).JSON(fiber.Map{"error": "Invalid token"})
+		}
+
+		resolved, err := authSvc.ResolveUserFromToken(c.UserContext(), claims)
+		if err != nil {
+			return c.Status(401).JSON(fiber.Map{"error": "User not found"})
+		}
+
+		c.Locals("user_id", resolved.UserID)
+		c.Locals("tenant_id", resolved.TenantID)
+		c.Locals("email", resolved.Email)
+		return c.Next()
+	}
 }
 
 // TenantResolver resolves tenant from path and sets locals.
@@ -173,10 +207,39 @@ func extractTenantFromPath(path string) string {
 	return ""
 }
 
+// APIKeyAuth protects admin endpoints with a static API key.
+// Key is sent via X-API-Key header.
+func APIKeyAuth(apiKey string) fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		if apiKey == "" {
+			return c.Status(503).JSON(fiber.Map{"error": "Admin API not configured"})
+		}
+		key := c.Get("X-API-Key")
+		if key == "" {
+			return c.Status(401).JSON(fiber.Map{"error": "API key required"})
+		}
+		if key != apiKey {
+			return c.Status(403).JSON(fiber.Map{"error": "Invalid API key"})
+		}
+		return c.Next()
+	}
+}
+
 // CORSHeaders adds CORS headers for JMAP endpoints.
 func CORSHeaders() fiber.Handler {
+	allowedOrigins := map[string]bool{
+		"http://localhost:9500":       true,
+		"https://localhost:9500":      true,
+		"https://airsend.in":          true,
+		"https://calender.airsend.in": true,
+	}
+
 	return func(c *fiber.Ctx) error {
-		c.Set("Access-Control-Allow-Origin", "*")
+		origin := c.Get("Origin")
+		if allowedOrigins[origin] {
+			c.Set("Access-Control-Allow-Origin", origin)
+		}
+		c.Set("Access-Control-Allow-Credentials", "true")
 		c.Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS, PROPFIND, PROPPATCH, REPORT, MKCALENDAR, MOVE, COPY, LOCK, UNLOCK")
 		c.Set("Access-Control-Allow-Headers", "Authorization, Content-Type, Depth, If-Match, If-None-Match, Lock-Token, Destination, Overwrite, Prefer, Brief")
 		c.Set("Access-Control-Expose-Headers", "ETag, DAV, Allow, Lock-Token")

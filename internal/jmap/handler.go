@@ -647,6 +647,7 @@ func jmapToEvent(props map[string]interface{}, tenantID, userID string) *models.
 		DTStart:        time.Now().UTC(),
 		Attendees:      json.RawMessage("[]"),
 		Properties:     json.RawMessage("{}"),
+		Categories:     []string{},
 	}
 
 	if title, ok := props["title"].(string); ok {
