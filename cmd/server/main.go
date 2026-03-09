@@ -49,12 +49,40 @@ func main() {
 	defer db.Close()
 	log.Println("Connected to PostgreSQL")
 
-	// Run migrations if migration file exists
-	if migrationSQL, err := os.ReadFile("migrations/001_init.sql"); err == nil {
-		if err := db.RunMigration(string(migrationSQL)); err != nil {
-			log.Printf("Migration warning (may already be applied): %v", err)
-		} else {
-			log.Println("Database migration applied successfully")
+	// Ensure migration tracking table exists (runs outside the main migration transaction)
+	db.RunMigration(`CREATE TABLE IF NOT EXISTS caldev_migrations (
+		id SERIAL PRIMARY KEY,
+		filename VARCHAR(512) NOT NULL UNIQUE,
+		applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	)`)
+
+	// Run migrations in order
+	migrationFiles := []string{
+		"migrations/001_init.sql",
+		// "migrations/002_seed.sql",
+		// "migrations/003_calendar_subscriptions.sql",
+	}
+	for _, mf := range migrationFiles {
+		sqlBytes, err := os.ReadFile(mf)
+		if err != nil {
+			log.Printf("Migration file %s not found, skipping", mf)
+			continue
+		}
+		applied, err := db.IsMigrationApplied(mf)
+		if err != nil {
+			applied = false
+		}
+		if applied {
+			log.Printf("Migration %s already applied, skipping", mf)
+			continue
+		}
+		if err := db.RunMigration(string(sqlBytes)); err != nil {
+			log.Printf("Migration %s failed: %v", mf, err)
+			continue
+		}
+		log.Printf("Migration %s applied successfully", mf)
+		if err := db.RecordMigration(mf); err != nil {
+			log.Printf("Failed to record migration %s: %v", mf, err)
 		}
 	}
 

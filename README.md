@@ -18,7 +18,7 @@ Supports Apple Calendar, Thunderbird, Google Calendar interop, and modern JMAP c
 ├──────────────────────────────────────────────────────────────┤
 │  Store (PostgreSQL)      │      Jobs (Valkey Queue)          │
 │  caldev schema           │      Background Workers           │
-│  public.users (shared)   │      Scheduling / Cleanup         │
+│  public.mail_accounts    │      Scheduling / Cleanup         │
 └──────────────────────────┴───────────────────────────────────┘
 ```
 
@@ -28,8 +28,8 @@ Supports Apple Calendar, Thunderbird, Google Calendar interop, and modern JMAP c
 - **JMAP** — RFC 8620 session + API (CalendarEvent/get, set, query, changes; Calendar/get, set)
 - **ICS** — RFC 5545 iCalendar parser & generator
 - **Scheduling** — RFC 6638 invitations/replies/cancellations via SMTP (background jobs)
-- **Multi-tenant** — Full tenant isolation via `tenant_id`
-- **Shared Users** — Reads from `public.users` (same table as your mail/auth system)
+- **Multi-tenant** — Full tenant isolation; `mail_accounts.id` serves as both user ID and tenant ID
+- **Shared Users** — Reads from `public.mail_accounts` (same table as your mail system)
 - **App Passwords** — CalDAV clients use `email + app-password` for Basic Auth
 - **JWT** — Shared secret & issuer with your other services
 - **Background Jobs** — Valkey-backed queue with retry, dead-letter, delayed scheduling
@@ -45,7 +45,7 @@ cal-dev/
 │   ├── server/main.go           # Entry point, routing, graceful shutdown
 │   └── demo/demo.go             # Standalone demo (no external deps)
 ├── internal/
-│   ├── auth/auth.go             # JWT (shared issuer) + app password auth
+│   ├── auth/auth.go             # JWT (shared issuer) + app password auth + tenant resolution
 │   ├── caldav/handler.go        # All WebDAV/CalDAV method handlers
 │   ├── config/config.go         # Environment-based configuration
 │   ├── feeds/handler.go         # ICS feed endpoints for Outlook/Google/Apple
@@ -63,7 +63,7 @@ cal-dev/
 │   │   └── service.go           # Sync engine (fetch, parse, import ICS feeds)
 │   └── xmlutil/xmlutil.go       # WebDAV XML parsing & response generation
 ├── migrations/
-│   ├── 000_public_users.sql     # Seed public.users table (development)
+│   ├── 000_public_users.sql     # Seed public.mail_accounts table (development)
 │   ├── 001_init.sql             # CalDev schema (caldev.*)
 │   ├── 002_seed.sql             # Test data seed
 │   └── 003_calendar_subscriptions.sql # External subscription table
@@ -77,7 +77,7 @@ cal-dev/
 - Go 1.22+
 - PostgreSQL 16+
 - Valkey 8+ (or Redis 7+ — wire-compatible)
-- Your existing `public.users` table with columns: `id (UUID)`, `email`, `tenant_id`, `display_name`
+- Your existing `public.mail_accounts` table with columns: `id (UUID PK)`, `email`, `name`
 
 ## Quick Start
 
@@ -188,8 +188,29 @@ POST   /api/subscriptions/:id/sync  → Trigger immediate sync
 ### JWT (Bearer)
 Tokens issued by your existing auth system work automatically — CalDev validates with the same `AUTH_JWT_SECRET` and `AUTH_JWT_ISSUER`.
 
+The JWT payload should include the `mid` claim (the `mail_accounts.id` UUID), which is used as the tenant ID.
+
 ```
 Authorization: Bearer <jwt-token>
+```
+
+### Tenant ID Resolution
+
+CalDev resolves the tenant ID in this priority order:
+
+1. **`X-Tenant-ID` header** — Explicitly set by the calling service (must be the `mail_accounts.id` UUID)
+2. **`access_token` cookie** — JWT is decoded and the `mid` claim is used as tenant ID
+3. **Auth fallback** — The `mid` or `tenant_id` claim from the `Authorization` header JWT
+
+```bash
+# Option 1: Explicit header
+curl -H "X-Tenant-ID: <mail_accounts_id>" -H "Authorization: Bearer <jwt>" ...
+
+# Option 2: Cookie (set by your auth system)
+# The access_token cookie is decoded automatically
+
+# Option 3: JWT mid claim (automatic from Authorization header)
+curl -H "Authorization: Bearer <jwt-with-mid-claim>" ...
 ```
 
 ### Basic Auth (CalDAV clients)
@@ -264,25 +285,23 @@ Jobs support automatic retry (configurable max + exponential backoff) and dead-l
 
 ## Database Schema
 
-CalDev uses the `caldev` schema and references `public.users`:
+CalDev uses the `caldev` schema and references `public.mail_accounts`:
 
 ```
-public.users (YOUR TABLE — not managed by CalDev)
-  ├── id (UUID PK)
+public.mail_accounts (YOUR TABLE — not managed by CalDev)
+  ├── id (UUID PK)        ← serves as both user ID and tenant ID
   ├── email
-  ├── tenant_id
-  └── display_name
+  └── name
 
-caldev.tenants
-caldev.app_passwords     → FK public.users(id)
-caldev.calendars         → FK public.users(id), caldev.tenants(id)
-caldev.events            → FK public.users(id), caldev.calendars(id)
+caldev.app_passwords     → FK public.mail_accounts(id)
+caldev.calendars         → FK public.mail_accounts(id)
+caldev.events            → FK public.mail_accounts(id), caldev.calendars(id)
 caldev.sync_changes      → FK caldev.calendars(id)
-caldev.scheduling_messages → FK public.users(id)
+caldev.scheduling_messages → FK public.mail_accounts(id)
 caldev.locks
-caldev.jmap_states       → FK public.users(id)
+caldev.jmap_states       → FK public.mail_accounts(id)
 caldev.job_history
-caldev.calendar_subscriptions → FK caldev.calendars(id), public.users(id)
+caldev.calendar_subscriptions → FK caldev.calendars(id), public.mail_accounts(id)
 ```
 
 ---
@@ -302,11 +321,11 @@ Two methods are supported on all endpoints:
 | **JWT Bearer** | `Authorization: Bearer <jwt-token>` | Frontend apps, JMAP clients |
 | **Basic Auth** | `Authorization: Basic base64(email:app-password)` | CalDAV clients, ICS feeds |
 
-JWT tokens are validated using a shared `AUTH_JWT_SECRET` + `AUTH_JWT_ISSUER` (same as your mail/auth system). The JWT payload must contain `sub` (user UUID), `tid` (tenant UUID), and `email`.
+JWT tokens are validated using a shared `AUTH_JWT_SECRET` + `AUTH_JWT_ISSUER` (same as your mail/auth system). The JWT payload should contain `sub` (user UUID), `email`, and `mid` (the `mail_accounts.id` UUID used as tenant ID). The `mid` claim takes priority over `tenant_id` when both are present.
 
 Basic Auth requires an **app password** (not the login password). App passwords are managed via the `/api/app-passwords/` endpoints.
 
-All authenticated requests set `user_id`, `tenant_id`, and `email` in the request context. All data is scoped by `tenant_id` + `user_id`.
+All authenticated requests set `user_id`, `tenant_id`, and `email` in the request context. The `tenant_id` is the `mail_accounts.id` UUID, resolved via the X-Tenant-ID header, access_token cookie, or JWT `mid` claim. All data is scoped by `tenant_id` + `user_id`.
 
 ### CORS
 

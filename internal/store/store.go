@@ -55,6 +55,28 @@ func (s *Store) RunMigration(sqlContent string) error {
 	return err
 }
 
+// IsMigrationApplied checks if a migration file has already been recorded.
+func (s *Store) IsMigrationApplied(filename string) (bool, error) {
+	var exists bool
+	err := s.db.QueryRow(
+		`SELECT EXISTS(SELECT 1 FROM caldev_migrations WHERE filename = $1)`,
+		filename,
+	).Scan(&exists)
+	if err != nil {
+		return false, err
+	}
+	return exists, nil
+}
+
+// RecordMigration inserts a migration filename into the tracking table.
+func (s *Store) RecordMigration(filename string) error {
+	_, err := s.db.Exec(
+		`INSERT INTO caldev_migrations (filename) VALUES ($1) ON CONFLICT (filename) DO NOTHING`,
+		filename,
+	)
+	return err
+}
+
 // ============================================================
 // User Operations (reads from mail_accounts — NOT managed by caldev)
 // ============================================================

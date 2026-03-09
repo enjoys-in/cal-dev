@@ -2,7 +2,7 @@
 -- CalDAV Server Database Schema (init)
 -- All tables in public schema with caldev_ prefix.
 -- Users are sourced from mail_accounts (shared with mail system).
--- mail_accounts MUST exist with at least: id (serial PK), email, name
+-- mail_accounts MUST exist with at least: id (UUID PK), email, name
 -- Since mail_accounts has no tenant_id, we use mail_accounts.id as tenant_id.
 -- ============================================================
 
@@ -10,12 +10,21 @@ CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 
 -- ============================================================
+-- Migration Tracking
+-- ============================================================
+CREATE TABLE IF NOT EXISTS caldev_migrations (
+    id              SERIAL PRIMARY KEY,
+    filename        VARCHAR(512) NOT NULL UNIQUE,
+    applied_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- ============================================================
 -- App Passwords (for CalDAV Basic Auth — like Nextcloud/Fastmail)
 -- Users authenticate CalDAV clients with email + app-password.
 -- ============================================================
 CREATE TABLE IF NOT EXISTS caldev_app_passwords (
     id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    user_id         UUID NOT NULL REFERENCES mail_accounts(id) ON DELETE CASCADE,
+    user_id         UUID NOT NULL, -- references mail_accounts(id)
     label           VARCHAR(256) NOT NULL DEFAULT '',
     password_hash   VARCHAR(512) NOT NULL,
     scopes          TEXT[] NOT NULL DEFAULT ARRAY['caldav','jmap'],
@@ -30,8 +39,8 @@ CREATE INDEX IF NOT EXISTS idx_caldev_app_passwords_user ON caldev_app_passwords
 -- ============================================================
 CREATE TABLE IF NOT EXISTS caldev_calendars (
     id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    tenant_id       UUID NOT NULL REFERENCES mail_accounts(id) ON DELETE CASCADE,
-    user_id         UUID NOT NULL REFERENCES mail_accounts(id) ON DELETE CASCADE,
+    tenant_id       UUID NOT NULL, -- references mail_accounts(id)
+    user_id         UUID NOT NULL, -- references mail_accounts(id)
     name            VARCHAR(512) NOT NULL,
     description     TEXT NOT NULL DEFAULT '',
     color           VARCHAR(32) NOT NULL DEFAULT '#0078D4',
@@ -58,8 +67,8 @@ CREATE INDEX IF NOT EXISTS idx_caldev_calendars_tenant_user ON caldev_calendars(
 -- ============================================================
 CREATE TABLE IF NOT EXISTS caldev_events (
     id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    tenant_id       UUID NOT NULL REFERENCES mail_accounts(id) ON DELETE CASCADE,
-    user_id         UUID NOT NULL REFERENCES mail_accounts(id) ON DELETE CASCADE,
+    tenant_id       UUID NOT NULL, -- references mail_accounts(id)
+    user_id         UUID NOT NULL, -- references mail_accounts(id)
     calendar_id     UUID NOT NULL REFERENCES caldev_calendars(id) ON DELETE CASCADE,
     uid             VARCHAR(512) NOT NULL,
     summary         VARCHAR(1024) NOT NULL DEFAULT '',
@@ -109,7 +118,7 @@ CREATE INDEX IF NOT EXISTS idx_caldev_events_tenant_calendar ON caldev_events(te
 -- ============================================================
 CREATE TABLE IF NOT EXISTS caldev_sync_changes (
     id              BIGSERIAL PRIMARY KEY,
-    tenant_id       UUID NOT NULL REFERENCES mail_accounts(id) ON DELETE CASCADE,
+    tenant_id       UUID NOT NULL, -- references mail_accounts(id)
     calendar_id     UUID NOT NULL REFERENCES caldev_calendars(id) ON DELETE CASCADE,
     event_uid       VARCHAR(512) NOT NULL,
     change_type     VARCHAR(16) NOT NULL, -- 'created', 'modified', 'deleted'
@@ -126,8 +135,8 @@ CREATE INDEX IF NOT EXISTS idx_caldev_sync_changes_tenant ON caldev_sync_changes
 -- ============================================================
 CREATE TABLE IF NOT EXISTS caldev_scheduling_messages (
     id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    tenant_id       UUID NOT NULL REFERENCES mail_accounts(id) ON DELETE CASCADE,
-    sender_id       UUID NOT NULL REFERENCES mail_accounts(id) ON DELETE CASCADE,
+    tenant_id       UUID NOT NULL, -- references mail_accounts(id)
+    sender_id       UUID NOT NULL, -- references mail_accounts(id)
     recipient_email VARCHAR(512) NOT NULL,
     event_uid       VARCHAR(512) NOT NULL,
     method          VARCHAR(32) NOT NULL, -- REQUEST, REPLY, CANCEL
@@ -148,7 +157,7 @@ CREATE INDEX IF NOT EXISTS idx_caldev_scheduling_event ON caldev_scheduling_mess
 -- ============================================================
 CREATE TABLE IF NOT EXISTS caldev_locks (
     id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    tenant_id       UUID NOT NULL REFERENCES mail_accounts(id) ON DELETE CASCADE,
+    tenant_id       UUID NOT NULL, -- references mail_accounts(id)
     resource_path   VARCHAR(2048) NOT NULL,
     lock_token      VARCHAR(512) NOT NULL UNIQUE,
     owner           VARCHAR(512) NOT NULL DEFAULT '',
@@ -170,8 +179,8 @@ CREATE INDEX IF NOT EXISTS idx_caldev_locks_tenant ON caldev_locks(tenant_id);
 -- ============================================================
 CREATE TABLE IF NOT EXISTS caldev_jmap_states (
     id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    tenant_id       UUID NOT NULL REFERENCES mail_accounts(id) ON DELETE CASCADE,
-    user_id         UUID NOT NULL REFERENCES mail_accounts(id) ON DELETE CASCADE,
+    tenant_id       UUID NOT NULL, -- references mail_accounts(id)
+    user_id         UUID NOT NULL, -- references mail_accounts(id)
     entity_type     VARCHAR(64) NOT NULL, -- 'CalendarEvent', 'Calendar'
     state           VARCHAR(256) NOT NULL,
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -211,8 +220,8 @@ $$ LANGUAGE plpgsql;
 -- ============================================================
 CREATE TABLE IF NOT EXISTS caldev_calendar_subscriptions (
     id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    tenant_id       UUID NOT NULL REFERENCES mail_accounts(id) ON DELETE CASCADE,
-    user_id         UUID NOT NULL REFERENCES mail_accounts(id) ON DELETE CASCADE,
+    tenant_id       UUID NOT NULL, -- references mail_accounts(id)
+    user_id         UUID NOT NULL, -- references mail_accounts(id)
     calendar_id     UUID NOT NULL REFERENCES caldev_calendars(id) ON DELETE CASCADE,
 
     -- Source configuration
