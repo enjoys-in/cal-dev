@@ -194,7 +194,7 @@ func (h *Handler) Report(c *fiber.Ctx) error {
 	}
 }
 
-func (h *Handler) reportCalendarQuery(c *fiber.Ctx, ctx context.Context, tenantID, userID, path string, body []byte) error {
+func (h *Handler) reportCalendarQuery(c *fiber.Ctx, ctx context.Context, tenantID, userID string, path string, body []byte) error {
 	req, err := xmlutil.ParseCalendarQuery(bytes.NewReader(body))
 	if err != nil {
 		return c.Status(400).SendString("Bad Request: " + err.Error())
@@ -235,7 +235,7 @@ func (h *Handler) reportCalendarQuery(c *fiber.Ctx, ctx context.Context, tenantI
 	return c.Send(buf.Bytes())
 }
 
-func (h *Handler) reportCalendarMultiget(c *fiber.Ctx, ctx context.Context, tenantID, path string, body []byte) error {
+func (h *Handler) reportCalendarMultiget(c *fiber.Ctx, ctx context.Context, tenantID string, path string, body []byte) error {
 	req, err := xmlutil.ParseCalendarMultiget(bytes.NewReader(body))
 	if err != nil {
 		return c.Status(400).SendString("Bad Request: " + err.Error())
@@ -268,7 +268,7 @@ func (h *Handler) reportCalendarMultiget(c *fiber.Ctx, ctx context.Context, tena
 	return c.Send(buf.Bytes())
 }
 
-func (h *Handler) reportSyncCollection(c *fiber.Ctx, ctx context.Context, tenantID, path string, body []byte) error {
+func (h *Handler) reportSyncCollection(c *fiber.Ctx, ctx context.Context, tenantID string, path string, body []byte) error {
 	req, err := xmlutil.ParseSyncCollection(bytes.NewReader(body))
 	if err != nil {
 		return c.Status(400).SendString("Bad Request: " + err.Error())
@@ -654,14 +654,8 @@ func (h *Handler) Unlock(c *fiber.Ctx) error {
 // ============================================================
 
 func (h *Handler) WellKnown(c *fiber.Ctx) error {
-	tenantID, ok := c.Locals("tenant_id").(string)
-	if !ok || tenantID == "" {
-		tenantID = "default"
-	}
-	userID, ok := c.Locals("user_id").(string)
-	if !ok || userID == "" {
-		userID = "default"
-	}
+	tenantID, _ := c.Locals("tenant_id").(string)
+	userID, _ := c.Locals("user_id").(string)
 	c.Set("Location", fmt.Sprintf("/dav/%s/%s/", tenantID, userID))
 	return c.SendStatus(301)
 }
@@ -670,7 +664,7 @@ func (h *Handler) WellKnown(c *fiber.Ctx) error {
 // Property Building Helpers
 // ============================================================
 
-func (h *Handler) propfindRoot(tenantID, userID, path string, req *xmlutil.PropfindRequest) []xmlutil.DAVResponse {
+func (h *Handler) propfindRoot(tenantID, userID string, path string, req *xmlutil.PropfindRequest) []xmlutil.DAVResponse {
 	props := make(map[string]string)
 	props["resourcetype"] = `<D:resourcetype><D:collection/></D:resourcetype>`
 	props["current-user-principal"] = fmt.Sprintf(`<D:current-user-principal><D:href>/dav/%s/%s/</D:href></D:current-user-principal>`, tenantID, userID)
@@ -685,7 +679,7 @@ func (h *Handler) propfindRoot(tenantID, userID, path string, req *xmlutil.Propf
 	}}
 }
 
-func (h *Handler) propfindPrincipal(tenantID, userID, path string, req *xmlutil.PropfindRequest) []xmlutil.DAVResponse {
+func (h *Handler) propfindPrincipal(tenantID, userID string, path string, req *xmlutil.PropfindRequest) []xmlutil.DAVResponse {
 	calHomePath := fmt.Sprintf("/dav/%s/%s/calendars/", tenantID, userID)
 	principalPath := fmt.Sprintf("/dav/%s/%s/", tenantID, userID)
 
@@ -705,7 +699,7 @@ func (h *Handler) propfindPrincipal(tenantID, userID, path string, req *xmlutil.
 	}}
 }
 
-func (h *Handler) propfindCalendarHome(tenantID, userID, path string, calendars []*models.Calendar, req *xmlutil.PropfindRequest, depth string) []xmlutil.DAVResponse {
+func (h *Handler) propfindCalendarHome(tenantID, userID string, path string, calendars []*models.Calendar, req *xmlutil.PropfindRequest, depth string) []xmlutil.DAVResponse {
 	var responses []xmlutil.DAVResponse
 
 	// Calendar home itself
@@ -733,7 +727,7 @@ func (h *Handler) propfindCalendarHome(tenantID, userID, path string, calendars 
 	return responses
 }
 
-func (h *Handler) propfindCalendar(tenantID, userID, path string, cal *models.Calendar, req *xmlutil.PropfindRequest, depth string) []xmlutil.DAVResponse {
+func (h *Handler) propfindCalendar(tenantID, userID string, path string, cal *models.Calendar, req *xmlutil.PropfindRequest, depth string) []xmlutil.DAVResponse {
 	var responses []xmlutil.DAVResponse
 	responses = append(responses, h.buildCalendarResponse(path, cal))
 	return responses

@@ -17,7 +17,7 @@ import (
 
 // Service provides authentication functionality.
 // JWT is verified with the same secret and issuer used by the mail/other services.
-// CalDAV Basic Auth uses app-passwords stored in caldev.app_passwords.
+// CalDAV Basic Auth uses app-passwords stored in caldev_app_passwords.
 type Service struct {
 	store  *store.Store
 	config *config.AuthConfig
@@ -29,9 +29,11 @@ func NewService(s *store.Store, cfg *config.AuthConfig) *Service {
 }
 
 // Claims represents JWT claims (compatible with the shared issuer token format).
+// The external mail system JWT uses "mid" (mail_accounts.id) as the tenant identifier.
 type Claims struct {
 	UserID   string `json:"user_id"`
 	TenantID string `json:"tenant_id"`
+	MID      string `json:"mid"` // mail_accounts.id — used as tenant ID
 	Email    string `json:"email"`
 	jwt.RegisteredClaims
 }
@@ -49,7 +51,7 @@ func CheckPassword(password, hash string) bool {
 }
 
 // GenerateToken creates a JWT token using the shared secret and issuer.
-func (s *Service) GenerateToken(userID, tenantID, email string) (string, error) {
+func (s *Service) GenerateToken(userID, tenantID string, email string) (string, error) {
 	issuer := s.config.JWTIssuer
 	if issuer == "" {
 		issuer = "caldev"
@@ -104,6 +106,11 @@ func (s *Service) ValidateToken(tokenString string) (*Claims, error) {
 		claims.UserID = claims.Subject
 	}
 
+	// Use mid (mail_accounts.id) as tenant ID when present
+	if claims.TenantID == "" && claims.MID != "" {
+		claims.TenantID = claims.MID
+	}
+
 	// Populate Email from Subject if subject looks like an email
 	if claims.Email == "" && claims.Subject != "" && strings.Contains(claims.Subject, "@") {
 		claims.Email = claims.Subject
@@ -144,11 +151,11 @@ func ParseBasicAuth(authHeader string) (*BasicAuthResult, error) {
 }
 
 // AuthenticateBasic authenticates a user via email + app password.
-// 1. Looks up user by email in public.users
-// 2. Checks the password against caldev.app_passwords
-// Returns (userID, tenantID, error).
+// 1. Looks up user by email in mail_accounts
+// 2. Checks the password against caldev_app_passwords
+// Returns (userID, tenantID, error). tenantID == userID since mail_accounts has no tenant_id.
 func (s *Service) AuthenticateBasic(ctx context.Context, email, password string) (string, string, error) {
-	// Look up user in public.users by email
+	// Look up user in mail_accounts by email
 	user, err := s.store.GetUserByEmail(ctx, email)
 	if err != nil {
 		return "", "", fmt.Errorf("auth: lookup error: %w", err)
@@ -169,16 +176,17 @@ func (s *Service) AuthenticateBasic(ctx context.Context, email, password string)
 			go func(id string) {
 				_ = s.store.TouchAppPassword(context.Background(), id)
 			}(ap.ID)
-			return user.ID, user.TenantID, nil
+			// tenant_id == user.ID (mail_accounts has no tenant_id)
+			return user.ID, user.ID, nil
 		}
 	}
 
 	return "", "", fmt.Errorf("auth: invalid credentials")
 }
 
-// ResolveUserFromToken looks up the user in public.users by the JWT claims.
+// ResolveUserFromToken looks up the user in mail_accounts by the JWT claims.
 // Tries email first (most reliable), then falls back to user_id/subject.
-// This ensures the user still exists and fetches current tenant_id.
+// This ensures the user still exists and sets tenant_id = user.ID.
 func (s *Service) ResolveUserFromToken(ctx context.Context, claims *Claims) (*Claims, error) {
 	var user *models.User
 	var err error
@@ -200,12 +208,13 @@ func (s *Service) ResolveUserFromToken(ctx context.Context, claims *Claims) (*Cl
 	}
 
 	if user == nil {
-		return nil, fmt.Errorf("auth: user not found in public.users")
+		return nil, fmt.Errorf("auth: user not found in mail_accounts")
 	}
 
-	// Always use canonical values from public.users
+	// Always use canonical values from mail_accounts
+	// tenant_id == user.ID (mail_accounts has no tenant_id)
 	claims.UserID = user.ID
-	claims.TenantID = user.TenantID
+	claims.TenantID = user.ID
 	claims.Email = user.Email
 	return claims, nil
 }

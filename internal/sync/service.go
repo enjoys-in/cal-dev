@@ -129,7 +129,7 @@ func (s *Service) SyncSubscription(ctx context.Context, sub *models.CalendarSubs
 }
 
 // SyncOneSingle syncs a single subscription by ID (for manual "sync now" API).
-func (s *Service) SyncOne(ctx context.Context, tenantID, subID string) error {
+func (s *Service) SyncOne(ctx context.Context, tenantID string, subID string) error {
 	sub, err := s.store.GetSubscription(ctx, tenantID, subID)
 	if err != nil {
 		return err
@@ -149,7 +149,7 @@ func (s *Service) EnqueueDueSyncs(ctx context.Context) error {
 	}
 
 	for _, sub := range subs {
-		payload, _ := json.Marshal(map[string]string{
+		payload, _ := json.Marshal(map[string]interface{}{
 			"subscription_id": sub.ID,
 			"tenant_id":       sub.TenantID,
 		})
@@ -238,7 +238,7 @@ func (s *Service) fetchFeed(ctx context.Context, sub *models.CalendarSubscriptio
 // ── ICS Parsing ──────────────────────────────────────────────
 
 // parseAllEvents extracts all VEVENT/VTODO components from a multi-event ICS feed.
-func parseAllEvents(rawICS, tenantID, userID, calendarID string) ([]*models.Event, error) {
+func parseAllEvents(rawICS string, tenantID, userID string, calendarID string) ([]*models.Event, error) {
 	if err := ics.ValidateICS(rawICS); err != nil {
 		return nil, err
 	}

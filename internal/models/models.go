@@ -5,29 +5,21 @@ import (
 	"time"
 )
 
-// Tenant represents a multi-tenant organization.
-type Tenant struct {
-	ID        string          `json:"id" db:"id"`
-	Slug      string          `json:"slug" db:"slug"`
-	Name      string          `json:"name" db:"name"`
-	Settings  json.RawMessage `json:"settings" db:"settings"`
-	CreatedAt time.Time       `json:"created_at" db:"created_at"`
-	UpdatedAt time.Time       `json:"updated_at" db:"updated_at"`
-}
-
-// User represents a user from public.users (shared with mail system).
-// This table is NOT managed by caldev — it reads from public.users.
+// User represents a user from mail_accounts (shared with mail system).
+// This table is NOT managed by caldev — it reads from mail_accounts.
 type User struct {
 	ID          string    `json:"id" db:"id"`
-	TenantID    string    `json:"tenant_id" db:"tenant_id"`
 	Email       string    `json:"email" db:"email"`
-	DisplayName string    `json:"display_name" db:"display_name"`
+	Name        string    `json:"name" db:"name"`
+	TenantName  string    `json:"tenant_name" db:"tenant_name"`
+	Status      string    `json:"status" db:"status"`
+	Type        string    `json:"type" db:"type"`
 	CreatedAt   time.Time `json:"created_at" db:"created_at"`
 	UpdatedAt   time.Time `json:"updated_at" db:"updated_at"`
 }
 
 // AppPassword is a CalDAV/JMAP app-specific password (like Nextcloud app passwords).
-// Stored in caldev.app_passwords, linked to public.users.
+// Stored in caldev_app_passwords, linked to mail_accounts.
 type AppPassword struct {
 	ID           string     `json:"id" db:"id"`
 	UserID       string     `json:"user_id" db:"user_id"`
@@ -47,7 +39,7 @@ type Job struct {
 	Created time.Time       `json:"created"`
 }
 
-// JobResult is stored in caldev.job_history after processing.
+// JobResult is stored in caldev_job_history after processing.
 type JobResult struct {
 	ID           string          `json:"id" db:"id"`
 	JobType      string          `json:"job_type" db:"job_type"`
@@ -145,7 +137,7 @@ type SchedulingMessage struct {
 // Lock represents a WebDAV lock.
 type Lock struct {
 	ID             string    `json:"id" db:"id"`
-	TenantID       string    `json:"tenant_id" db:"tenant_id"`
+	TenantID       string       `json:"tenant_id" db:"tenant_id"`
 	ResourcePath   string    `json:"resource_path" db:"resource_path"`
 	LockToken      string    `json:"lock_token" db:"lock_token"`
 	Owner          string    `json:"owner" db:"owner"`

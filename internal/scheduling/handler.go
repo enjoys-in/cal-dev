@@ -29,12 +29,13 @@ func NewHandler(svc *Service) *Handler {
 //   - application/json with {"tenant_id": "...", "ics": "BEGIN:VCALENDAR..."}
 //   - text/calendar with raw ICS body + X-Tenant-ID header
 func (h *Handler) IncomingIMIP(c *fiber.Ctx) error {
-	var tenantID, rawICS string
+	var tenantID string
+	var rawICS string
 
 	contentType := strings.ToLower(c.Get("Content-Type"))
 
 	if strings.Contains(contentType, "application/json") {
-		// JSON body: {"tenant_id": "...", "ics": "BEGIN:VCALENDAR..."}
+		// JSON body: {"tenant_id": 123, "ics": "BEGIN:VCALENDAR..."}
 		var req struct {
 			TenantID string `json:"tenant_id"`
 			ICS      string `json:"ics"`
@@ -56,7 +57,9 @@ func (h *Handler) IncomingIMIP(c *fiber.Ctx) error {
 	} else {
 		// Raw ICS body (text/calendar)
 		rawICS = string(c.Body())
-		tenantID = c.Get("X-Tenant-ID")
+		if tidStr := c.Get("X-Tenant-ID"); tidStr != "" {
+			tenantID = tidStr
+		}
 		if tenantID == "" {
 			if tid, ok := c.Locals("tenant_id").(string); ok {
 				tenantID = tid

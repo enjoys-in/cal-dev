@@ -90,7 +90,7 @@ func DAVAuth(authSvc *auth.Service, s *store.Store) fiber.Handler {
 				return c.Status(401).SendString("Invalid token")
 			}
 
-			// Resolve user from public.users to get canonical tenant_id
+			// Resolve user from mail_accounts to get canonical IDs
 			resolved, err := authSvc.ResolveUserFromToken(c.UserContext(), claims)
 			if err != nil {
 				c.Set("WWW-Authenticate", `Basic realm="CalDAV Server"`)
@@ -98,7 +98,7 @@ func DAVAuth(authSvc *auth.Service, s *store.Store) fiber.Handler {
 			}
 
 			c.Locals("user_id", resolved.UserID)
-			c.Locals("tenant_id", resolved.TenantID)
+			c.Locals("tenant_id", resolveTenantID(c, authSvc, resolved.TenantID))
 			c.Locals("email", resolved.Email)
 			return c.Next()
 		}
@@ -118,7 +118,7 @@ func DAVAuth(authSvc *auth.Service, s *store.Store) fiber.Handler {
 			}
 
 			c.Locals("user_id", userID)
-			c.Locals("tenant_id", tenantID)
+			c.Locals("tenant_id", resolveTenantID(c, authSvc, tenantID))
 			c.Locals("email", result.Email)
 			return c.Next()
 		}
@@ -161,29 +161,8 @@ func JMAPAuth(authSvc *auth.Service, s *store.Store) fiber.Handler {
 		}
 
 		c.Locals("user_id", resolved.UserID)
-		c.Locals("tenant_id", resolved.TenantID)
+		c.Locals("tenant_id", resolveTenantID(c, authSvc, resolved.TenantID))
 		c.Locals("email", resolved.Email)
-		return c.Next()
-	}
-}
-
-// TenantResolver resolves tenant from path and sets locals.
-func TenantResolver(s *store.Store) fiber.Handler {
-	return func(c *fiber.Ctx) error {
-		tenantSlug := extractTenantFromPath(c.Path())
-		if tenantSlug == "" {
-			return c.Next()
-		}
-
-		tenant, err := s.GetTenantBySlug(c.UserContext(), tenantSlug)
-		if err != nil {
-			return c.Status(500).SendString("Internal Server Error")
-		}
-		if tenant != nil {
-			c.Locals("tenant_id", tenant.ID)
-			c.Locals("tenant_slug", tenant.Slug)
-		}
-
 		return c.Next()
 	}
 }
@@ -196,6 +175,32 @@ func XMLSizeLimit(maxSize int) fiber.Handler {
 		}
 		return c.Next()
 	}
+}
+
+// resolveTenantID determines the tenant ID using the following priority:
+//  1. X-Tenant-ID request header
+//  2. access_token cookie → decode JWT → use "mid" claim
+//  3. Fallback to the value provided by auth (mail_accounts.id)
+func resolveTenantID(c *fiber.Ctx, authSvc *auth.Service, fallback string) string {
+	// 1. Explicit header
+	if tid := c.Get("X-Tenant-ID"); tid != "" {
+		return tid
+	}
+
+	// 2. access_token cookie → decode JWT → mid claim
+	if cookieToken := c.Cookies("access_token"); cookieToken != "" {
+		if claims, err := authSvc.ValidateToken(cookieToken); err == nil {
+			if claims.MID != "" {
+				return claims.MID
+			}
+			if claims.TenantID != "" {
+				return claims.TenantID
+			}
+		}
+	}
+
+	// 3. Fallback (typically mail_accounts.id from auth)
+	return fallback
 }
 
 // extractTenantFromPath extracts tenant ID/slug from URL path.

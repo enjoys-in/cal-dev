@@ -6,7 +6,6 @@ import (
 	"log"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
 	"time"
 
@@ -56,13 +55,6 @@ func main() {
 			log.Printf("Migration warning (may already be applied): %v", err)
 		} else {
 			log.Println("Database migration applied successfully")
-		}
-	}
-	if migrationSQL, err := os.ReadFile("migrations/003_calendar_subscriptions.sql"); err == nil {
-		if err := db.RunMigration(string(migrationSQL)); err != nil {
-			log.Printf("Subscription migration warning (may already be applied): %v", err)
-		} else {
-			log.Println("Subscription migration applied successfully")
 		}
 	}
 
@@ -343,13 +335,11 @@ func deleteAppPasswordHandler(db *store.Store) fiber.Handler {
 	}
 }
 
-// createUserHandler provisions a new user + default calendar.
+// createUserHandler looks up an existing mail_accounts user and creates their default calendar.
 func createUserHandler(db *store.Store) fiber.Handler {
 	return func(c *fiber.Ctx) error {
 		var req struct {
-			Email       string `json:"email"`
-			DisplayName string `json:"display_name"`
-			TenantID    string `json:"tenant_id"`
+			Email string `json:"email"`
 		}
 		if err := c.BodyParser(&req); err != nil {
 			return response.Error(c, 400, "invalid request body")
@@ -357,24 +347,17 @@ func createUserHandler(db *store.Store) fiber.Handler {
 		if req.Email == "" {
 			return response.Error(c, 400, "email is required")
 		}
-		// Default tenant
-		if req.TenantID == "" {
-			req.TenantID = "b0000000-0000-0000-0000-000000000001"
-		}
-		if req.DisplayName == "" {
-			req.DisplayName = strings.Split(req.Email, "@")[0]
+
+		// Look up user from mail_accounts
+		user, err := db.GetUserByEmail(c.UserContext(), req.Email)
+		if err != nil || user == nil {
+			return response.Error(c, 404, "user not found in mail_accounts")
 		}
 
-		// Create user
-		user, err := db.CreateUser(c.UserContext(), req.TenantID, req.Email, req.DisplayName)
-		if err != nil {
-			return response.Error(c, 500, "failed to create user: "+err.Error())
-		}
-
-		// Create default calendar
+		// Create default calendar (tenant_id = user.ID)
 		cal := &models.Calendar{
 			ID:                  uuid.New().String(),
-			TenantID:            req.TenantID,
+			TenantID:            user.ID,
 			UserID:              user.ID,
 			Name:                "Personal",
 			Description:         "Default calendar",
@@ -392,12 +375,11 @@ func createUserHandler(db *store.Store) fiber.Handler {
 			log.Printf("Warning: default calendar may already exist: %v", err)
 		}
 
-		return response.Created(c, "User created", fiber.Map{
-			"user_id":      user.ID,
-			"email":        user.Email,
-			"tenant_id":    user.TenantID,
-			"display_name": user.DisplayName,
-			"calendar_id":  cal.ID,
+		return response.Created(c, "User provisioned for CalDev", fiber.Map{
+			"user_id":     user.ID,
+			"email":       user.Email,
+			"tenant_id":   user.ID,
+			"calendar_id": cal.ID,
 		})
 	}
 }

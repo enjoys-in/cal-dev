@@ -150,7 +150,7 @@ func (svc *Service) sendTLS(addr string, auth smtp.Auth, from, to string, body [
 }
 
 // ProcessReply handles an incoming scheduling reply (PARTSTAT update).
-func (svc *Service) ProcessReply(ctx context.Context, tenantID, eventUID, attendeeEmail, partstat string) error {
+func (svc *Service) ProcessReply(ctx context.Context, tenantID string, eventUID, attendeeEmail, partstat string) error {
 	events, err := svc.store.QueryEvents(ctx, &models.EventFilter{
 		TenantID: tenantID,
 		UIDs:     []string{eventUID},
@@ -190,7 +190,7 @@ func (svc *Service) SendCancellation(ctx context.Context, event *models.Event) e
 
 // SendReplyToOrganizer sends a METHOD:REPLY email to the event organizer
 // when an attendee RSVPs (accept/decline/tentative).
-func (svc *Service) SendReplyToOrganizer(ctx context.Context, tenantID, eventUID, attendeeEmail, partstat string) error {
+func (svc *Service) SendReplyToOrganizer(ctx context.Context, tenantID string, eventUID, attendeeEmail, partstat string) error {
 	events, err := svc.store.QueryEvents(ctx, &models.EventFilter{
 		TenantID: tenantID,
 		UIDs:     []string{eventUID},

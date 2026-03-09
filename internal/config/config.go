@@ -45,7 +45,6 @@ type DatabaseConfig struct {
 	User            string
 	Password        string
 	DBName          string
-	Schema          string
 	SSLMode         string
 	MaxOpenConns    int
 	MaxIdleConns    int
@@ -100,8 +99,8 @@ type TLSConfig struct {
 // DSN returns the PostgreSQL connection string.
 func (d *DatabaseConfig) DSN() string {
 	return fmt.Sprintf(
-		"host=%s port=%d user=%s password=%s dbname=%s sslmode=%s search_path=%s,public",
-		d.Host, d.Port, d.User, d.Password, d.DBName, d.SSLMode, d.Schema,
+		"host=%s port=%d user=%s password=%s dbname=%s sslmode=%s",
+		d.Host, d.Port, d.User, d.Password, d.DBName, d.SSLMode,
 	)
 }
 
@@ -133,7 +132,6 @@ func Load() *Config {
 			User:            envStr("DB_USER", "caldev"),
 			Password:        envStr("DB_PASSWORD", "caldev"),
 			DBName:          envStr("DB_NAME", "caldev"),
-			Schema:          envStr("DB_SCHEMA", "caldev"),
 			SSLMode:         envStr("DB_SSLMODE", "disable"),
 			MaxOpenConns:    envInt("DB_MAX_OPEN_CONNS", 50),
 			MaxIdleConns:    envInt("DB_MAX_IDLE_CONNS", 10),
