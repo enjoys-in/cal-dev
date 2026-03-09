@@ -13,9 +13,18 @@ type Config struct {
 	Database DatabaseConfig
 	Redis    RedisConfig // Valkey-compatible (wire protocol == Redis)
 	Auth     AuthConfig
+	App      AppConfig
 	SMTP     SMTPConfig
 	TLS      TLSConfig
 	Worker   WorkerConfig
+}
+
+// AppConfig holds application-level header validation settings.
+type AppConfig struct {
+	APIKey    string // expected value of x-api-key header
+	Name      string // expected value of X-App-Name header
+	Version   string // expected value of X-App-Version header
+	Signature string // expected value of x-signature header
 }
 
 // ServerConfig holds HTTP server settings.
@@ -144,6 +153,12 @@ func Load() *Config {
 			OAuth2Enabled:    envBool("AUTH_OAUTH2_ENABLED", false),
 			BasicAuthEnabled: envBool("AUTH_BASIC_ENABLED", true),
 			AdminAPIKey:      envStr("ADMIN_API_KEY", ""),
+		},
+		App: AppConfig{
+			APIKey:    envStr("APP_API_KEY", ""),
+			Name:      envStr("APP_NAME", "AirSend"),
+			Version:   envStr("APP_VERSION", "1.0.0"),
+			Signature: envStr("APP_SIGNATURE", ""),
 		},
 		SMTP: SMTPConfig{
 			Host:     envStr("SMTP_HOST", "localhost"),

@@ -10,6 +10,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/joho/godotenv"
+
 	"github.com/enjoys-in/cal-dev/internal/auth"
 	"github.com/enjoys-in/cal-dev/internal/caldav"
 	"github.com/enjoys-in/cal-dev/internal/config"
@@ -30,6 +32,11 @@ import (
 
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
+
+	// Load .env file (if present) so os.Getenv picks up the values
+	if err := godotenv.Load(); err != nil {
+		log.Printf("No .env file found or error loading it: %v (continuing with OS env)", err)
+	}
 
 	// Load configuration
 	cfg := config.Load()
@@ -119,6 +126,7 @@ func main() {
 	app.Use(middleware.SecurityHeaders())
 	app.Use(middleware.RequestLogger())
 	app.Use(middleware.CORSHeaders())
+	app.Use(middleware.AppHeaders(&cfg.App))
 	app.Use(middleware.RateLimiter(1000, time.Minute))
 	app.Use(middleware.XMLSizeLimit(10 * 1024 * 1024)) // 10MB XML limit
 

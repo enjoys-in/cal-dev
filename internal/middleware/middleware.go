@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/enjoys-in/cal-dev/internal/auth"
+	"github.com/enjoys-in/cal-dev/internal/config"
 	"github.com/enjoys-in/cal-dev/internal/store"
 	"github.com/gofiber/fiber/v2"
 )
@@ -225,6 +226,52 @@ func APIKeyAuth(apiKey string) fiber.Handler {
 	}
 }
 
+// AppHeaders validates the required application headers:
+//   - X-App-Version  (must match configured version)
+//   - X-App-Name     (must match configured app name)
+//   - x-api-key      (must match configured API key)
+//
+// Requests missing or mismatching any of these headers are rejected.
+func AppHeaders(appCfg *config.AppConfig) fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		// Skip health-check and well-known discovery from header validation
+		path := c.Path()
+		if path == "/health" || strings.HasPrefix(path, "/.well-known/") {
+			return c.Next()
+		}
+
+		// Validate x-api-key
+		if appCfg.APIKey != "" {
+			if key := c.Get("x-api-key"); key != appCfg.APIKey {
+				return c.Status(401).JSON(fiber.Map{"error": "Invalid or missing x-api-key"})
+			}
+		}
+
+		// Validate X-App-Name
+		if appCfg.Name != "" {
+			if name := c.Get("X-App-Name"); !strings.EqualFold(name, appCfg.Name) {
+				return c.Status(400).JSON(fiber.Map{"error": "Invalid or missing X-App-Name"})
+			}
+		}
+
+		// Validate X-App-Version
+		if appCfg.Version != "" {
+			if ver := c.Get("X-App-Version"); ver != appCfg.Version {
+				return c.Status(400).JSON(fiber.Map{"error": "Invalid or missing X-App-Version"})
+			}
+		}
+
+		// Validate x-signature
+		if appCfg.Signature != "" {
+			if sig := c.Get("x-signature"); sig != appCfg.Signature {
+				return c.Status(401).JSON(fiber.Map{"error": "Invalid or missing x-signature"})
+			}
+		}
+
+		return c.Next()
+	}
+}
+
 // CORSHeaders adds CORS headers for JMAP endpoints.
 func CORSHeaders() fiber.Handler {
 	allowedOrigins := map[string]bool{
@@ -241,7 +288,7 @@ func CORSHeaders() fiber.Handler {
 		}
 		c.Set("Access-Control-Allow-Credentials", "true")
 		c.Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS, PROPFIND, PROPPATCH, REPORT, MKCALENDAR, MOVE, COPY, LOCK, UNLOCK")
-		c.Set("Access-Control-Allow-Headers", "Authorization, Content-Type, Depth, If-Match, If-None-Match, Lock-Token, Destination, Overwrite, Prefer, Brief")
+		c.Set("Access-Control-Allow-Headers", "Authorization, Content-Type, Depth, If-Match, If-None-Match, Lock-Token, Destination, Overwrite, Prefer, Brief, X-App-Version, X-App-Name, x-api-key, x-signature")
 		c.Set("Access-Control-Expose-Headers", "ETag, DAV, Allow, Lock-Token")
 		c.Set("Access-Control-Max-Age", "86400")
 
