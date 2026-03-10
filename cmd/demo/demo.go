@@ -39,7 +39,7 @@ func main() {
 
 	cfg := config.Load()
 	fmt.Printf("  Server address : %s\n", cfg.Server.Addr())
-	fmt.Printf("  DB schema      : %s\n", cfg.Database.Schema)
+	fmt.Printf("  DB host        : %s\n", cfg.Database.Host)
 	fmt.Printf("  JWT issuer     : %q\n", cfg.Auth.JWTIssuer)
 	fmt.Printf("  Worker threads : %d\n", cfg.Worker.Concurrency)
 	check("Config loads without panic", true, &passed, &failed)
@@ -57,8 +57,8 @@ func main() {
 	}
 	authSvc := auth.NewService(nil, authCfg) // nil store — token ops don't need DB
 
-	userID := uuid.New().String()
-	tenantID := uuid.New().String()
+	userID := 42
+	tenantID := 42
 	email := "demo@airsend.example"
 
 	token, err := authSvc.GenerateToken(userID, tenantID, email)
@@ -73,7 +73,7 @@ func main() {
 		fmt.Printf("  Claims.Email    = %s\n", claims.Email)
 		fmt.Printf("  Claims.Issuer   = %s\n", claims.Issuer)
 		check("Issuer matches", claims.Issuer == "airsend-auth", &passed, &failed)
-		check("UserID matches", claims.UserID == userID, &passed, &failed)
+		check("UserID matches", claims.UserID == fmt.Sprintf("%d", userID), &passed, &failed)
 		check("Email matches", claims.Email == email, &passed, &failed)
 	}
 
@@ -286,14 +286,14 @@ END:VCALENDAR`
 			},
 		},
 		Accounts: map[string]interface{}{
-			tenantID + ":" + userID: map[string]interface{}{
+			fmt.Sprintf("%d:%d", tenantID, userID): map[string]interface{}{
 				"name":       email,
 				"isPersonal": true,
 				"isReadOnly": false,
 			},
 		},
 		PrimaryAccounts: map[string]string{
-			"urn:ietf:params:jmap:calendars": tenantID + ":" + userID,
+			"urn:ietf:params:jmap:calendars": fmt.Sprintf("%d:%d", tenantID, userID),
 		},
 		Username:       email,
 		APIURL:         "http://localhost:8443/jmap/api",
@@ -345,7 +345,7 @@ END:VCALENDAR`
 	jobResult := &models.JobResult{
 		ID:         uuid.New().String(),
 		JobType:    "send_scheduling_email",
-		Payload:    json.RawMessage(`{"message_id":"abc-123","tenant_id":"` + tenantID + `"}`),
+		Payload:    json.RawMessage(fmt.Sprintf(`{"message_id":"abc-123","tenant_id":%d}`, tenantID)),
 		Status:     "completed",
 		DurationMs: 142,
 	}

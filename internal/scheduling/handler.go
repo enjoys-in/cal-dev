@@ -2,6 +2,7 @@ package scheduling
 
 import (
 	"log"
+	"strconv"
 	"strings"
 
 	"github.com/enjoys-in/cal-dev/internal/ics"
@@ -29,7 +30,7 @@ func NewHandler(svc *Service) *Handler {
 //   - application/json with {"tenant_id": "...", "ics": "BEGIN:VCALENDAR..."}
 //   - text/calendar with raw ICS body + X-Tenant-ID header
 func (h *Handler) IncomingIMIP(c *fiber.Ctx) error {
-	var tenantID string
+	var tenantID int
 	var rawICS string
 
 	contentType := strings.ToLower(c.Get("Content-Type"))
@@ -37,7 +38,7 @@ func (h *Handler) IncomingIMIP(c *fiber.Ctx) error {
 	if strings.Contains(contentType, "application/json") {
 		// JSON body: {"tenant_id": 123, "ics": "BEGIN:VCALENDAR..."}
 		var req struct {
-			TenantID string `json:"tenant_id"`
+			TenantID int    `json:"tenant_id"`
 			ICS      string `json:"ics"`
 			// Optional: override attendee email (mail system knows the sender)
 			SenderEmail string `json:"sender_email"`
@@ -48,9 +49,9 @@ func (h *Handler) IncomingIMIP(c *fiber.Ctx) error {
 		tenantID = req.TenantID
 		rawICS = req.ICS
 
-		if tenantID == "" {
+		if tenantID == 0 {
 			// Fall back to auth context
-			if tid, ok := c.Locals("tenant_id").(string); ok {
+			if tid, ok := c.Locals("tenant_id").(int); ok {
 				tenantID = tid
 			}
 		}
@@ -58,10 +59,10 @@ func (h *Handler) IncomingIMIP(c *fiber.Ctx) error {
 		// Raw ICS body (text/calendar)
 		rawICS = string(c.Body())
 		if tidStr := c.Get("X-Tenant-ID"); tidStr != "" {
-			tenantID = tidStr
+			tenantID, _ = strconv.Atoi(tidStr)
 		}
-		if tenantID == "" {
-			if tid, ok := c.Locals("tenant_id").(string); ok {
+		if tenantID == 0 {
+			if tid, ok := c.Locals("tenant_id").(int); ok {
 				tenantID = tid
 			}
 		}
@@ -70,7 +71,7 @@ func (h *Handler) IncomingIMIP(c *fiber.Ctx) error {
 	if rawICS == "" {
 		return response.Error(c, 400, "no ICS data provided")
 	}
-	if tenantID == "" {
+	if tenantID == 0 {
 		return response.Error(c, 400, "tenant_id is required (via JSON body, X-Tenant-ID header, or auth context)")
 	}
 
@@ -132,7 +133,7 @@ func (h *Handler) IncomingIMIP(c *fiber.Ctx) error {
 //
 // POST /api/scheduling/rsvp
 func (h *Handler) RSVPRespond(c *fiber.Ctx) error {
-	tenantID, _ := c.Locals("tenant_id").(string)
+	tenantID, _ := c.Locals("tenant_id").(int)
 	email, _ := c.Locals("email").(string)
 
 	var req struct {

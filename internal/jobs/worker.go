@@ -213,21 +213,21 @@ func (w *Worker) maintenanceLoop(ctx context.Context) {
 // SchedulingEmailPayload is the payload for send_scheduling_email jobs.
 type SchedulingEmailPayload struct {
 	MessageID string `json:"message_id"`
-	TenantID  string `json:"tenant_id"`
+	TenantID  int    `json:"tenant_id"`
 }
 
 // ProcessICSPayload is the payload for process_ics jobs.
 type ProcessICSPayload struct {
-	TenantID   string `json:"tenant_id"`
+	TenantID   int    `json:"tenant_id"`
 	CalendarID string `json:"calendar_id"`
 	EventUID   string `json:"event_uid"`
 	RawICS     string `json:"raw_ics"`
-	UserID     string `json:"user_id"`
+	UserID     int    `json:"user_id"`
 }
 
 // SyncNotificationPayload is the payload for sync_notification jobs.
 type SyncNotificationPayload struct {
-	TenantID   string `json:"tenant_id"`
+	TenantID   int    `json:"tenant_id"`
 	CalendarID string `json:"calendar_id"`
 	ChangeType string `json:"change_type"`
 	EventUID   string `json:"event_uid"`

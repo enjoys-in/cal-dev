@@ -61,6 +61,9 @@ func main() {
 		"migrations/001_init.sql",
 		// "migrations/002_seed.sql",
 		// "migrations/003_calendar_subscriptions.sql",
+		"migrations/004_fix_uuid_to_integer.sql",
+		"migrations/005_ensure_pgcrypto.sql",
+		"migrations/006_restore_uuid_defaults.sql",
 	}
 	for _, mf := range migrationFiles {
 		sqlBytes, err := os.ReadFile(mf)
@@ -175,12 +178,12 @@ func main() {
 	davGroup.Options("/*", caldavHandler.Options)
 
 	// Principal
-	davGroup.All("/:tenant/:user", caldavHandler.Propfind).Name("principal")
-	davGroup.All("/:tenant/:user/", caldavHandler.Propfind)
+	davGroup.All("/:tenant/:user", handleDAVMethod(caldavHandler)).Name("principal")
+	davGroup.All("/:tenant/:user/", handleDAVMethod(caldavHandler))
 
 	// Calendar Home
-	davGroup.All("/:tenant/:user/calendars", caldavHandler.Propfind)
-	davGroup.All("/:tenant/:user/calendars/", caldavHandler.Propfind)
+	davGroup.All("/:tenant/:user/calendars", handleDAVMethod(caldavHandler))
+	davGroup.All("/:tenant/:user/calendars/", handleDAVMethod(caldavHandler))
 
 	// Calendar Collection & Events
 	davGroup.All("/:tenant/:user/calendars/:calendar", handleDAVMethod(caldavHandler))
@@ -317,7 +320,7 @@ func handleDAVMethod(h *caldav.Handler) fiber.Handler {
 // createAppPasswordHandler creates a new app password for CalDAV Basic Auth.
 func createAppPasswordHandler(db *store.Store) fiber.Handler {
 	return func(c *fiber.Ctx) error {
-		userID := c.Locals("user_id").(string)
+		userID := c.Locals("user_id").(int)
 
 		var req struct {
 			Label    string `json:"label"`
@@ -342,7 +345,7 @@ func createAppPasswordHandler(db *store.Store) fiber.Handler {
 		}
 
 		if err := db.CreateAppPasswordFromInput(c.UserContext(), ap); err != nil {
-			return response.Error(c, 500, "create failed")
+			return response.Error(c, 500, "create failed", err.Error())
 		}
 
 		return response.Created(c, "App password created. Use your email + this password for CalDAV Basic Auth.", fiber.Map{

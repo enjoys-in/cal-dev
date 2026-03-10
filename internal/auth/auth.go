@@ -5,6 +5,7 @@ import (
 	"crypto/subtle"
 	"encoding/base64"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -51,21 +52,24 @@ func CheckPassword(password, hash string) bool {
 }
 
 // GenerateToken creates a JWT token using the shared secret and issuer.
-func (s *Service) GenerateToken(userID, tenantID string, email string) (string, error) {
+func (s *Service) GenerateToken(userID, tenantID int, email string) (string, error) {
 	issuer := s.config.JWTIssuer
 	if issuer == "" {
 		issuer = "caldev"
 	}
 
+	userIDStr := strconv.Itoa(userID)
+	tenantIDStr := strconv.Itoa(tenantID)
+
 	claims := &Claims{
-		UserID:   userID,
-		TenantID: tenantID,
+		UserID:   userIDStr,
+		TenantID: tenantIDStr,
 		Email:    email,
 		RegisteredClaims: jwt.RegisteredClaims{
 			ExpiresAt: jwt.NewNumericDate(time.Now().Add(s.config.TokenExpiry)),
 			IssuedAt:  jwt.NewNumericDate(time.Now()),
 			Issuer:    issuer,
-			Subject:   userID,
+			Subject:   userIDStr,
 		},
 	}
 
@@ -75,6 +79,7 @@ func (s *Service) GenerateToken(userID, tenantID string, email string) (string, 
 
 // ValidateToken validates a JWT token using the shared secret.
 // Accepts tokens from any service that uses the same secret+issuer.
+// Uses MapClaims internally to handle both numeric and string claim values.
 func (s *Service) ValidateToken(tokenString string) (*Claims, error) {
 	parserOpts := []jwt.ParserOption{
 		jwt.WithValidMethods([]string{"HS256", "HS384", "HS512"}),
@@ -85,7 +90,7 @@ func (s *Service) ValidateToken(tokenString string) (*Claims, error) {
 		parserOpts = append(parserOpts, jwt.WithIssuer(s.config.JWTIssuer))
 	}
 
-	token, err := jwt.ParseWithClaims(tokenString, &Claims{}, func(token *jwt.Token) (interface{}, error) {
+	token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
 		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
 			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
 		}
@@ -96,9 +101,21 @@ func (s *Service) ValidateToken(tokenString string) (*Claims, error) {
 		return nil, err
 	}
 
-	claims, ok := token.Claims.(*Claims)
+	mc, ok := token.Claims.(jwt.MapClaims)
 	if !ok || !token.Valid {
 		return nil, fmt.Errorf("invalid token")
+	}
+
+	claims := &Claims{
+		UserID:   claimStr(mc, "user_id"),
+		TenantID: claimStr(mc, "tenant_id"),
+		MID:      claimStr(mc, "mid"),
+		Email:    claimStr(mc, "email"),
+	}
+
+	// Extract standard registered claims
+	if sub, _ := mc.GetSubject(); sub != "" {
+		claims.Subject = sub
 	}
 
 	// Populate UserID from Subject if not set in custom claim
@@ -117,6 +134,25 @@ func (s *Service) ValidateToken(tokenString string) (*Claims, error) {
 	}
 
 	return claims, nil
+}
+
+// claimStr extracts a claim value as a string, handling both JSON string and number types.
+func claimStr(mc jwt.MapClaims, key string) string {
+	v, ok := mc[key]
+	if !ok {
+		return ""
+	}
+	switch val := v.(type) {
+	case string:
+		return val
+	case float64:
+		if val == float64(int(val)) {
+			return strconv.Itoa(int(val))
+		}
+		return strconv.FormatFloat(val, 'f', -1, 64)
+	default:
+		return fmt.Sprintf("%v", val)
+	}
 }
 
 // BasicAuthResult holds the result of basic auth parsing.
@@ -154,20 +190,20 @@ func ParseBasicAuth(authHeader string) (*BasicAuthResult, error) {
 // 1. Looks up user by email in mail_accounts
 // 2. Checks the password against caldev_app_passwords
 // Returns (userID, tenantID, error). tenantID == userID since mail_accounts has no tenant_id.
-func (s *Service) AuthenticateBasic(ctx context.Context, email, password string) (string, string, error) {
+func (s *Service) AuthenticateBasic(ctx context.Context, email, password string) (int, int, error) {
 	// Look up user in mail_accounts by email
 	user, err := s.store.GetUserByEmail(ctx, email)
 	if err != nil {
-		return "", "", fmt.Errorf("auth: lookup error: %w", err)
+		return 0, 0, fmt.Errorf("auth: lookup error: %w", err)
 	}
 	if user == nil {
-		return "", "", fmt.Errorf("auth: user not found")
+		return 0, 0, fmt.Errorf("auth: user not found")
 	}
 
 	// Check app passwords for this user
 	appPasswords, err := s.store.GetAppPasswordsByUser(ctx, user.ID)
 	if err != nil {
-		return "", "", fmt.Errorf("auth: app password lookup error: %w", err)
+		return 0, 0, fmt.Errorf("auth: app password lookup error: %w", err)
 	}
 
 	for _, ap := range appPasswords {
@@ -181,13 +217,20 @@ func (s *Service) AuthenticateBasic(ctx context.Context, email, password string)
 		}
 	}
 
-	return "", "", fmt.Errorf("auth: invalid credentials")
+	return 0, 0, fmt.Errorf("auth: invalid credentials")
+}
+
+// ResolvedAuth holds the resolved user identity with integer IDs.
+type ResolvedAuth struct {
+	UserID   int
+	TenantID int
+	Email    string
 }
 
 // ResolveUserFromToken looks up the user in mail_accounts by the JWT claims.
 // Tries email first (most reliable), then falls back to user_id/subject.
 // This ensures the user still exists and sets tenant_id = user.ID.
-func (s *Service) ResolveUserFromToken(ctx context.Context, claims *Claims) (*Claims, error) {
+func (s *Service) ResolveUserFromToken(ctx context.Context, claims *Claims) (*ResolvedAuth, error) {
 	var user *models.User
 	var err error
 
@@ -201,9 +244,12 @@ func (s *Service) ResolveUserFromToken(ctx context.Context, claims *Claims) (*Cl
 
 	// 2. Fall back to user ID / subject
 	if user == nil && claims.UserID != "" {
-		user, err = s.store.GetUserByID(ctx, claims.UserID)
-		if err != nil {
-			return nil, fmt.Errorf("auth: user resolve by id error: %w", err)
+		uid, parseErr := strconv.Atoi(claims.UserID)
+		if parseErr == nil {
+			user, err = s.store.GetUserByID(ctx, uid)
+			if err != nil {
+				return nil, fmt.Errorf("auth: user resolve by id error: %w", err)
+			}
 		}
 	}
 
@@ -213,10 +259,11 @@ func (s *Service) ResolveUserFromToken(ctx context.Context, claims *Claims) (*Cl
 
 	// Always use canonical values from mail_accounts
 	// tenant_id == user.ID (mail_accounts has no tenant_id)
-	claims.UserID = user.ID
-	claims.TenantID = user.ID
-	claims.Email = user.Email
-	return claims, nil
+	return &ResolvedAuth{
+		UserID:   user.ID,
+		TenantID: user.ID,
+		Email:    user.Email,
+	}, nil
 }
 
 // ConstantTimeCompare performs constant-time string comparison.

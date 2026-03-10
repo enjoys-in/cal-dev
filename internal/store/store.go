@@ -94,7 +94,7 @@ func (s *Store) GetUserByEmail(ctx context.Context, email string) (*models.User,
 	return u, err
 }
 
-func (s *Store) GetUserByID(ctx context.Context, id string) (*models.User, error) {
+func (s *Store) GetUserByID(ctx context.Context, id int) (*models.User, error) {
 	u := &models.User{}
 	query := `SELECT id, COALESCE(name, '') as name, email, COALESCE(tenant_name, '') as tenant_name,
 		COALESCE(status, 'ACTIVE') as status, COALESCE(type, 'USER') as type, created_at, updated_at
@@ -107,7 +107,7 @@ func (s *Store) GetUserByID(ctx context.Context, id string) (*models.User, error
 	return u, err
 }
 
-func (s *Store) GetUserByTenantAndEmail(ctx context.Context, tenantID string, email string) (*models.User, error) {
+func (s *Store) GetUserByTenantAndEmail(ctx context.Context, tenantID int, email string) (*models.User, error) {
 	// Since mail_accounts has no tenant_id, tenantID == user.ID.
 	// We just look up by email and verify the ID matches.
 	u, err := s.GetUserByEmail(ctx, email)
@@ -132,7 +132,7 @@ func (s *Store) CreateAppPassword(ctx context.Context, ap *models.AppPassword) e
 		Scan(&ap.CreatedAt)
 }
 
-func (s *Store) GetAppPasswordsByUser(ctx context.Context, userID string) ([]*models.AppPassword, error) {
+func (s *Store) GetAppPasswordsByUser(ctx context.Context, userID int) ([]*models.AppPassword, error) {
 	query := `SELECT id, user_id, label, password_hash, scopes, last_used_at, created_at
 		FROM caldev_app_passwords WHERE user_id = $1 ORDER BY created_at DESC`
 	rows, err := s.db.QueryContext(ctx, query, userID)
@@ -168,7 +168,7 @@ func (s *Store) DeleteAppPassword(ctx context.Context, id string) error {
 // AppPasswordInput is used by the API handler for creating app passwords.
 type AppPasswordInput struct {
 	ID           string
-	UserID       string
+	UserID       int
 	Label        string
 	PasswordHash string
 }
@@ -201,7 +201,7 @@ func (s *Store) CreateCalendar(ctx context.Context, c *models.Calendar) error {
 		Scan(&c.CreatedAt, &c.UpdatedAt)
 }
 
-func (s *Store) GetCalendar(ctx context.Context, tenantID string, calendarID string) (*models.Calendar, error) {
+func (s *Store) GetCalendar(ctx context.Context, tenantID int, calendarID string) (*models.Calendar, error) {
 	c := &models.Calendar{}
 	query := `SELECT id, tenant_id, user_id, name, description, color, timezone, sort_order,
 		ctag, sync_token, is_default, is_visible, is_readonly, supported_components,
@@ -218,7 +218,7 @@ func (s *Store) GetCalendar(ctx context.Context, tenantID string, calendarID str
 	return c, err
 }
 
-func (s *Store) GetCalendarsByUser(ctx context.Context, tenantID, userID string) ([]*models.Calendar, error) {
+func (s *Store) GetCalendarsByUser(ctx context.Context, tenantID, userID int) ([]*models.Calendar, error) {
 	query := `SELECT id, tenant_id, user_id, name, description, color, timezone, sort_order,
 		ctag, sync_token, is_default, is_visible, is_readonly, supported_components,
 		max_resource_size, properties, created_at, updated_at
@@ -243,6 +243,35 @@ func (s *Store) GetCalendarsByUser(ctx context.Context, tenantID, userID string)
 	return calendars, rows.Err()
 }
 
+// EnsureDefaultCalendar creates a default "Personal" calendar if the user has none.
+func (s *Store) EnsureDefaultCalendar(ctx context.Context, tenantID, userID int) error {
+	var count int
+	err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM caldev_calendars WHERE tenant_id = $1 AND user_id = $2`,
+		tenantID, userID).Scan(&count)
+	if err != nil {
+		return err
+	}
+	if count > 0 {
+		return nil
+	}
+	cal := &models.Calendar{
+		ID:                  uuid.New().String(),
+		TenantID:            tenantID,
+		UserID:              userID,
+		Name:                "Personal",
+		Description:         "Default calendar",
+		Color:               "#0078D4",
+		Timezone:            "UTC",
+		IsDefault:           true,
+		IsVisible:           true,
+		SupportedComponents: []string{"VEVENT", "VTODO", "VJOURNAL"},
+		MaxResourceSize:     10485760,
+		Properties:          json.RawMessage(`{}`),
+	}
+	return s.CreateCalendar(ctx, cal)
+}
+
 func (s *Store) UpdateCalendar(ctx context.Context, c *models.Calendar) error {
 	query := `UPDATE caldev_calendars SET
 		name = $3, description = $4, color = $5, timezone = $6, sort_order = $7,
@@ -253,7 +282,7 @@ func (s *Store) UpdateCalendar(ctx context.Context, c *models.Calendar) error {
 	return err
 }
 
-func (s *Store) DeleteCalendar(ctx context.Context, tenantID string, calendarID string) error {
+func (s *Store) DeleteCalendar(ctx context.Context, tenantID int, calendarID string) error {
 	query := `DELETE FROM caldev_calendars WHERE tenant_id = $1 AND id = $2`
 	_, err := s.db.ExecContext(ctx, query, tenantID, calendarID)
 	return err
@@ -304,7 +333,7 @@ func (s *Store) UpdateEvent(ctx context.Context, e *models.Event) error {
 	return err
 }
 
-func (s *Store) GetEvent(ctx context.Context, tenantID string, calendarID, uid string) (*models.Event, error) {
+func (s *Store) GetEvent(ctx context.Context, tenantID int, calendarID, uid string) (*models.Event, error) {
 	e := &models.Event{}
 	query := `SELECT id, tenant_id, user_id, calendar_id, uid, summary, description, location,
 		dtstart, dtend, duration, all_day, recurrence_rule, recurrence_id, sequence,
@@ -328,7 +357,7 @@ func (s *Store) GetEvent(ctx context.Context, tenantID string, calendarID, uid s
 	return e, err
 }
 
-func (s *Store) GetEventByID(ctx context.Context, tenantID string, eventID string) (*models.Event, error) {
+func (s *Store) GetEventByID(ctx context.Context, tenantID int, eventID string) (*models.Event, error) {
 	e := &models.Event{}
 	query := `SELECT id, tenant_id, user_id, calendar_id, uid, summary, description, location,
 		dtstart, dtend, duration, all_day, recurrence_rule, recurrence_id, sequence,
@@ -352,13 +381,13 @@ func (s *Store) GetEventByID(ctx context.Context, tenantID string, eventID strin
 	return e, err
 }
 
-func (s *Store) DeleteEvent(ctx context.Context, tenantID string, calendarID, uid string) error {
+func (s *Store) DeleteEvent(ctx context.Context, tenantID int, calendarID, uid string) error {
 	query := `DELETE FROM caldev_events WHERE tenant_id = $1 AND calendar_id = $2 AND uid = $3`
 	_, err := s.db.ExecContext(ctx, query, tenantID, calendarID, uid)
 	return err
 }
 
-func (s *Store) GetEventsByCalendar(ctx context.Context, tenantID string, calendarID string) ([]*models.Event, error) {
+func (s *Store) GetEventsByCalendar(ctx context.Context, tenantID int, calendarID string) ([]*models.Event, error) {
 	return s.queryEvents(ctx, &models.EventFilter{
 		TenantID:   tenantID,
 		CalendarID: calendarID,
@@ -375,7 +404,7 @@ func (s *Store) queryEvents(ctx context.Context, filter *models.EventFilter) ([]
 	var args []interface{}
 	argIdx := 1
 
-	if filter.TenantID != "" {
+	if filter.TenantID != 0 {
 		conditions = append(conditions, fmt.Sprintf("tenant_id = $%d", argIdx))
 		args = append(args, filter.TenantID)
 		argIdx++
@@ -385,7 +414,7 @@ func (s *Store) queryEvents(ctx context.Context, filter *models.EventFilter) ([]
 		args = append(args, filter.CalendarID)
 		argIdx++
 	}
-	if filter.UserID != "" {
+	if filter.UserID != 0 {
 		conditions = append(conditions, fmt.Sprintf("user_id = $%d", argIdx))
 		args = append(args, filter.UserID)
 		argIdx++
@@ -456,7 +485,7 @@ func (s *Store) queryEvents(ctx context.Context, filter *models.EventFilter) ([]
 }
 
 // MoveEvent moves an event from one calendar to another.
-func (s *Store) MoveEvent(ctx context.Context, tenantID string, oldCalendarID, uid, newCalendarID string) error {
+func (s *Store) MoveEvent(ctx context.Context, tenantID int, oldCalendarID, uid, newCalendarID string) error {
 	query := `UPDATE caldev_events SET calendar_id = $4
 		WHERE tenant_id = $1 AND calendar_id = $2 AND uid = $3`
 	result, err := s.db.ExecContext(ctx, query, tenantID, oldCalendarID, uid, newCalendarID)
@@ -471,7 +500,7 @@ func (s *Store) MoveEvent(ctx context.Context, tenantID string, oldCalendarID, u
 }
 
 // CopyEvent copies an event to another calendar.
-func (s *Store) CopyEvent(ctx context.Context, tenantID string, srcCalendarID, uid, destCalendarID, newID, newETag string) error {
+func (s *Store) CopyEvent(ctx context.Context, tenantID int, srcCalendarID, uid, destCalendarID, newID, newETag string) error {
 	query := `INSERT INTO caldev_events
 		(id, tenant_id, user_id, calendar_id, uid, summary, description, location,
 		 dtstart, dtend, duration, all_day, recurrence_rule, recurrence_id, sequence,
@@ -531,7 +560,7 @@ func (s *Store) CreateLock(ctx context.Context, l *models.Lock) error {
 		Scan(&l.CreatedAt)
 }
 
-func (s *Store) GetLock(ctx context.Context, tenantID string, resourcePath string) (*models.Lock, error) {
+func (s *Store) GetLock(ctx context.Context, tenantID int, resourcePath string) (*models.Lock, error) {
 	l := &models.Lock{}
 	query := `SELECT id, tenant_id, resource_path, lock_token, owner, lock_type, lock_scope,
 		depth, timeout_seconds, created_at, expires_at
@@ -546,7 +575,7 @@ func (s *Store) GetLock(ctx context.Context, tenantID string, resourcePath strin
 	return l, err
 }
 
-func (s *Store) DeleteLock(ctx context.Context, tenantID string, lockToken string) error {
+func (s *Store) DeleteLock(ctx context.Context, tenantID int, lockToken string) error {
 	query := `DELETE FROM caldev_locks WHERE tenant_id = $1 AND lock_token = $2`
 	_, err := s.db.ExecContext(ctx, query, tenantID, lockToken)
 	return err
@@ -573,12 +602,12 @@ func (s *Store) CreateSchedulingMessage(ctx context.Context, m *models.Schedulin
 		Scan(&m.CreatedAt)
 }
 
-func (s *Store) GetPendingSchedulingMessages(ctx context.Context, tenantID string) ([]*models.SchedulingMessage, error) {
+func (s *Store) GetPendingSchedulingMessages(ctx context.Context, tenantID int) ([]*models.SchedulingMessage, error) {
 	var query string
 	var rows *sql.Rows
 	var err error
 
-	if tenantID == "" {
+	if tenantID == 0 {
 		query = `SELECT id, tenant_id, sender_id, recipient_email, event_uid, method, status, raw_ics, error_message, created_at, sent_at
 			FROM caldev_scheduling_messages WHERE status = 'pending' ORDER BY created_at ASC LIMIT 100`
 		rows, err = s.db.QueryContext(ctx, query)
@@ -620,7 +649,7 @@ func (s *Store) UpdateSchedulingMessageStatus(ctx context.Context, id, status, e
 // JMAP State Operations
 // ============================================================
 
-func (s *Store) GetJMAPState(ctx context.Context, tenantID, userID string, entityType string) (string, error) {
+func (s *Store) GetJMAPState(ctx context.Context, tenantID, userID int, entityType string) (string, error) {
 	var state string
 	query := `SELECT state FROM caldev_jmap_states
 		WHERE tenant_id = $1 AND user_id = $2 AND entity_type = $3`
@@ -631,7 +660,7 @@ func (s *Store) GetJMAPState(ctx context.Context, tenantID, userID string, entit
 	return state, err
 }
 
-func (s *Store) GetEventsChangedSince(ctx context.Context, tenantID, userID string, since time.Time) ([]*models.Event, error) {
+func (s *Store) GetEventsChangedSince(ctx context.Context, tenantID, userID int, since time.Time) ([]*models.Event, error) {
 	return s.queryEvents(ctx, &models.EventFilter{
 		TenantID: tenantID,
 		UserID:   userID,
@@ -652,7 +681,7 @@ func (s *Store) UpsertEvent(ctx context.Context, e *models.Event) error {
 }
 
 // EventExistsByUID checks if an event with the given UID exists in the calendar.
-func (s *Store) EventExistsByUID(ctx context.Context, tenantID string, calendarID, uid string) (bool, error) {
+func (s *Store) EventExistsByUID(ctx context.Context, tenantID int, calendarID, uid string) (bool, error) {
 	var exists bool
 	query := `SELECT EXISTS(SELECT 1 FROM caldev_events WHERE tenant_id = $1 AND calendar_id = $2 AND uid = $3)`
 	err := s.db.QueryRowContext(ctx, query, tenantID, calendarID, uid).Scan(&exists)
@@ -660,7 +689,7 @@ func (s *Store) EventExistsByUID(ctx context.Context, tenantID string, calendarI
 }
 
 // GetCalendarCTag returns the current CTag for a calendar.
-func (s *Store) GetCalendarCTag(ctx context.Context, tenantID string, calendarID string) (string, error) {
+func (s *Store) GetCalendarCTag(ctx context.Context, tenantID int, calendarID string) (string, error) {
 	var ctag string
 	query := `SELECT ctag FROM caldev_calendars WHERE tenant_id = $1 AND id = $2`
 	err := s.db.QueryRowContext(ctx, query, tenantID, calendarID).Scan(&ctag)
@@ -671,7 +700,7 @@ func (s *Store) GetCalendarCTag(ctx context.Context, tenantID string, calendarID
 }
 
 // GetCalendarSyncToken returns the current sync token for a calendar.
-func (s *Store) GetCalendarSyncToken(ctx context.Context, tenantID string, calendarID string) (string, error) {
+func (s *Store) GetCalendarSyncToken(ctx context.Context, tenantID int, calendarID string) (string, error) {
 	var token string
 	query := `SELECT sync_token FROM caldev_calendars WHERE tenant_id = $1 AND id = $2`
 	err := s.db.QueryRowContext(ctx, query, tenantID, calendarID).Scan(&token)
@@ -706,7 +735,7 @@ func (s *Store) CreateSubscription(ctx context.Context, sub *models.CalendarSubs
 }
 
 // GetSubscription returns a single subscription by ID.
-func (s *Store) GetSubscription(ctx context.Context, tenantID string, subID string) (*models.CalendarSubscription, error) {
+func (s *Store) GetSubscription(ctx context.Context, tenantID int, subID string) (*models.CalendarSubscription, error) {
 	sub := &models.CalendarSubscription{}
 	query := `SELECT id, tenant_id, user_id, calendar_id, source_type, source_url,
 		display_name, color, auth_type, auth_credentials, is_enabled, sync_interval,
@@ -725,7 +754,7 @@ func (s *Store) GetSubscription(ctx context.Context, tenantID string, subID stri
 }
 
 // GetSubscriptionsByUser returns all subscriptions for a user.
-func (s *Store) GetSubscriptionsByUser(ctx context.Context, tenantID, userID string) ([]*models.CalendarSubscription, error) {
+func (s *Store) GetSubscriptionsByUser(ctx context.Context, tenantID, userID int) ([]*models.CalendarSubscription, error) {
 	query := `SELECT id, tenant_id, user_id, calendar_id, source_type, source_url,
 		display_name, color, auth_type, '', is_enabled, sync_interval,
 		last_synced_at, last_etag, last_error, error_count, events_count, created_at, updated_at
@@ -815,14 +844,14 @@ func (s *Store) UpdateSubscription(ctx context.Context, sub *models.CalendarSubs
 }
 
 // DeleteSubscription deletes a subscription (events in the linked calendar remain).
-func (s *Store) DeleteSubscription(ctx context.Context, tenantID string, subID string) error {
+func (s *Store) DeleteSubscription(ctx context.Context, tenantID int, subID string) error {
 	query := `DELETE FROM caldev_calendar_subscriptions WHERE tenant_id = $1 AND id = $2`
 	_, err := s.db.ExecContext(ctx, query, tenantID, subID)
 	return err
 }
 
 // DeleteEventsByCalendar deletes all events in a calendar (used during re-sync).
-func (s *Store) DeleteEventsByCalendar(ctx context.Context, tenantID string, calendarID string) error {
+func (s *Store) DeleteEventsByCalendar(ctx context.Context, tenantID int, calendarID string) error {
 	query := `DELETE FROM caldev_events WHERE tenant_id = $1 AND calendar_id = $2`
 	_, err := s.db.ExecContext(ctx, query, tenantID, calendarID)
 	return err

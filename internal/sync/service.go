@@ -57,7 +57,7 @@ func NewService(s *store.Store, q *jobs.Queue) *Service {
 func (s *Service) HandleSyncJob(ctx context.Context, job *jobs.Job) error {
 	var payload struct {
 		SubscriptionID string `json:"subscription_id"`
-		TenantID       string `json:"tenant_id"`
+		TenantID       int    `json:"tenant_id"`
 	}
 	if err := json.Unmarshal(job.Payload, &payload); err != nil {
 		return fmt.Errorf("sync: invalid payload: %w", err)
@@ -129,7 +129,7 @@ func (s *Service) SyncSubscription(ctx context.Context, sub *models.CalendarSubs
 }
 
 // SyncOneSingle syncs a single subscription by ID (for manual "sync now" API).
-func (s *Service) SyncOne(ctx context.Context, tenantID string, subID string) error {
+func (s *Service) SyncOne(ctx context.Context, tenantID int, subID string) error {
 	sub, err := s.store.GetSubscription(ctx, tenantID, subID)
 	if err != nil {
 		return err
@@ -238,7 +238,7 @@ func (s *Service) fetchFeed(ctx context.Context, sub *models.CalendarSubscriptio
 // ── ICS Parsing ──────────────────────────────────────────────
 
 // parseAllEvents extracts all VEVENT/VTODO components from a multi-event ICS feed.
-func parseAllEvents(rawICS string, tenantID, userID string, calendarID string) ([]*models.Event, error) {
+func parseAllEvents(rawICS string, tenantID, userID int, calendarID string) ([]*models.Event, error) {
 	if err := ics.ValidateICS(rawICS); err != nil {
 		return nil, err
 	}

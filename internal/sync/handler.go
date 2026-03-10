@@ -24,8 +24,8 @@ func NewHandler(s *store.Store, svc *Service) *Handler {
 // List returns all subscriptions for the authenticated user.
 // GET /api/subscriptions/
 func (h *Handler) List(c *fiber.Ctx) error {
-	tenantID := c.Locals("tenant_id").(string)
-	userID := c.Locals("user_id").(string)
+	tenantID := c.Locals("tenant_id").(int)
+	userID := c.Locals("user_id").(int)
 
 	subs, err := h.store.GetSubscriptionsByUser(c.UserContext(), tenantID, userID)
 	if err != nil {
@@ -48,8 +48,8 @@ func (h *Handler) List(c *fiber.Ctx) error {
 // Create creates a new external calendar subscription.
 // POST /api/subscriptions/
 func (h *Handler) Create(c *fiber.Ctx) error {
-	tenantID := c.Locals("tenant_id").(string)
-	userID := c.Locals("user_id").(string)
+	tenantID := c.Locals("tenant_id").(int)
+	userID := c.Locals("user_id").(int)
 
 	var req struct {
 		SourceURL       string `json:"source_url"`
@@ -157,7 +157,7 @@ func (h *Handler) Create(c *fiber.Ctx) error {
 // Get returns a single subscription.
 // GET /api/subscriptions/:id
 func (h *Handler) Get(c *fiber.Ctx) error {
-	tenantID := c.Locals("tenant_id").(string)
+	tenantID := c.Locals("tenant_id").(int)
 	subID := c.Params("id")
 
 	sub, err := h.store.GetSubscription(c.UserContext(), tenantID, subID)
@@ -174,7 +174,7 @@ func (h *Handler) Get(c *fiber.Ctx) error {
 // Update modifies a subscription.
 // PUT /api/subscriptions/:id
 func (h *Handler) Update(c *fiber.Ctx) error {
-	tenantID := c.Locals("tenant_id").(string)
+	tenantID := c.Locals("tenant_id").(int)
 	subID := c.Params("id")
 
 	existing, err := h.store.GetSubscription(c.UserContext(), tenantID, subID)
@@ -230,7 +230,7 @@ func (h *Handler) Update(c *fiber.Ctx) error {
 // Delete removes a subscription and optionally its calendar.
 // DELETE /api/subscriptions/:id?delete_calendar=true
 func (h *Handler) Delete(c *fiber.Ctx) error {
-	tenantID := c.Locals("tenant_id").(string)
+	tenantID := c.Locals("tenant_id").(int)
 	subID := c.Params("id")
 	deleteCalendar := c.Query("delete_calendar") == "true"
 
@@ -254,7 +254,7 @@ func (h *Handler) Delete(c *fiber.Ctx) error {
 // SyncNow triggers an immediate sync for a subscription.
 // POST /api/subscriptions/:id/sync
 func (h *Handler) SyncNow(c *fiber.Ctx) error {
-	tenantID := c.Locals("tenant_id").(string)
+	tenantID := c.Locals("tenant_id").(int)
 	subID := c.Params("id")
 
 	sub, err := h.store.GetSubscription(c.UserContext(), tenantID, subID)

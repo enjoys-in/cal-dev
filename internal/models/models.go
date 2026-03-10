@@ -8,21 +8,21 @@ import (
 // User represents a user from mail_accounts (shared with mail system).
 // This table is NOT managed by caldev — it reads from mail_accounts.
 type User struct {
-	ID          string    `json:"id" db:"id"`
-	Email       string    `json:"email" db:"email"`
-	Name        string    `json:"name" db:"name"`
-	TenantName  string    `json:"tenant_name" db:"tenant_name"`
-	Status      string    `json:"status" db:"status"`
-	Type        string    `json:"type" db:"type"`
-	CreatedAt   time.Time `json:"created_at" db:"created_at"`
-	UpdatedAt   time.Time `json:"updated_at" db:"updated_at"`
+	ID         int       `json:"id" db:"id"`
+	Email      string    `json:"email" db:"email"`
+	Name       string    `json:"name" db:"name"`
+	TenantName string    `json:"tenant_name" db:"tenant_name"`
+	Status     string    `json:"status" db:"status"`
+	Type       string    `json:"type" db:"type"`
+	CreatedAt  time.Time `json:"created_at" db:"created_at"`
+	UpdatedAt  time.Time `json:"updated_at" db:"updated_at"`
 }
 
 // AppPassword is a CalDAV/JMAP app-specific password (like Nextcloud app passwords).
 // Stored in caldev_app_passwords, linked to mail_accounts.
 type AppPassword struct {
 	ID           string     `json:"id" db:"id"`
-	UserID       string     `json:"user_id" db:"user_id"`
+	UserID       int        `json:"user_id" db:"user_id"`
 	Label        string     `json:"label" db:"label"`
 	PasswordHash string     `json:"-" db:"password_hash"`
 	Scopes       []string   `json:"scopes" db:"scopes"`
@@ -53,8 +53,8 @@ type JobResult struct {
 // Calendar represents a CalDAV calendar collection.
 type Calendar struct {
 	ID                  string          `json:"id" db:"id"`
-	TenantID            string          `json:"tenant_id" db:"tenant_id"`
-	UserID              string          `json:"user_id" db:"user_id"`
+	TenantID            int             `json:"tenant_id" db:"tenant_id"`
+	UserID              int             `json:"user_id" db:"user_id"`
 	Name                string          `json:"name" db:"name"`
 	Description         string          `json:"description" db:"description"`
 	Color               string          `json:"color" db:"color"`
@@ -75,8 +75,8 @@ type Calendar struct {
 // Event represents a calendar event (iCalendar resource).
 type Event struct {
 	ID             string          `json:"id" db:"id"`
-	TenantID       string          `json:"tenant_id" db:"tenant_id"`
-	UserID         string          `json:"user_id" db:"user_id"`
+	TenantID       int             `json:"tenant_id" db:"tenant_id"`
+	UserID         int             `json:"user_id" db:"user_id"`
 	CalendarID     string          `json:"calendar_id" db:"calendar_id"`
 	UID            string          `json:"uid" db:"uid"`
 	Summary        string          `json:"summary" db:"summary"`
@@ -111,7 +111,7 @@ type Event struct {
 // SyncChange represents a change tracked for sync tokens.
 type SyncChange struct {
 	ID         int64     `json:"id" db:"id"`
-	TenantID   string    `json:"tenant_id" db:"tenant_id"`
+	TenantID   int       `json:"tenant_id" db:"tenant_id"`
 	CalendarID string    `json:"calendar_id" db:"calendar_id"`
 	EventUID   string    `json:"event_uid" db:"event_uid"`
 	ChangeType string    `json:"change_type" db:"change_type"`
@@ -122,8 +122,8 @@ type SyncChange struct {
 // SchedulingMessage represents a scheduling invitation/reply.
 type SchedulingMessage struct {
 	ID             string     `json:"id" db:"id"`
-	TenantID       string     `json:"tenant_id" db:"tenant_id"`
-	SenderID       string     `json:"sender_id" db:"sender_id"`
+	TenantID       int        `json:"tenant_id" db:"tenant_id"`
+	SenderID       int        `json:"sender_id" db:"sender_id"`
 	RecipientEmail string     `json:"recipient_email" db:"recipient_email"`
 	EventUID       string     `json:"event_uid" db:"event_uid"`
 	Method         string     `json:"method" db:"method"`
@@ -137,7 +137,7 @@ type SchedulingMessage struct {
 // Lock represents a WebDAV lock.
 type Lock struct {
 	ID             string    `json:"id" db:"id"`
-	TenantID       string       `json:"tenant_id" db:"tenant_id"`
+	TenantID       int       `json:"tenant_id" db:"tenant_id"`
 	ResourcePath   string    `json:"resource_path" db:"resource_path"`
 	LockToken      string    `json:"lock_token" db:"lock_token"`
 	Owner          string    `json:"owner" db:"owner"`
@@ -152,8 +152,8 @@ type Lock struct {
 // JMAPState tracks sync state for JMAP.
 type JMAPState struct {
 	ID         string    `json:"id" db:"id"`
-	TenantID   string    `json:"tenant_id" db:"tenant_id"`
-	UserID     string    `json:"user_id" db:"user_id"`
+	TenantID   int       `json:"tenant_id" db:"tenant_id"`
+	UserID     int       `json:"user_id" db:"user_id"`
 	EntityType string    `json:"entity_type" db:"entity_type"`
 	State      string    `json:"state" db:"state"`
 	UpdatedAt  time.Time `json:"updated_at" db:"updated_at"`
@@ -162,8 +162,8 @@ type JMAPState struct {
 // EventFilter is used for querying events (REPORT).
 type EventFilter struct {
 	CalendarID     string
-	TenantID       string
-	UserID         string
+	TenantID       int
+	UserID         int
 	ComponentType  string
 	TimeRangeStart *time.Time
 	TimeRangeEnd   *time.Time
@@ -187,8 +187,8 @@ type Attendee struct {
 // and events are periodically synced into a local calendar.
 type CalendarSubscription struct {
 	ID              string     `json:"id" db:"id"`
-	TenantID        string     `json:"tenant_id" db:"tenant_id"`
-	UserID          string     `json:"user_id" db:"user_id"`
+	TenantID        int        `json:"tenant_id" db:"tenant_id"`
+	UserID          int        `json:"user_id" db:"user_id"`
 	CalendarID      string     `json:"calendar_id" db:"calendar_id"`
 	SourceType      string     `json:"source_type" db:"source_type"` // ics_url, google, outlook
 	SourceURL       string     `json:"source_url" db:"source_url"`

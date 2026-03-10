@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"log"
+	"strconv"
 	"strings"
 	"time"
 
@@ -74,8 +75,17 @@ func RateLimiter(maxRequests int, window time.Duration) fiber.Handler {
 func DAVAuth(authSvc *auth.Service, s *store.Store) fiber.Handler {
 	return func(c *fiber.Ctx) error {
 		authHeader := c.Get("Authorization")
+		fromCookie := false
 
-		// No auth header → challenge
+		// Try access_token cookie if no Authorization header
+		if authHeader == "" {
+			if cookieToken := c.Cookies("access_token"); cookieToken != "" {
+				authHeader = "Bearer " + cookieToken
+				fromCookie = true
+			}
+		}
+
+		// No auth at all → Basic challenge (for native CalDAV clients)
 		if authHeader == "" {
 			c.Set("WWW-Authenticate", `Basic realm="CalDAV Server"`)
 			return c.Status(401).SendString("Authentication required")
@@ -86,6 +96,10 @@ func DAVAuth(authSvc *auth.Service, s *store.Store) fiber.Handler {
 			token := strings.TrimPrefix(authHeader, "Bearer ")
 			claims, err := authSvc.ValidateToken(token)
 			if err != nil {
+				// Browser/API request — don't trigger Basic Auth dialog
+				if fromCookie || c.Get("Origin") != "" {
+					return c.Status(401).JSON(fiber.Map{"error": "Invalid token"})
+				}
 				c.Set("WWW-Authenticate", `Basic realm="CalDAV Server"`)
 				return c.Status(401).SendString("Invalid token")
 			}
@@ -93,6 +107,9 @@ func DAVAuth(authSvc *auth.Service, s *store.Store) fiber.Handler {
 			// Resolve user from mail_accounts to get canonical IDs
 			resolved, err := authSvc.ResolveUserFromToken(c.UserContext(), claims)
 			if err != nil {
+				if fromCookie || c.Get("Origin") != "" {
+					return c.Status(401).JSON(fiber.Map{"error": "User not found"})
+				}
 				c.Set("WWW-Authenticate", `Basic realm="CalDAV Server"`)
 				return c.Status(401).SendString("User not found")
 			}
@@ -178,23 +195,29 @@ func XMLSizeLimit(maxSize int) fiber.Handler {
 }
 
 // resolveTenantID determines the tenant ID using the following priority:
-//  1. X-Tenant-ID request header
+//  1. X-Tenant-ID request header (parsed to int)
 //  2. access_token cookie → decode JWT → use "mid" claim
 //  3. Fallback to the value provided by auth (mail_accounts.id)
-func resolveTenantID(c *fiber.Ctx, authSvc *auth.Service, fallback string) string {
+func resolveTenantID(c *fiber.Ctx, authSvc *auth.Service, fallback int) int {
 	// 1. Explicit header
 	if tid := c.Get("X-Tenant-ID"); tid != "" {
-		return tid
+		if n, err := strconv.Atoi(tid); err == nil {
+			return n
+		}
 	}
 
 	// 2. access_token cookie → decode JWT → mid claim
 	if cookieToken := c.Cookies("access_token"); cookieToken != "" {
 		if claims, err := authSvc.ValidateToken(cookieToken); err == nil {
 			if claims.MID != "" {
-				return claims.MID
+				if n, err := strconv.Atoi(claims.MID); err == nil {
+					return n
+				}
 			}
 			if claims.TenantID != "" {
-				return claims.TenantID
+				if n, err := strconv.Atoi(claims.TenantID); err == nil {
+					return n
+				}
 			}
 		}
 	}
@@ -239,9 +262,10 @@ func APIKeyAuth(apiKey string) fiber.Handler {
 // Requests missing or mismatching any of these headers are rejected.
 func AppHeaders(appCfg *config.AppConfig) fiber.Handler {
 	return func(c *fiber.Ctx) error {
-		// Skip health-check and well-known discovery from header validation
+		// Skip health-check, well-known discovery, and CalDAV/feed paths from header validation
 		path := c.Path()
-		if path == "/health" || strings.HasPrefix(path, "/.well-known/") {
+		if path == "/health" || strings.HasPrefix(path, "/.well-known/") ||
+			strings.HasPrefix(path, "/dav/") || strings.HasPrefix(path, "/feeds/") {
 			return c.Next()
 		}
 
@@ -288,14 +312,18 @@ func CORSHeaders() fiber.Handler {
 
 	return func(c *fiber.Ctx) error {
 		origin := c.Get("Origin")
+
+		// Always set Vary so caches distinguish responses by origin.
+		c.Set("Vary", "Origin")
+
 		if allowedOrigins[origin] {
 			c.Set("Access-Control-Allow-Origin", origin)
+			c.Set("Access-Control-Allow-Credentials", "true")
+			c.Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS, PROPFIND, PROPPATCH, REPORT, MKCALENDAR, MOVE, COPY, LOCK, UNLOCK")
+			c.Set("Access-Control-Allow-Headers", "Authorization, Content-Type, Depth, If-Match, If-None-Match, Lock-Token, Destination, Overwrite, Prefer, Brief, X-App-Version, X-App-Name, x-api-key, x-signature, X-Tenant-ID")
+			c.Set("Access-Control-Expose-Headers", "ETag, DAV, Allow, Lock-Token")
+			c.Set("Access-Control-Max-Age", "86400")
 		}
-		c.Set("Access-Control-Allow-Credentials", "true")
-		c.Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS, PROPFIND, PROPPATCH, REPORT, MKCALENDAR, MOVE, COPY, LOCK, UNLOCK")
-		c.Set("Access-Control-Allow-Headers", "Authorization, Content-Type, Depth, If-Match, If-None-Match, Lock-Token, Destination, Overwrite, Prefer, Brief, X-App-Version, X-App-Name, x-api-key, x-signature")
-		c.Set("Access-Control-Expose-Headers", "ETag, DAV, Allow, Lock-Token")
-		c.Set("Access-Control-Max-Age", "86400")
 
 		if c.Method() == "OPTIONS" {
 			return c.SendStatus(204)

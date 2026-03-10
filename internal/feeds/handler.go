@@ -29,7 +29,7 @@ func NewHandler(s *store.Store) *Handler {
 // Outlook: File → Account Settings → Internet Calendars → New → paste URL.
 // Google Calendar: Other calendars → From URL → paste URL.
 func (h *Handler) CalendarFeed(c *fiber.Ctx) error {
-	tenantID := c.Locals("tenant_id").(string)
+	tenantID := c.Locals("tenant_id").(int)
 	calendarParam := c.Params("calendar")
 
 	// Strip .ics extension if present
@@ -71,8 +71,8 @@ func (h *Handler) CalendarFeed(c *fiber.Ctx) error {
 // AllCalendarsFeed returns a merged .ics feed of ALL calendars for a user.
 // GET /feeds/{tenant}/{user}/all.ics
 func (h *Handler) AllCalendarsFeed(c *fiber.Ctx) error {
-	tenantID := c.Locals("tenant_id").(string)
-	userID := c.Locals("user_id").(string)
+	tenantID := c.Locals("tenant_id").(int)
+	userID := c.Locals("user_id").(int)
 
 	// Get all user calendars
 	calendars, err := h.store.GetCalendarsByUser(c.UserContext(), tenantID, userID)
@@ -113,8 +113,8 @@ func (h *Handler) AllCalendarsFeed(c *fiber.Ctx) error {
 // FeedIndex returns a JSON list of available feeds for the user.
 // GET /feeds/{tenant}/{user}/
 func (h *Handler) FeedIndex(c *fiber.Ctx) error {
-	tenantID := c.Locals("tenant_id").(string)
-	userID := c.Locals("user_id").(string)
+	tenantID := c.Locals("tenant_id").(int)
+	userID := c.Locals("user_id").(int)
 
 	calendars, err := h.store.GetCalendarsByUser(c.UserContext(), tenantID, userID)
 	if err != nil {
@@ -128,7 +128,7 @@ func (h *Handler) FeedIndex(c *fiber.Ctx) error {
 		FeedURL     string `json:"feed_url"`
 	}
 
-	basePath := fmt.Sprintf("/feeds/%s/%s", tenantID, userID)
+	basePath := fmt.Sprintf("/feeds/%d/%d", tenantID, userID)
 	feeds := []feedInfo{
 		{
 			Name:        "All Calendars (merged)",

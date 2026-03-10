@@ -20,7 +20,7 @@ const (
 )
 
 // ParseICS parses a raw ICS string into Event fields.
-func ParseICS(rawICS string, tenantID, userID string, calendarID string) (*models.Event, error) {
+func ParseICS(rawICS string, tenantID, userID int, calendarID string) (*models.Event, error) {
 	e := &models.Event{
 		ID:             uuid.New().String(),
 		TenantID:       tenantID,

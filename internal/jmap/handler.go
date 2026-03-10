@@ -29,11 +29,11 @@ func NewHandler(s *store.Store, baseURL string) *Handler {
 // ============================================================
 
 func (h *Handler) Session(c *fiber.Ctx) error {
-	tenantID := c.Locals("tenant_id").(string)
-	userID := c.Locals("user_id").(string)
+	tenantID := c.Locals("tenant_id").(int)
+	userID := c.Locals("user_id").(int)
 	email, _ := c.Locals("email").(string)
 
-	accountID := fmt.Sprintf("%s:%s", tenantID, userID)
+	accountID := fmt.Sprintf("%d:%d", tenantID, userID)
 
 	session := models.JMAPSession{
 		Capabilities: map[string]interface{}{
@@ -93,8 +93,8 @@ type JMAPMethodCall struct {
 }
 
 func (h *Handler) API(c *fiber.Ctx) error {
-	tenantID := c.Locals("tenant_id").(string)
-	userID := c.Locals("user_id").(string)
+	tenantID := c.Locals("tenant_id").(int)
+	userID := c.Locals("user_id").(int)
 
 	var req models.JMAPRequest
 	if err := c.BodyParser(&req); err != nil {
@@ -132,7 +132,7 @@ func (h *Handler) API(c *fiber.Ctx) error {
 	return c.JSON(resp)
 }
 
-func (h *Handler) dispatchMethod(c *fiber.Ctx, tenantID, userID string, call *JMAPMethodCall) interface{} {
+func (h *Handler) dispatchMethod(c *fiber.Ctx, tenantID, userID int, call *JMAPMethodCall) interface{} {
 	switch call.MethodName {
 	case "CalendarEvent/get":
 		return h.calendarEventGet(c, tenantID, userID, call)
@@ -164,7 +164,7 @@ type calendarEventGetArgs struct {
 	Properties []string `json:"properties"`
 }
 
-func (h *Handler) calendarEventGet(c *fiber.Ctx, tenantID, userID string, call *JMAPMethodCall) interface{} {
+func (h *Handler) calendarEventGet(c *fiber.Ctx, tenantID, userID int, call *JMAPMethodCall) interface{} {
 	var args calendarEventGetArgs
 	if err := json.Unmarshal(call.Args, &args); err != nil {
 		return jmapMethodError("invalidArguments", "Invalid arguments", call.CallID)
@@ -205,7 +205,7 @@ func (h *Handler) calendarEventGet(c *fiber.Ctx, tenantID, userID string, call *
 	}
 
 	result := map[string]interface{}{
-		"accountId": fmt.Sprintf("%s:%s", tenantID, userID),
+		"accountId": fmt.Sprintf("%d:%d", tenantID, userID),
 		"state":     state,
 		"list":      list,
 		"notFound":  notFound,
@@ -226,7 +226,7 @@ type calendarEventSetArgs struct {
 	Destroy   []string                          `json:"destroy,omitempty"`
 }
 
-func (h *Handler) calendarEventSet(c *fiber.Ctx, tenantID, userID string, call *JMAPMethodCall) interface{} {
+func (h *Handler) calendarEventSet(c *fiber.Ctx, tenantID, userID int, call *JMAPMethodCall) interface{} {
 	var args calendarEventSetArgs
 	if err := json.Unmarshal(call.Args, &args); err != nil {
 		return jmapMethodError("invalidArguments", "Invalid arguments", call.CallID)
@@ -307,7 +307,7 @@ func (h *Handler) calendarEventSet(c *fiber.Ctx, tenantID, userID string, call *
 	newState, _ := h.store.GetJMAPState(c.UserContext(), tenantID, userID, "CalendarEvent")
 
 	result := map[string]interface{}{
-		"accountId":    fmt.Sprintf("%s:%s", tenantID, userID),
+		"accountId":    fmt.Sprintf("%d:%d", tenantID, userID),
 		"oldState":     args.IfInState,
 		"newState":     newState,
 		"created":      created,
@@ -333,7 +333,7 @@ type calendarEventQueryArgs struct {
 	Limit     int                    `json:"limit,omitempty"`
 }
 
-func (h *Handler) calendarEventQuery(c *fiber.Ctx, tenantID, userID string, call *JMAPMethodCall) interface{} {
+func (h *Handler) calendarEventQuery(c *fiber.Ctx, tenantID, userID int, call *JMAPMethodCall) interface{} {
 	var args calendarEventQueryArgs
 	if err := json.Unmarshal(call.Args, &args); err != nil {
 		return jmapMethodError("invalidArguments", "Invalid arguments", call.CallID)
@@ -378,7 +378,7 @@ func (h *Handler) calendarEventQuery(c *fiber.Ctx, tenantID, userID string, call
 	state, _ := h.store.GetJMAPState(c.UserContext(), tenantID, userID, "CalendarEvent")
 
 	result := map[string]interface{}{
-		"accountId":           fmt.Sprintf("%s:%s", tenantID, userID),
+		"accountId":           fmt.Sprintf("%d:%d", tenantID, userID),
 		"queryState":          state,
 		"canCalculateChanges": false,
 		"position":            args.Position,
@@ -398,7 +398,7 @@ type calendarEventChangesArgs struct {
 	SinceState string `json:"sinceState"`
 }
 
-func (h *Handler) calendarEventChanges(c *fiber.Ctx, tenantID, userID string, call *JMAPMethodCall) interface{} {
+func (h *Handler) calendarEventChanges(c *fiber.Ctx, tenantID, userID int, call *JMAPMethodCall) interface{} {
 	var args calendarEventChangesArgs
 	if err := json.Unmarshal(call.Args, &args); err != nil {
 		return jmapMethodError("invalidArguments", "Invalid arguments", call.CallID)
@@ -408,7 +408,7 @@ func (h *Handler) calendarEventChanges(c *fiber.Ctx, tenantID, userID string, ca
 	newState, _ := h.store.GetJMAPState(c.UserContext(), tenantID, userID, "CalendarEvent")
 
 	result := map[string]interface{}{
-		"accountId":      fmt.Sprintf("%s:%s", tenantID, userID),
+		"accountId":      fmt.Sprintf("%d:%d", tenantID, userID),
 		"oldState":       args.SinceState,
 		"newState":       newState,
 		"hasMoreChanges": false,
@@ -424,7 +424,10 @@ func (h *Handler) calendarEventChanges(c *fiber.Ctx, tenantID, userID string, ca
 // Calendar/get
 // ============================================================
 
-func (h *Handler) calendarGet(c *fiber.Ctx, tenantID, userID string, call *JMAPMethodCall) interface{} {
+func (h *Handler) calendarGet(c *fiber.Ctx, tenantID, userID int, call *JMAPMethodCall) interface{} {
+	if err := h.store.EnsureDefaultCalendar(c.UserContext(), tenantID, userID); err != nil {
+		log.Printf("Warning: auto-provision default calendar failed: %v", err)
+	}
 	calendars, err := h.store.GetCalendarsByUser(c.UserContext(), tenantID, userID)
 	if err != nil {
 		return jmapMethodError("serverFail", err.Error(), call.CallID)
@@ -455,7 +458,7 @@ func (h *Handler) calendarGet(c *fiber.Ctx, tenantID, userID string, call *JMAPM
 	state, _ := h.store.GetJMAPState(c.UserContext(), tenantID, userID, "Calendar")
 
 	result := map[string]interface{}{
-		"accountId": fmt.Sprintf("%s:%s", tenantID, userID),
+		"accountId": fmt.Sprintf("%d:%d", tenantID, userID),
 		"state":     state,
 		"list":      list,
 		"notFound":  []string{},
@@ -476,7 +479,7 @@ type calendarSetArgs struct {
 	Destroy   []string                          `json:"destroy,omitempty"`
 }
 
-func (h *Handler) calendarSet(c *fiber.Ctx, tenantID, userID string, call *JMAPMethodCall) interface{} {
+func (h *Handler) calendarSet(c *fiber.Ctx, tenantID, userID int, call *JMAPMethodCall) interface{} {
 	var args calendarSetArgs
 	if err := json.Unmarshal(call.Args, &args); err != nil {
 		return jmapMethodError("invalidArguments", "Invalid arguments", call.CallID)
@@ -534,7 +537,7 @@ func (h *Handler) calendarSet(c *fiber.Ctx, tenantID, userID string, call *JMAPM
 	newState, _ := h.store.GetJMAPState(c.UserContext(), tenantID, userID, "Calendar")
 
 	result := map[string]interface{}{
-		"accountId": fmt.Sprintf("%s:%s", tenantID, userID),
+		"accountId": fmt.Sprintf("%d:%d", tenantID, userID),
 		"oldState":  args.IfInState,
 		"newState":  newState,
 		"created":   created,
@@ -633,7 +636,7 @@ func eventToJMAP(evt *models.Event) map[string]interface{} {
 	return result
 }
 
-func jmapToEvent(props map[string]interface{}, tenantID, userID string) *models.Event {
+func jmapToEvent(props map[string]interface{}, tenantID, userID int) *models.Event {
 	evt := &models.Event{
 		ID:             uuid.New().String(),
 		TenantID:       tenantID,

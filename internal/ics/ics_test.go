@@ -15,7 +15,7 @@ func TestParseICS_BasicEvent(t *testing.T) {
 		"STATUS:CONFIRMED\r\nSEQUENCE:0\r\n" +
 		"END:VEVENT\r\nEND:VCALENDAR\r\n"
 
-	event, err := ParseICS(raw, "tenant-1", "user-1", "cal-1")
+	event, err := ParseICS(raw, 1, 1, "cal-1")
 	if err != nil {
 		t.Fatalf("ParseICS failed: %v", err)
 	}
@@ -35,8 +35,8 @@ func TestParseICS_BasicEvent(t *testing.T) {
 	if event.Status != "CONFIRMED" {
 		t.Errorf("expected Status 'CONFIRMED', got '%s'", event.Status)
 	}
-	if event.TenantID != "tenant-1" {
-		t.Errorf("expected TenantID 'tenant-1', got '%s'", event.TenantID)
+	if event.TenantID != 1 {
+		t.Errorf("expected TenantID 1, got %d", event.TenantID)
 	}
 	if event.CalendarID != "cal-1" {
 		t.Errorf("expected CalendarID 'cal-1', got '%s'", event.CalendarID)
@@ -52,7 +52,7 @@ func TestParseICS_AllDayEvent(t *testing.T) {
 		"DTSTART;VALUE=DATE:20260226\r\nDTEND;VALUE=DATE:20260227\r\n" +
 		"END:VEVENT\r\nEND:VCALENDAR\r\n"
 
-	event, err := ParseICS(raw, "t", "u", "c")
+	event, err := ParseICS(raw, 1, 1, "c")
 	if err != nil {
 		t.Fatalf("ParseICS failed: %v", err)
 	}
@@ -73,7 +73,7 @@ func TestParseICS_WithAttendees(t *testing.T) {
 		"ATTENDEE;ROLE=REQ-PARTICIPANT;PARTSTAT=NEEDS-ACTION;RSVP=TRUE;CN=Jane:mailto:jane@example.com\r\n" +
 		"END:VEVENT\r\nEND:VCALENDAR\r\n"
 
-	event, err := ParseICS(raw, "t", "u", "c")
+	event, err := ParseICS(raw, 1, 1, "c")
 	if err != nil {
 		t.Fatalf("ParseICS failed: %v", err)
 	}
@@ -90,7 +90,7 @@ func TestParseICS_WithRecurrence(t *testing.T) {
 		"RRULE:FREQ=WEEKLY;BYDAY=MO\r\n" +
 		"END:VEVENT\r\nEND:VCALENDAR\r\n"
 
-	event, err := ParseICS(raw, "t", "u", "c")
+	event, err := ParseICS(raw, 1, 1, "c")
 	if err != nil {
 		t.Fatalf("ParseICS failed: %v", err)
 	}
@@ -107,7 +107,7 @@ func TestParseICS_WithCategories(t *testing.T) {
 		"CATEGORIES:Work,Meeting\r\n" +
 		"END:VEVENT\r\nEND:VCALENDAR\r\n"
 
-	event, err := ParseICS(raw, "t", "u", "c")
+	event, err := ParseICS(raw, 1, 1, "c")
 	if err != nil {
 		t.Fatalf("ParseICS failed: %v", err)
 	}
@@ -126,7 +126,7 @@ func TestGenerateICS_RoundTrip(t *testing.T) {
 		"STATUS:CONFIRMED\r\nSEQUENCE:1\r\n" +
 		"END:VEVENT\r\nEND:VCALENDAR\r\n"
 
-	event, err := ParseICS(raw, "t", "u", "c")
+	event, err := ParseICS(raw, 1, 1, "c")
 	if err != nil {
 		t.Fatalf("ParseICS failed: %v", err)
 	}
@@ -292,7 +292,7 @@ func TestGenerateSchedulingICS_Request(t *testing.T) {
 		"DTSTART:20260226T140000Z\r\nDTEND:20260226T150000Z\r\n" +
 		"END:VEVENT\r\nEND:VCALENDAR\r\n"
 
-	event, _ := ParseICS(raw, "t", "u", "c")
+	event, _ := ParseICS(raw, 1, 1, "c")
 	result := GenerateSchedulingICS(event, "REQUEST")
 
 	if !strings.Contains(result, "METHOD:REQUEST") {
