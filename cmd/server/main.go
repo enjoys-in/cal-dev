@@ -59,11 +59,6 @@ func main() {
 	// Run migrations in order
 	migrationFiles := []string{
 		"migrations/001_init.sql",
-		// "migrations/002_seed.sql",
-		// "migrations/003_calendar_subscriptions.sql",
-		"migrations/004_fix_uuid_to_integer.sql",
-		"migrations/005_ensure_pgcrypto.sql",
-		"migrations/006_restore_uuid_defaults.sql",
 	}
 	for _, mf := range migrationFiles {
 		sqlBytes, err := os.ReadFile(mf)

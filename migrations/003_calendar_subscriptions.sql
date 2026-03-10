@@ -1,4 +1,0 @@
--- External Calendar Subscriptions
--- This migration is now included in 001_init.sql.
--- Kept as a no-op for backwards compatibility with the migration runner.
--- (intentionally empty)

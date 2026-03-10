@@ -63,10 +63,7 @@ cal-dev/
 │   │   └── service.go           # Sync engine (fetch, parse, import ICS feeds)
 │   └── xmlutil/xmlutil.go       # WebDAV XML parsing & response generation
 ├── migrations/
-│   ├── 000_public_users.sql     # Seed public.mail_accounts table (development)
-│   ├── 001_init.sql             # CalDev schema (caldev.*)
-│   ├── 002_seed.sql             # Test data seed
-│   └── 003_calendar_subscriptions.sql # External subscription table
+│   └── 001_init.sql             # Full CalDev schema (tables, indexes, triggers, functions)
 ├── docker-compose.yml           # PostgreSQL + Valkey + CalDev
 ├── Dockerfile                   # Multi-stage build
 └── .env.example                 # All environment variables
@@ -77,7 +74,7 @@ cal-dev/
 - Go 1.22+
 - PostgreSQL 16+
 - Valkey 8+ (or Redis 7+ — wire-compatible)
-- Your existing `public.mail_accounts` table with columns: `id (UUID PK)`, `email`, `name`
+- Your existing `public.mail_accounts` table with columns: `id (INTEGER PK)`, `email`, `name`
 
 ## Quick Start
 

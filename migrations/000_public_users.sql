@@ -1,6 +1,0 @@
--- ============================================================
--- This migration is no longer needed.
--- Users are sourced from the existing mail_accounts table.
--- CalDev tables are in the public schema with caldev_ prefix.
--- ============================================================
--- (intentionally empty — mail_accounts already exists)

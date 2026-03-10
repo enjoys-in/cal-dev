@@ -15,9 +15,7 @@ services:
       - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
-      - ./migrations/000_public_users.sql:/docker-entrypoint-initdb.d/000_public_users.sql
       - ./migrations/001_init.sql:/docker-entrypoint-initdb.d/001_init.sql
-      - ./migrations/002_seed.sql:/docker-entrypoint-initdb.d/002_seed.sql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U caldev"]
       interval: 5s

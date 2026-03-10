@@ -1,5 +1,5 @@
 -- ============================================================
--- CalDAV Server Database Schema (init)
+-- CalDAV Server Database Schema (single consolidated migration)
 -- All tables in public schema with caldev_ prefix.
 -- Users are sourced from mail_accounts (shared with mail system).
 -- mail_accounts MUST exist with at least: id (INTEGER PK, auto-increment), email, name
@@ -8,15 +8,6 @@
 
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
-
--- ============================================================
--- Migration Tracking
--- ============================================================
-CREATE TABLE IF NOT EXISTS caldev_migrations (
-    id              SERIAL PRIMARY KEY,
-    filename        VARCHAR(512) NOT NULL UNIQUE,
-    applied_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
 
 -- ============================================================
 -- App Passwords (for CalDAV Basic Auth — like Nextcloud/Fastmail)
