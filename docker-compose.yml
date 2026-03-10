@@ -64,8 +64,7 @@ services:
       DB_MAX_OPEN_CONNS: "50"
       DB_MAX_IDLE_CONNS: "10"
       # Valkey (Redis-compatible)
-      REDIS_HOST: valkey
-      REDIS_PORT: "6379"
+      REDIS_URL: "redis://valkey:6379/0"
       # Auth — use same JWT secret & issuer as your mail/other services
       AUTH_JWT_SECRET: e783e9b23f8b14e6b245e8b479a503d402fad947758f9006e70d30a32d605661ac00645bbf2f1d3894aaff7b01fccabea47a7c417737fb0d9802e297a21b6167
       AUTH_JWT_ISSUER: ENJOYS

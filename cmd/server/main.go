@@ -19,6 +19,7 @@ import (
 	"github.com/enjoys-in/cal-dev/internal/jobs"
 	"github.com/enjoys-in/cal-dev/internal/middleware"
 	"github.com/enjoys-in/cal-dev/internal/models"
+	"github.com/enjoys-in/cal-dev/internal/publisher"
 	"github.com/enjoys-in/cal-dev/internal/response"
 	"github.com/enjoys-in/cal-dev/internal/scheduling"
 	"github.com/enjoys-in/cal-dev/internal/store"
@@ -93,7 +94,8 @@ func main() {
 
 	// Initialize services
 	authSvc := auth.NewService(db, &cfg.Auth)
-	schedulingSvc := scheduling.NewService(db, &cfg.SMTP, jobQueue)
+	mailPub := publisher.New(jobQueue.Client())
+	schedulingSvc := scheduling.NewService(db, jobQueue, mailPub)
 	syncSvc := extsync.NewService(db, jobQueue)
 
 	// Initialize background worker

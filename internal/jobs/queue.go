@@ -41,11 +41,11 @@ type Queue struct {
 
 // NewQueue creates a new Valkey job queue.
 func NewQueue(redisCfg *config.RedisConfig, workerCfg *config.WorkerConfig) (*Queue, error) {
-	client := redis.NewClient(&redis.Options{
-		Addr:     redisCfg.RedisAddr(),
-		Password: redisCfg.Password,
-		DB:       redisCfg.DB,
-	})
+	opts, err := redis.ParseURL(redisCfg.URL)
+	if err != nil {
+		return nil, fmt.Errorf("jobs: invalid redis URL: %w", err)
+	}
+	client := redis.NewClient(opts)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -54,7 +54,7 @@ func NewQueue(redisCfg *config.RedisConfig, workerCfg *config.WorkerConfig) (*Qu
 		return nil, fmt.Errorf("jobs: valkey ping failed: %w", err)
 	}
 
-	log.Printf("Connected to Valkey at %s", redisCfg.RedisAddr())
+	log.Printf("Connected to Valkey at %s", redisCfg.URL)
 
 	return &Queue{
 		client:     client,

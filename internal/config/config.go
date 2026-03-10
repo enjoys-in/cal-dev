@@ -14,7 +14,6 @@ type Config struct {
 	Redis    RedisConfig // Valkey-compatible (wire protocol == Redis)
 	Auth     AuthConfig
 	App      AppConfig
-	SMTP     SMTPConfig
 	TLS      TLSConfig
 	Worker   WorkerConfig
 }
@@ -53,11 +52,9 @@ type DatabaseConfig struct {
 }
 
 // RedisConfig holds Redis connection settings.
+// Uses a URL so credentials can be added later: redis://user:pass@host:6379/0
 type RedisConfig struct {
-	Host     string
-	Port     int
-	Password string
-	DB       int
+	URL string
 }
 
 // AuthConfig holds authentication settings.
@@ -79,16 +76,6 @@ type WorkerConfig struct {
 	ShutdownTimeout time.Duration
 }
 
-// SMTPConfig holds SMTP settings for scheduling invitations.
-type SMTPConfig struct {
-	Host     string
-	Port     int
-	User     string
-	Password string
-	From     string
-	UseTLS   bool
-}
-
 // TLSConfig holds TLS/HTTPS settings.
 type TLSConfig struct {
 	Enabled  bool
@@ -102,11 +89,6 @@ func (d *DatabaseConfig) DSN() string {
 		"host=%s port=%d user=%s password=%s dbname=%s sslmode=%s",
 		d.Host, d.Port, d.User, d.Password, d.DBName, d.SSLMode,
 	)
-}
-
-// RedisAddr returns the Redis address.
-func (r *RedisConfig) RedisAddr() string {
-	return fmt.Sprintf("%s:%d", r.Host, r.Port)
 }
 
 // Addr returns the server listen address.
@@ -139,10 +121,7 @@ func Load() *Config {
 			ConnMaxIdleTime: envDuration("DB_CONN_MAX_IDLE_TIME", 5*time.Minute),
 		},
 		Redis: RedisConfig{
-			Host:     envStr("REDIS_HOST", "localhost"),
-			Port:     envInt("REDIS_PORT", 6379),
-			Password: envStr("REDIS_PASSWORD", ""),
-			DB:       envInt("REDIS_DB", 0),
+			URL: envStr("REDIS_URL", "redis://localhost:6379/0"),
 		},
 		Auth: AuthConfig{
 			JWTSecret:        envStr("AUTH_JWT_SECRET", "change-me-in-production"),
@@ -158,14 +137,7 @@ func Load() *Config {
 			Version:   envStr("APP_VERSION", "1.0.0"),
 			Signature: envStr("APP_SIGNATURE", ""),
 		},
-		SMTP: SMTPConfig{
-			Host:     envStr("SMTP_HOST", "localhost"),
-			Port:     envInt("SMTP_PORT", 587),
-			User:     envStr("SMTP_USER", ""),
-			Password: envStr("SMTP_PASSWORD", ""),
-			From:     envStr("SMTP_FROM", "calendar@localhost"),
-			UseTLS:   envBool("SMTP_USE_TLS", true),
-		},
+
 		TLS: TLSConfig{
 			Enabled:  envBool("TLS_ENABLED", false),
 			CertFile: envStr("TLS_CERT_FILE", ""),
