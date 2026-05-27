@@ -198,7 +198,11 @@ func GenerateICS(e *models.Event) string {
 		b.WriteString(fmt.Sprintf("CLASS:%s\r\n", e.Classification))
 	}
 	if e.Organizer != "" {
-		b.WriteString(fmt.Sprintf("ORGANIZER:mailto:%s\r\n", e.Organizer))
+		org := e.Organizer
+		if !strings.HasPrefix(strings.ToLower(org), "mailto:") {
+			org = "mailto:" + org
+		}
+		b.WriteString(fmt.Sprintf("ORGANIZER:%s\r\n", org))
 	}
 	if e.Sequence > 0 {
 		b.WriteString(fmt.Sprintf("SEQUENCE:%d\r\n", e.Sequence))
@@ -256,13 +260,20 @@ func GenerateSchedulingICS(e *models.Event, method string) string {
 		b.WriteString(fmt.Sprintf("LOCATION:%s\r\n", escapeICS(e.Location)))
 	}
 	if e.Organizer != "" {
-		b.WriteString(fmt.Sprintf("ORGANIZER:mailto:%s\r\n", e.Organizer))
+		org := e.Organizer
+		if !strings.HasPrefix(strings.ToLower(org), "mailto:") {
+			org = "mailto:" + org
+		}
+		b.WriteString(fmt.Sprintf("ORGANIZER:%s\r\n", org))
 	}
 	b.WriteString(fmt.Sprintf("SEQUENCE:%d\r\n", e.Sequence))
+	b.WriteString(fmt.Sprintf("STATUS:%s\r\n", e.Status))
 
 	var attendees []models.Attendee
 	if err := json.Unmarshal(e.Attendees, &attendees); err == nil {
 		for _, a := range attendees {
+			// Force RSVP=TRUE in scheduling ICS so mail clients show Accept/Decline
+			a.RSVP = true
 			b.WriteString(formatAttendee(a))
 		}
 	}

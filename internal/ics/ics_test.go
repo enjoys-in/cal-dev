@@ -333,3 +333,97 @@ func TestUnfoldICS(t *testing.T) {
 		t.Error("DESCRIPTION line not found after unfolding")
 	}
 }
+
+// ── Bug Fix Tests ───────────────────────────────────────────
+
+func TestGenerateICS_ClearedRawICS_Regenerates(t *testing.T) {
+	// Bug: GenerateICS short-circuits if RawICS is set.
+	// After clearing RawICS, it should regenerate from fields.
+	raw := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\n" +
+		"BEGIN:VEVENT\r\nUID:regen@caldev\r\nSUMMARY:Original\r\n" +
+		"DTSTART:20260226T140000Z\r\nDTEND:20260226T150000Z\r\n" +
+		"END:VEVENT\r\nEND:VCALENDAR\r\n"
+
+	event, _ := ParseICS(raw, 1, 1, "c")
+	// Change summary
+	event.Summary = "Updated Title"
+	// Clear RawICS so it regenerates
+	event.RawICS = ""
+	generated := GenerateICS(event)
+
+	if !strings.Contains(generated, "SUMMARY:Updated Title") {
+		t.Error("GenerateICS did not regenerate with updated fields after clearing RawICS")
+	}
+	if strings.Contains(generated, "SUMMARY:Original") {
+		t.Error("GenerateICS returned stale content")
+	}
+}
+
+func TestGenerateICS_OrganizerNoDoubleMailto(t *testing.T) {
+	// Bug: If organizer is already "mailto:x@y.com", GenerateICS would produce
+	// "ORGANIZER:mailto:mailto:x@y.com"
+	raw := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\n" +
+		"BEGIN:VEVENT\r\nUID:org@caldev\r\nSUMMARY:Test\r\n" +
+		"DTSTART:20260226T140000Z\r\n" +
+		"ORGANIZER:mailto:boss@example.com\r\n" +
+		"END:VEVENT\r\nEND:VCALENDAR\r\n"
+
+	event, _ := ParseICS(raw, 1, 1, "c")
+	// Organizer should have been parsed as just the email
+	event.RawICS = ""
+	generated := GenerateICS(event)
+
+	if strings.Contains(generated, "mailto:mailto:") {
+		t.Errorf("double mailto: prefix found in generated ICS: %s", generated)
+	}
+	if !strings.Contains(generated, "ORGANIZER:mailto:boss@example.com") {
+		t.Errorf("expected ORGANIZER:mailto:boss@example.com in generated ICS, got: %s", generated)
+	}
+}
+
+func TestGenerateSchedulingICS_ForcesRSVP(t *testing.T) {
+	// Bug: Scheduling ICS did not set RSVP=TRUE on attendees,
+	// so mail clients wouldn't show Accept/Decline buttons.
+	raw := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\n" +
+		"BEGIN:VEVENT\r\nUID:rsvp@caldev\r\nSUMMARY:Meeting\r\n" +
+		"DTSTART:20260226T140000Z\r\nDTEND:20260226T150000Z\r\n" +
+		"ORGANIZER;CN=Boss:mailto:boss@example.com\r\n" +
+		"ATTENDEE;ROLE=REQ-PARTICIPANT;PARTSTAT=NEEDS-ACTION;CN=Jane:mailto:jane@example.com\r\n" +
+		"END:VEVENT\r\nEND:VCALENDAR\r\n"
+
+	event, _ := ParseICS(raw, 1, 1, "c")
+	result := GenerateSchedulingICS(event, "REQUEST")
+
+	if !strings.Contains(result, "RSVP=TRUE") {
+		t.Errorf("scheduling ICS should force RSVP=TRUE on attendees, got: %s", result)
+	}
+}
+
+func TestGenerateSchedulingICS_IncludesStatus(t *testing.T) {
+	raw := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\n" +
+		"BEGIN:VEVENT\r\nUID:status@caldev\r\nSUMMARY:Meeting\r\n" +
+		"DTSTART:20260226T140000Z\r\nSTATUS:CONFIRMED\r\n" +
+		"END:VEVENT\r\nEND:VCALENDAR\r\n"
+
+	event, _ := ParseICS(raw, 1, 1, "c")
+	result := GenerateSchedulingICS(event, "REQUEST")
+
+	if !strings.Contains(result, "STATUS:CONFIRMED") {
+		t.Errorf("scheduling ICS should include STATUS, got: %s", result)
+	}
+}
+
+func TestGenerateSchedulingICS_OrganizerNoDoubleMailto(t *testing.T) {
+	raw := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\n" +
+		"BEGIN:VEVENT\r\nUID:orgprefix@caldev\r\nSUMMARY:Test\r\n" +
+		"DTSTART:20260226T140000Z\r\n" +
+		"ORGANIZER:mailto:boss@example.com\r\n" +
+		"END:VEVENT\r\nEND:VCALENDAR\r\n"
+
+	event, _ := ParseICS(raw, 1, 1, "c")
+	result := GenerateSchedulingICS(event, "REQUEST")
+
+	if strings.Contains(result, "mailto:mailto:") {
+		t.Errorf("double mailto: prefix in scheduling ICS: %s", result)
+	}
+}

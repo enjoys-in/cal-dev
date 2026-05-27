@@ -12,6 +12,7 @@ import (
 
 	"github.com/enjoys-in/cal-dev/internal/ics"
 	"github.com/enjoys-in/cal-dev/internal/models"
+	"github.com/enjoys-in/cal-dev/internal/scheduling"
 	"github.com/enjoys-in/cal-dev/internal/store"
 	"github.com/enjoys-in/cal-dev/internal/xmlutil"
 	"github.com/gofiber/fiber/v2"
@@ -20,12 +21,13 @@ import (
 
 // Handler provides CalDAV endpoint handlers.
 type Handler struct {
-	store *store.Store
+	store      *store.Store
+	scheduling *scheduling.Service
 }
 
 // NewHandler creates a new CalDAV handler.
-func NewHandler(s *store.Store) *Handler {
-	return &Handler{store: s}
+func NewHandler(s *store.Store, sched *scheduling.Service) *Handler {
+	return &Handler{store: s, scheduling: sched}
 }
 
 // ============================================================
@@ -386,6 +388,15 @@ func (h *Handler) Put(c *fiber.Ctx) error {
 		return c.Status(500).SendString("Internal Server Error")
 	}
 
+	// Send scheduling emails to attendees (invitations or updates)
+	if h.scheduling != nil {
+		go func() {
+			if err := h.scheduling.ProcessEvent(context.Background(), event, "REQUEST"); err != nil {
+				log.Printf("caldav: scheduling ProcessEvent error: %v", err)
+			}
+		}()
+	}
+
 	c.Set("ETag", event.ETag)
 	return c.SendStatus(statusCode)
 }
@@ -411,14 +422,16 @@ func (h *Handler) Delete(c *fiber.Ctx) error {
 		calendarID := extractCalendarID(path)
 		uid := extractEventUID(path)
 
+		// Fetch event before deletion (needed for cancellation emails)
+		event, err := h.store.GetEvent(ctx, tenantID, calendarID, uid)
+		if err != nil || event == nil {
+			return c.Status(404).SendString("Not Found")
+		}
+
 		// Check If-Match
 		ifMatch := c.Get("If-Match")
 		if ifMatch != "" {
-			existing, err := h.store.GetEvent(ctx, tenantID, calendarID, uid)
-			if err != nil || existing == nil {
-				return c.Status(404).SendString("Not Found")
-			}
-			if existing.ETag != ifMatch {
+			if event.ETag != ifMatch {
 				return c.Status(412).SendString("Precondition Failed")
 			}
 		}
@@ -426,6 +439,16 @@ func (h *Handler) Delete(c *fiber.Ctx) error {
 		if err := h.store.DeleteEvent(ctx, tenantID, calendarID, uid); err != nil {
 			return c.Status(500).SendString("Internal Server Error")
 		}
+
+		// Send cancellation to attendees
+		if h.scheduling != nil {
+			go func() {
+				if err := h.scheduling.SendCancellation(context.Background(), event); err != nil {
+					log.Printf("caldav: scheduling SendCancellation error: %v", err)
+				}
+			}()
+		}
+
 		return c.SendStatus(204)
 	}
 

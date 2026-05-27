@@ -171,6 +171,8 @@ func (svc *Service) ProcessReply(ctx context.Context, tenantID int, eventUID, at
 	event.Attendees = json.RawMessage(attendeesJSON)
 	event.Sequence++
 	event.ETag = ics.GenerateETag(event.UID + fmt.Sprintf("%d", event.Sequence))
+	// Clear RawICS so GenerateICS actually regenerates from updated fields
+	event.RawICS = ""
 	event.RawICS = ics.GenerateICS(event)
 	event.SizeBytes = len(event.RawICS)
 

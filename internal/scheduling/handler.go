@@ -1,6 +1,7 @@
 package scheduling
 
 import (
+	"context"
 	"log"
 	"strconv"
 	"strings"
@@ -175,9 +176,9 @@ func (h *Handler) RSVPRespond(c *fiber.Ctx) error {
 		return response.Error(c, 404, "event not found or you are not an attendee", err.Error())
 	}
 
-	// Send REPLY email to organizer
+	// Send REPLY email to organizer (use detached context since HTTP response may finish first)
 	go func() {
-		if err := h.svc.SendReplyToOrganizer(c.UserContext(), tenantID, req.EventUID, email, partstat); err != nil {
+		if err := h.svc.SendReplyToOrganizer(context.Background(), tenantID, req.EventUID, email, partstat); err != nil {
 			log.Printf("scheduling: failed to send RSVP reply email: %v", err)
 		}
 	}()

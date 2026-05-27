@@ -1,6 +1,7 @@
 package jmap
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -8,6 +9,7 @@ import (
 
 	"github.com/enjoys-in/cal-dev/internal/ics"
 	"github.com/enjoys-in/cal-dev/internal/models"
+	"github.com/enjoys-in/cal-dev/internal/scheduling"
 	"github.com/enjoys-in/cal-dev/internal/store"
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
@@ -15,13 +17,14 @@ import (
 
 // Handler provides JMAP (RFC 8620) endpoint handlers.
 type Handler struct {
-	store   *store.Store
-	baseURL string
+	store      *store.Store
+	baseURL    string
+	scheduling *scheduling.Service
 }
 
 // NewHandler creates a new JMAP handler.
-func NewHandler(s *store.Store, baseURL string) *Handler {
-	return &Handler{store: s, baseURL: baseURL}
+func NewHandler(s *store.Store, baseURL string, sched *scheduling.Service) *Handler {
+	return &Handler{store: s, baseURL: baseURL, scheduling: sched}
 }
 
 // ============================================================
@@ -267,6 +270,16 @@ func (h *Handler) calendarEventSet(c *fiber.Ctx, tenantID, userID int, call *JMA
 			"uid":  evt.UID,
 			"etag": evt.ETag,
 		}
+
+		// Send invitation emails to attendees
+		if h.scheduling != nil {
+			evtCopy := evt
+			go func() {
+				if err := h.scheduling.ProcessEvent(context.Background(), evtCopy, "REQUEST"); err != nil {
+					log.Printf("jmap: scheduling ProcessEvent error: %v", err)
+				}
+			}()
+		}
 	}
 
 	// Handle updates
@@ -279,6 +292,7 @@ func (h *Handler) calendarEventSet(c *fiber.Ctx, tenantID, userID int, call *JMA
 
 		// Apply updates
 		applyJMAPUpdates(evt, props)
+		evt.RawICS = "" // Clear so GenerateICS regenerates from updated fields
 		evt.RawICS = ics.GenerateICS(evt)
 		evt.SizeBytes = len(evt.RawICS)
 		evt.ETag = ics.GenerateETag(evt.RawICS)
@@ -288,6 +302,16 @@ func (h *Handler) calendarEventSet(c *fiber.Ctx, tenantID, userID int, call *JMA
 			continue
 		}
 		updated[id] = nil
+
+		// Send update notification to attendees
+		if h.scheduling != nil {
+			evtCopy := evt
+			go func() {
+				if err := h.scheduling.ProcessEvent(context.Background(), evtCopy, "REQUEST"); err != nil {
+					log.Printf("jmap: scheduling ProcessEvent (update) error: %v", err)
+				}
+			}()
+		}
 	}
 
 	// Handle destroys
@@ -302,6 +326,16 @@ func (h *Handler) calendarEventSet(c *fiber.Ctx, tenantID, userID int, call *JMA
 			continue
 		}
 		destroyed = append(destroyed, id)
+
+		// Send cancellation to attendees
+		if h.scheduling != nil {
+			evtCopy := evt
+			go func() {
+				if err := h.scheduling.SendCancellation(context.Background(), evtCopy); err != nil {
+					log.Printf("jmap: scheduling SendCancellation error: %v", err)
+				}
+			}()
+		}
 	}
 
 	newState, _ := h.store.GetJMAPState(c.UserContext(), tenantID, userID, "CalendarEvent")

@@ -118,12 +118,12 @@ func main() {
 	worker.Start(ctx)
 
 	// Initialize handlers
-	caldavHandler := caldav.NewHandler(db)
+	caldavHandler := caldav.NewHandler(db, schedulingSvc)
 	baseURL := "https://localhost:" + fmt.Sprintf("%d", cfg.Server.Port)
 	if !cfg.TLS.Enabled {
 		baseURL = "http://localhost:" + fmt.Sprintf("%d", cfg.Server.Port)
 	}
-	jmapHandler := jmap.NewHandler(db, baseURL)
+	jmapHandler := jmap.NewHandler(db, baseURL, schedulingSvc)
 
 	// Create Fiber app with WebDAV method support
 	app := fiber.New(fiber.Config{
