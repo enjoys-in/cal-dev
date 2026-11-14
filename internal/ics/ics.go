@@ -405,6 +405,8 @@ func writeComponent(b *strings.Builder, e *models.Event) {
 		compType = "VEVENT"
 	}
 
+	loc := eventLocation(e)
+
 	b.WriteString(fmt.Sprintf("BEGIN:%s\r\n", compType))
 	b.WriteString(fmt.Sprintf("UID:%s\r\n", e.UID))
 	b.WriteString(fmt.Sprintf("DTSTAMP:%s\r\n", e.DTStamp.UTC().Format(ICSDateTimeUTC)))
@@ -415,9 +417,9 @@ func writeComponent(b *strings.Builder, e *models.Event) {
 			b.WriteString(fmt.Sprintf("DTEND;VALUE=DATE:%s\r\n", e.DTEnd.Format(ICSDateOnly)))
 		}
 	} else {
-		b.WriteString(fmt.Sprintf("DTSTART:%s\r\n", e.DTStart.UTC().Format(ICSDateTimeUTC)))
+		writeDateTime(b, "DTSTART", e.DTStart, loc)
 		if e.DTEnd != nil {
-			b.WriteString(fmt.Sprintf("DTEND:%s\r\n", e.DTEnd.UTC().Format(ICSDateTimeUTC)))
+			writeDateTime(b, "DTEND", *e.DTEnd, loc)
 		}
 	}
 
@@ -437,9 +439,18 @@ func writeComponent(b *strings.Builder, e *models.Event) {
 		b.WriteString(fmt.Sprintf("RRULE:%s\r\n", e.RecurrenceRule))
 	}
 	if e.RecurrenceID != "" {
-		if len(e.RecurrenceID) == 8 { // date-only key of an all-day occurrence
+		switch {
+		case len(e.RecurrenceID) == 8: // date-only key of an all-day occurrence
 			b.WriteString(fmt.Sprintf("RECURRENCE-ID;VALUE=DATE:%s\r\n", e.RecurrenceID))
-		} else {
+		case loc != nil:
+			// Keys are stored as UTC instants; write them back in the series' zone so the
+			// value type matches DTSTART, the way CalDAV clients send them.
+			if t, err := time.Parse(ICSDateTimeUTC, e.RecurrenceID); err == nil {
+				writeDateTime(b, "RECURRENCE-ID", t, loc)
+			} else {
+				b.WriteString(fmt.Sprintf("RECURRENCE-ID:%s\r\n", e.RecurrenceID))
+			}
+		default:
 			b.WriteString(fmt.Sprintf("RECURRENCE-ID:%s\r\n", e.RecurrenceID))
 		}
 	}
@@ -490,14 +501,14 @@ func writeComponent(b *strings.Builder, e *models.Event) {
 			if exdates, ok := propsMap["exdates"].([]interface{}); ok {
 				for _, ed := range exdates {
 					if edStr, ok := ed.(string); ok && edStr != "" {
-						b.WriteString(fmt.Sprintf("EXDATE:%s\r\n", edStr))
+						writeDateValue(b, "EXDATE", edStr, loc)
 					}
 				}
 			}
 			if rdates, ok := propsMap["rdates"].([]interface{}); ok {
 				for _, rd := range rdates {
 					if rdStr, ok := rd.(string); ok && rdStr != "" {
-						b.WriteString(fmt.Sprintf("RDATE:%s\r\n", rdStr))
+						writeDateValue(b, "RDATE", rdStr, loc)
 					}
 				}
 			}
@@ -542,9 +553,17 @@ func GenerateSchedulingICS(e *models.Event, method string) string {
 	b.WriteString("BEGIN:VEVENT\r\n")
 	b.WriteString(fmt.Sprintf("UID:%s\r\n", e.UID))
 	b.WriteString(fmt.Sprintf("DTSTAMP:%s\r\n", e.DTStamp.UTC().Format(ICSDateTimeUTC)))
-	b.WriteString(fmt.Sprintf("DTSTART:%s\r\n", e.DTStart.UTC().Format(ICSDateTimeUTC)))
-	if e.DTEnd != nil {
-		b.WriteString(fmt.Sprintf("DTEND:%s\r\n", e.DTEnd.UTC().Format(ICSDateTimeUTC)))
+	loc := eventLocation(e)
+	if e.AllDay {
+		b.WriteString(fmt.Sprintf("DTSTART;VALUE=DATE:%s\r\n", e.DTStart.Format(ICSDateOnly)))
+		if e.DTEnd != nil {
+			b.WriteString(fmt.Sprintf("DTEND;VALUE=DATE:%s\r\n", e.DTEnd.Format(ICSDateOnly)))
+		}
+	} else {
+		writeDateTime(&b, "DTSTART", e.DTStart, loc)
+		if e.DTEnd != nil {
+			writeDateTime(&b, "DTEND", *e.DTEnd, loc)
+		}
 	}
 	if e.Summary != "" {
 		b.WriteString(fmt.Sprintf("SUMMARY:%s\r\n", escapeICS(e.Summary)))

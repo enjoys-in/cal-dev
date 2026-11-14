@@ -324,6 +324,16 @@ func (h *Handler) calendarEventSet(c *fiber.Ctx, tenantID, userID int, call *JMA
 			}
 		}
 
+		// Anchor to the requested zone (or the calendar's, for a recurring event without one)
+		// before rendering the ICS, so the stored text carries TZID rather than a fixed UTC time.
+		if err := applyTimeZone(evt, props, true, func() string {
+			return h.calendarTimeZone(c.UserContext(), tenantID, evt.CalendarID)
+		}); err != nil {
+			notCreated[tempID] = map[string]interface{}{"type": "invalidProperties",
+				"properties": []string{"timeZone"}, "description": err.Error()}
+			continue
+		}
+
 		evt.RawICS = ics.GenerateICS(evt)
 		evt.SizeBytes = len(evt.RawICS)
 		evt.ETag = ics.GenerateETag(evt.RawICS)
@@ -353,6 +363,11 @@ func (h *Handler) calendarEventSet(c *fiber.Ctx, tenantID, userID int, call *JMA
 
 	// Handle updates
 	for id, props := range args.Update {
+		if err := validateTimeZone(props); err != nil { // before any side effect (calendar move)
+			notUpdated[id] = map[string]interface{}{"type": "invalidProperties",
+				"properties": []string{"timeZone"}, "description": err.Error()}
+			continue
+		}
 		evt, err := h.store.GetEventByID(c.UserContext(), tenantID, id)
 		if err != nil || evt == nil {
 			notUpdated[id] = map[string]string{"type": "notFound", "description": "Event not found"}
@@ -398,6 +413,24 @@ func (h *Handler) calendarEventSet(c *fiber.Ctx, tenantID, userID int, call *JMA
 		// applyJMAPUpdates reassigns fields rather than mutating shared slices).
 		oldEvt := *evt
 		applyJMAPUpdates(evt, props)
+
+		// Zone: an explicit timeZone always applies; the calendar-zone fallback only applies when
+		// this update actually changes the recurrence rule, never on an unrelated edit (or a save
+		// that just re-sends the unchanged rule) of an existing series.
+		zoneBefore := ics.EventTZID(evt)
+		if err := applyTimeZone(evt, props, evt.RecurrenceRule != oldEvt.RecurrenceRule, func() string {
+			return h.calendarTimeZone(c.UserContext(), tenantID, evt.CalendarID)
+		}); err != nil {
+			notUpdated[id] = map[string]interface{}{"type": "invalidProperties",
+				"properties": []string{"timeZone"}, "description": err.Error()}
+			continue
+		}
+		if zoneAfter := ics.EventTZID(evt); zoneAfter != zoneBefore {
+			for _, r := range rows[1:] { // overrides follow the series' zone
+				_ = ics.SetEventTZID(r, zoneAfter)
+			}
+		}
+
 		if patches, ok := props["recurrenceOverrides"].(map[string]interface{}); ok {
 			if rows, err = applyOverridePatches(rows, patches); err != nil {
 				notUpdated[id] = map[string]string{"type": "invalidProperties", "description": err.Error()}
@@ -934,6 +967,9 @@ func eventToJMAP(evt *models.Event, overrides []*models.Event) map[string]interf
 		result["recurrenceOverrides"] = ov
 	}
 
+	if tz, ok := timeZoneJMAP(evt); ok {
+		result["timeZone"] = tz
+	}
 	if evt.DTEnd != nil {
 		result["end"] = evt.DTEnd.Format(time.RFC3339)
 	}

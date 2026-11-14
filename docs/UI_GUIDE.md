@@ -180,6 +180,7 @@ interface JmapEvent {
   start: string;                    // RFC 3339, UTC offset as stored
   end?: string;
   duration?: string;                // ISO 8601, only if the source used DURATION
+  timeZone?: string;                // IANA zone the wall-clock times belong to; "Etc/UTC" = a fixed UTC time; absent for all-day
   isAllDay: boolean;
   status: "CONFIRMED" | "TENTATIVE" | "CANCELLED";
   sequence: number;
@@ -224,6 +225,7 @@ If your client does not resolve back-references, make two calls and pass `ids: [
 ["CalendarEvent/set", { "accountId": "7:7", "create": { "k1": {
   "title": "Design review",
   "start": "2026-11-20T10:00:00Z", "end": "2026-11-20T11:00:00Z",
+  "timeZone": "America/New_York",            // always send it — see "Time zone" below
   "location": "Room 4", "description": "…",
   "calendarId": "<optional>",
   "participants": {
@@ -239,11 +241,22 @@ Result: `created.k1 = { id, uid, etag }`.
 - **Do not send `organizer`.** The server sets you as the organizer whenever there are participants, and ignores any value you send. This is deliberate (it stops people sending invitations in someone else's name).
 - Adding participants sends invitations automatically — see [§7](#7-invitations-and-rsvp).
 
+#### Time zone
+
+`start` and `end` are always instants. `timeZone` says which zone those instants are *wall-clock times in*, and that is what makes "every Thursday 10:00 New York" stay at 10:00 across daylight-saving changes. **Send `timeZone` on every timed event**, using the user's zone: `Intl.DateTimeFormat().resolvedOptions().timeZone`.
+
+- It must be an IANA name (`America/New_York`, `Asia/Kolkata`; common Windows names such as `Eastern Standard Time` are accepted). An unknown name fails that object with `invalidProperties` and `properties: ["timeZone"]`.
+- `"Etc/UTC"`, `"UTC"`, `""` and `null` all mean a fixed UTC time.
+- If you leave it out on a **recurring** event, the server uses the zone of the event's calendar (`timezone` on the calendar, `UTC` by default). Do not rely on this: a calendar's zone is rarely the zone of the person creating the event.
+- All-day events have no zone; `timeZone` is not sent for them and is ignored if you send it.
+- Every `CalendarEvent/get` returns the stored `timeZone`, so edit forms can show it.
+
 ### Update
 
 ```jsonc
 ["CalendarEvent/set", { "accountId": "7:7", "update": { "<id>": {
   "title": "Design review (moved)", "start": "…", "end": "…", "location": "…",
+  "timeZone": "Europe/London",    // re-labels the series' zone; the instants in start/end do not change
   "participants": { … },          // replaces the guest list; removed guests get a cancellation
   "recurrenceRules": [{ "rule": "…" }],   // [] removes recurrence
   "status": "CANCELLED",
@@ -252,6 +265,8 @@ Result: `created.k1 = { id, uid, etag }`.
 ```
 
 Send only what changed. Updating an event **never** loses its exceptions, reminders or excluded dates. Each update bumps `sequence`.
+
+A `timeZone` you send always applies, and the zone of every exception follows the series. Without one, an update leaves the zone alone — except when it *changes* the recurrence rule of an event that has no zone, which then takes the calendar's zone. Re-sending the same rule changes nothing. To change the zone and keep the same **wall-clock** time (09:00 New York → 09:00 London), send the new `timeZone` together with the new `start`/`end` instants.
 
 ### Delete
 
@@ -270,6 +285,7 @@ A series comes back as **one** event. Exceptions are in `recurrenceOverrides`, k
 ```jsonc
 {
   "id": "…", "title": "Standup", "start": "2026-11-02T09:00:00Z", "end": "2026-11-02T10:00:00Z",
+  "timeZone": "Europe/London",
   "recurrenceRules": [{ "rule": "FREQ=WEEKLY;BYDAY=MO" }],
   "recurrenceOverrides": {
     "2026-11-16T09:00:00Z": { "start": "2026-11-16T14:00:00Z", "title": "Standup (afternoon)" },   // moved + retitled
@@ -282,18 +298,39 @@ An `OccurrencePatch` lists **only what differs** from the series: `start`, `end`
 
 ### Expanding in the UI
 
-Server-side expansion is used for free/busy and shared calendars, but the UI expands its own series. Use an RFC 5545 library (for example `rrule`) and apply overrides like this:
+Server-side expansion is used for free/busy and shared calendars, but the UI expands its own series. Use an RFC 5545 library (here `rrule` and `luxon`). **Expand in the event's `timeZone`, not in UTC**: a UTC-only expansion shows "every Monday 09:00 New York" an hour late after the daylight-saving change.
 
 ```ts
+import { RRule } from "rrule";
+import { DateTime } from "luxon";
+
+// rrule works on "floating" times: a Date whose UTC fields hold the wall-clock fields.
+const toFloating = (d: Date, zone: string) => {
+  const l = DateTime.fromJSDate(d, { zone });
+  return new Date(Date.UTC(l.year, l.month - 1, l.day, l.hour, l.minute, l.second));
+};
+const fromFloating = (f: Date, zone: string) =>
+  DateTime.fromObject({ year: f.getUTCFullYear(), month: f.getUTCMonth() + 1, day: f.getUTCDate(),
+    hour: f.getUTCHours(), minute: f.getUTCMinutes(), second: f.getUTCSeconds() }, { zone }).toJSDate();
+
+// The real start instants of a series inside [from, to].
+function seriesStarts(ev: JmapEvent, from: Date, to: Date): Date[] {
+  const rule = ev.recurrenceRules?.[0]?.rule;
+  if (!rule) return [new Date(ev.start)];
+  const zone = ev.timeZone ?? "Etc/UTC";
+  const opts = RRule.parseString(rule);
+  if (opts.until) opts.until = toFloating(opts.until, zone);       // UNTIL is a UTC instant
+  const rr = new RRule({ ...opts, dtstart: toFloating(new Date(ev.start), zone) });
+  const DAY = 864e5;                                                // window edges are converted approximately: widen
+  return rr.between(new Date(+toFloating(from, zone) - DAY), new Date(+toFloating(to, zone) + DAY), true)
+           .map(f => fromFloating(f, zone));
+}
+
 function occurrences(ev: JmapEvent, from: Date, to: Date) {
   const dur = ev.end ? +new Date(ev.end) - +new Date(ev.start) : 0;
-  const rule = ev.recurrenceRules?.[0]?.rule;
-  const starts = rule
-    ? RRule.fromString(`DTSTART:${toICS(ev.start)}\nRRULE:${rule}`).between(from, to, true)
-    : [new Date(ev.start)];
 
   const out = [];
-  for (const s of starts) {
+  for (const s of seriesStarts(ev, from, to)) {
     const key = s.toISOString().replace(".000Z", "Z");          // "2026-11-16T09:00:00Z"
     const o = ev.recurrenceOverrides?.[key];
     if (o?.excluded) continue;                                  // cancelled
@@ -314,7 +351,7 @@ function occurrences(ev: JmapEvent, from: Date, to: Date) {
 }
 ```
 
-`toICS` formats an ISO time as `20261102T090000Z`. Two cases are easy to miss: an occurrence whose *original* time is outside the window but that was moved **into** it (the second loop), and one whose original time is inside the window but that was moved **out** of it (the final filter).
+The override keys are always UTC instants, so `s.toISOString()` of a real start instant matches them even when the series is in another zone. Two cases are easy to miss: an occurrence whose *original* time is outside the window but that was moved **into** it (the second loop), and one whose original time is inside the window but that was moved **out** of it (the final filter).
 
 ### Editing
 
@@ -556,7 +593,9 @@ Important details:
 
 - Every instant is RFC 3339. Display in the user's own time zone; store and send UTC (`…Z`).
 - **All-day events:** send `isAllDay: true` with `start` at **00:00:00Z of the first day** and `end` at 00:00:00Z of the day **after the last day** (end is exclusive, as in iCalendar). A single all-day on 20 Nov is `start 2026-11-20T00:00:00Z`, `end 2026-11-21T00:00:00Z`. Render by date, not by local midnight, so users west of UTC do not see it a day early.
-- **Time zones of recurring events:** events created by calendar apps over CalDAV keep their zone, so "every Monday 09:00 New York" stays at 09:00 local across daylight-saving changes. A recurring event **created through JMAP** repeats at a fixed UTC time (JMAP events carry no zone yet), so it shifts by an hour in local time across DST. Prefer fixed-UTC recurrence only for things like "every 24 h", or create such events through CalDAV.
+- **Time zones of recurring events:** a recurring event stays at the same wall-clock time across daylight-saving changes **if it has a `timeZone`**. Events created by calendar apps over CalDAV always have one, and events created through JMAP have one when you send `timeZone` ([§5](#time-zone)). The zone survives everything the server does to the event afterwards: edits from any client, invitations and RSVPs, and the copy invitees receive.
+- **Series without a zone** (`timeZone: "Etc/UTC"`) repeat at a fixed UTC time, so in a zone with daylight saving their local time shifts by an hour twice a year. That is right for "every 24 h" and wrong for "every Monday at 09:00". **Recurring events created through JMAP before `timeZone` existed are in this state.** To fix one, send it a `timeZone` (`update: { "<id>": { "timeZone": "America/New_York" } }`): the first occurrence stays at the same instant and later ones follow the local clock. Check that the instant is the right local time first — a series created in summer and labelled with a winter zone's offset in mind will show an hour off.
+- Display is the UI's job: convert instants to the viewer's zone, and when the event's `timeZone` differs from the viewer's, show that too ("10:00 New York" for a viewer in Delhi) so people are not surprised when the local time moves after a daylight-saving change.
 - `RRULE` text uses iCalendar syntax: `FREQ=WEEKLY;BYDAY=MO,WE;UNTIL=20270101T000000Z`. Rules with `FREQ=SECONDLY|MINUTELY` are not expanded.
 
 ---
@@ -569,6 +608,8 @@ Important details:
 | Availability | ≤ 62 days per query, ≤ 50 emails; recurring series expanded up to 1000 occurrences per event |
 | Shared calendar events | ≤ 366 days, ≤ 2000 events per call |
 | Sharing | read-only only; no write/delegate sharing; no groups |
+| Time zone definitions | the server writes `TZID=<IANA name>` to calendar apps without an embedded `VTIMEZONE` definition; a client that does not know IANA names may treat the time as UTC |
+| Invitations to external addresses (email) | the emailed invitation describes the event's first occurrence only (no recurrence rule yet), in the event's `timeZone`; invitees with an account here get the whole series |
 | RSVP | applies to the whole series; no per-occurrence reply |
 | Edit "this and following" | not a single operation (split the series) |
 | Reminders (alarms) | preserved and synced to CalDAV clients, but not exposed in the JMAP event shape; the server sends no push for them |
