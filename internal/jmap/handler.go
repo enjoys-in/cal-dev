@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/enjoys-in/cal-dev/internal/ics"
@@ -235,6 +236,16 @@ func (h *Handler) calendarEventSet(c *fiber.Ctx, tenantID, userID int, call *JMA
 		return jmapMethodError("invalidArguments", "Invalid arguments", call.CallID)
 	}
 
+	if args.IfInState != "" {
+		currentState, _ := h.store.GetJMAPState(c.UserContext(), tenantID, userID, "CalendarEvent")
+		if args.IfInState != currentState {
+			return []interface{}{"error", map[string]string{
+				"type":        "stateMismatch",
+				"description": "State mismatch",
+			}, call.CallID}
+		}
+	}
+
 	created := make(map[string]map[string]interface{})
 	updated := make(map[string]interface{})
 	destroyed := make([]string, 0)
@@ -253,6 +264,12 @@ func (h *Handler) calendarEventSet(c *fiber.Ctx, tenantID, userID int, call *JMA
 				continue
 			}
 			evt.CalendarID = calendars[0].ID
+		} else {
+			cal, err := h.store.GetCalendar(c.UserContext(), tenantID, evt.CalendarID)
+			if err != nil || cal == nil || cal.UserID != userID {
+				notCreated[tempID] = map[string]string{"type": "forbidden", "description": "Calendar not found or access denied"}
+				continue
+			}
 		}
 
 		evt.RawICS = ics.GenerateICS(evt)
@@ -438,17 +455,40 @@ func (h *Handler) calendarEventChanges(c *fiber.Ctx, tenantID, userID int, call 
 		return jmapMethodError("invalidArguments", "Invalid arguments", call.CallID)
 	}
 
-	// For now return a simple changes response
 	newState, _ := h.store.GetJMAPState(c.UserContext(), tenantID, userID, "CalendarEvent")
+	if newState == "" {
+		newState = "initial"
+	}
+
+	if args.SinceState == "" || args.SinceState == newState {
+		result := map[string]interface{}{
+			"accountId":      fmt.Sprintf("%d:%d", tenantID, userID),
+			"oldState":       args.SinceState,
+			"newState":       newState,
+			"hasMoreChanges": false,
+			"created":        []string{},
+			"updated":        []string{},
+			"destroyed":      []string{},
+		}
+		return []interface{}{"CalendarEvent/changes", result, call.CallID}
+	}
+
+	changes, err := h.store.GetEventChangesSinceState(c.UserContext(), tenantID, userID, args.SinceState)
+	if err != nil {
+		return []interface{}{"error", map[string]string{
+			"type":        "cannotCalculateChanges",
+			"description": "State too old or unknown: " + err.Error(),
+		}, call.CallID}
+	}
 
 	result := map[string]interface{}{
 		"accountId":      fmt.Sprintf("%d:%d", tenantID, userID),
 		"oldState":       args.SinceState,
 		"newState":       newState,
 		"hasMoreChanges": false,
-		"created":        []string{},
-		"updated":        []string{},
-		"destroyed":      []string{},
+		"created":        changes.Created,
+		"updated":        changes.Updated,
+		"destroyed":      changes.Destroyed,
 	}
 
 	return []interface{}{"CalendarEvent/changes", result, call.CallID}
@@ -519,8 +559,21 @@ func (h *Handler) calendarSet(c *fiber.Ctx, tenantID, userID int, call *JMAPMeth
 		return jmapMethodError("invalidArguments", "Invalid arguments", call.CallID)
 	}
 
+	if args.IfInState != "" {
+		currentState, _ := h.store.GetJMAPState(c.UserContext(), tenantID, userID, "Calendar")
+		if args.IfInState != currentState {
+			return []interface{}{"error", map[string]string{
+				"type":        "stateMismatch",
+				"description": "State mismatch",
+			}, call.CallID}
+		}
+	}
+
 	created := make(map[string]map[string]interface{})
+	updated := make(map[string]interface{})
 	destroyed := make([]string, 0)
+	notCreated := make(map[string]interface{})
+	notUpdated := make(map[string]interface{})
 
 	// Handle creates
 	for tempID, props := range args.Create {
@@ -553,12 +606,50 @@ func (h *Handler) calendarSet(c *fiber.Ctx, tenantID, userID int, call *JMAPMeth
 		}
 
 		if err := h.store.CreateCalendar(c.UserContext(), cal); err != nil {
+			notCreated[tempID] = map[string]string{"type": "serverFail", "description": err.Error()}
 			continue
 		}
 
 		created[tempID] = map[string]interface{}{
 			"id": cal.ID,
 		}
+	}
+
+	// Handle updates
+	for id, props := range args.Update {
+		cal, err := h.store.GetCalendar(c.UserContext(), tenantID, id)
+		if err != nil || cal == nil {
+			notUpdated[id] = map[string]string{"type": "notFound", "description": "Calendar not found"}
+			continue
+		}
+
+		if name, ok := props["name"].(string); ok && name != "" {
+			cal.Name = name
+		}
+		if desc, ok := props["description"].(string); ok {
+			cal.Description = desc
+		}
+		if color, ok := props["color"].(string); ok && color != "" {
+			cal.Color = color
+		}
+		if tz, ok := props["timezone"].(string); ok && tz != "" {
+			cal.Timezone = tz
+		}
+		if isDefault, ok := props["isDefault"].(bool); ok {
+			cal.IsDefault = isDefault
+		}
+		if isVisible, ok := props["isVisible"].(bool); ok {
+			cal.IsVisible = isVisible
+		}
+		if sortOrder, ok := props["sortOrder"].(float64); ok {
+			cal.SortOrder = int(sortOrder)
+		}
+
+		if err := h.store.UpdateCalendar(c.UserContext(), cal); err != nil {
+			notUpdated[id] = map[string]string{"type": "serverFail", "description": err.Error()}
+			continue
+		}
+		updated[id] = nil
 	}
 
 	// Handle destroys
@@ -571,11 +662,14 @@ func (h *Handler) calendarSet(c *fiber.Ctx, tenantID, userID int, call *JMAPMeth
 	newState, _ := h.store.GetJMAPState(c.UserContext(), tenantID, userID, "Calendar")
 
 	result := map[string]interface{}{
-		"accountId": fmt.Sprintf("%d:%d", tenantID, userID),
-		"oldState":  args.IfInState,
-		"newState":  newState,
-		"created":   created,
-		"destroyed": destroyed,
+		"accountId":  fmt.Sprintf("%d:%d", tenantID, userID),
+		"oldState":   args.IfInState,
+		"newState":   newState,
+		"created":    created,
+		"updated":    updated,
+		"destroyed":  destroyed,
+		"notCreated": notCreated,
+		"notUpdated": notUpdated,
 	}
 
 	return []interface{}{"Calendar/set", result, call.CallID}
@@ -718,6 +812,18 @@ func jmapToEvent(props map[string]interface{}, tenantID, userID int) *models.Eve
 	if uid, ok := props["uid"].(string); ok {
 		evt.UID = uid
 	}
+	if status, ok := props["status"].(string); ok && status != "" {
+		evt.Status = strings.ToUpper(status)
+	}
+	if priority, ok := props["priority"].(float64); ok {
+		evt.Priority = int(priority)
+	}
+	if rule, ok := parseJMAPRecurrence(props); ok {
+		evt.RecurrenceRule = rule
+	}
+	if atts, ok := parseJMAPParticipants(props); ok {
+		evt.Attendees = atts
+	}
 
 	return evt
 }
@@ -742,10 +848,104 @@ func applyJMAPUpdates(evt *models.Event, props map[string]interface{}) {
 			evt.DTEnd = &t
 		}
 	}
+	if dur, ok := props["duration"].(string); ok {
+		evt.Duration = dur
+	}
 	if allDay, ok := props["isAllDay"].(bool); ok {
 		evt.AllDay = allDay
 	}
+	if calID, ok := props["calendarId"].(string); ok && calID != "" {
+		evt.CalendarID = calID
+	}
+	if status, ok := props["status"].(string); ok && status != "" {
+		evt.Status = strings.ToUpper(status)
+	}
+	if priority, ok := props["priority"].(float64); ok {
+		evt.Priority = int(priority)
+	}
+	if rule, ok := parseJMAPRecurrence(props); ok {
+		evt.RecurrenceRule = rule
+	}
+	if atts, ok := parseJMAPParticipants(props); ok {
+		evt.Attendees = atts
+	}
 	evt.Sequence++
+}
+
+func parseJMAPParticipants(props map[string]interface{}) (json.RawMessage, bool) {
+	if participants, ok := props["participants"].(map[string]interface{}); ok {
+		var attendees []models.Attendee
+		for _, p := range participants {
+			if pMap, ok := p.(map[string]interface{}); ok {
+				a := models.Attendee{
+					Role:   "REQ-PARTICIPANT",
+					Status: "NEEDS-ACTION",
+					Type:   "INDIVIDUAL",
+				}
+				if email, ok := pMap["email"].(string); ok {
+					a.Email = email
+				}
+				if name, ok := pMap["name"].(string); ok {
+					a.DisplayName = name
+				}
+				if status, ok := pMap["participationStatus"].(string); ok {
+					a.Status = status
+				}
+				if expectReply, ok := pMap["expectReply"].(bool); ok {
+					a.RSVP = expectReply
+				}
+				if a.Email != "" {
+					attendees = append(attendees, a)
+				}
+			}
+		}
+		b, err := json.Marshal(attendees)
+		if err == nil {
+			return json.RawMessage(b), true
+		}
+	}
+	return nil, false
+}
+
+func parseJMAPRecurrence(props map[string]interface{}) (string, bool) {
+	if rrules, ok := props["recurrenceRules"].([]interface{}); ok {
+		if len(rrules) > 0 {
+			if rmap, ok := rrules[0].(map[string]interface{}); ok {
+				if rule, ok := rmap["rule"].(string); ok {
+					return rule, true
+				}
+			}
+		} else {
+			return "", true
+		}
+	}
+	return "", false
+}
+
+// EventSource provides Server-Sent Events for JMAP push notifications (RFC 8620 §7).
+func (h *Handler) EventSource(c *fiber.Ctx) error {
+	tenantID := c.Locals("tenant_id").(int)
+	userID := c.Locals("user_id").(int)
+	accountID := fmt.Sprintf("%d:%d", tenantID, userID)
+
+	c.Set("Content-Type", "text/event-stream")
+	c.Set("Cache-Control", "no-cache")
+	c.Set("Connection", "keep-alive")
+
+	state, _ := h.store.GetJMAPState(c.UserContext(), tenantID, userID, "CalendarEvent")
+	calState, _ := h.store.GetJMAPState(c.UserContext(), tenantID, userID, "Calendar")
+
+	payload := map[string]interface{}{
+		"@type": "StateChange",
+		"changed": map[string]interface{}{
+			accountID: map[string]string{
+				"CalendarEvent": state,
+				"Calendar":      calState,
+			},
+		},
+	}
+	data, _ := json.Marshal(payload)
+	return c.SendString(fmt.Sprintf("event: state\r\ndata: %s\r\n\r\n", string(data)))
 }
 
 func jmapError(errType, description string) map[string]interface{} {

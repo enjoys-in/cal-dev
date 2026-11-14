@@ -199,6 +199,9 @@ func main() {
 	// JMAP API endpoint (RFC 8620 §3)
 	jmapGroup.Post("/api", jmapHandler.API)
 
+	// JMAP EventSource (RFC 8620 §7)
+	jmapGroup.Get("/eventsource", jmapHandler.EventSource)
+
 	// ============================================================
 	// ICS Feed Routes — /feeds/{tenant}/{user}/... (Outlook, Google, Apple)
 	// ============================================================
@@ -352,11 +355,15 @@ func createAppPasswordHandler(db *store.Store) fiber.Handler {
 	}
 }
 
-// deleteAppPasswordHandler deletes an app password.
+// deleteAppPasswordHandler deletes an app password scoped to user.
 func deleteAppPasswordHandler(db *store.Store) fiber.Handler {
 	return func(c *fiber.Ctx) error {
+		userID, _ := c.Locals("user_id").(int)
+		if userID == 0 {
+			return response.Error(c, 401, "unauthorized")
+		}
 		id := c.Params("id")
-		if err := db.DeleteAppPassword(c.UserContext(), id); err != nil {
+		if err := db.DeleteAppPasswordForUser(c.UserContext(), userID, id); err != nil {
 			return response.Error(c, 500, "delete failed")
 		}
 		return c.SendStatus(204)

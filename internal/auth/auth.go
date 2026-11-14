@@ -117,6 +117,9 @@ func (s *Service) ValidateToken(tokenString string) (*Claims, error) {
 	if sub, _ := mc.GetSubject(); sub != "" {
 		claims.Subject = sub
 	}
+	if iss, _ := mc.GetIssuer(); iss != "" {
+		claims.Issuer = iss
+	}
 
 	// Populate UserID from Subject if not set in custom claim
 	if claims.UserID == "" && claims.Subject != "" {
@@ -199,6 +202,9 @@ func (s *Service) AuthenticateBasic(ctx context.Context, email, password string)
 	if user == nil {
 		return 0, 0, fmt.Errorf("auth: user not found")
 	}
+	if strings.ToUpper(user.Status) != "ACTIVE" {
+		return 0, 0, fmt.Errorf("auth: account is %s", user.Status)
+	}
 
 	// Check app passwords for this user
 	appPasswords, err := s.store.GetAppPasswordsByUser(ctx, user.ID)
@@ -255,6 +261,9 @@ func (s *Service) ResolveUserFromToken(ctx context.Context, claims *Claims) (*Re
 
 	if user == nil {
 		return nil, fmt.Errorf("auth: user not found in mail_accounts")
+	}
+	if strings.ToUpper(user.Status) != "ACTIVE" {
+		return nil, fmt.Errorf("auth: account is %s", user.Status)
 	}
 
 	// Always use canonical values from mail_accounts

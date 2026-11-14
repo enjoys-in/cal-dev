@@ -47,25 +47,19 @@ func (h *Handler) IncomingIMIP(c *fiber.Ctx) error {
 		if err := c.BodyParser(&req); err != nil {
 			return response.Error(c, 400, "invalid request body")
 		}
-		tenantID = req.TenantID
 		rawICS = req.ICS
-
-		if tenantID == 0 {
-			// Fall back to auth context
-			if tid, ok := c.Locals("tenant_id").(int); ok {
-				tenantID = tid
-			}
+		if tid, ok := c.Locals("tenant_id").(int); ok && tid > 0 {
+			tenantID = tid
+		} else {
+			tenantID = req.TenantID
 		}
 	} else {
 		// Raw ICS body (text/calendar)
 		rawICS = string(c.Body())
-		if tidStr := c.Get("X-Tenant-ID"); tidStr != "" {
+		if tid, ok := c.Locals("tenant_id").(int); ok && tid > 0 {
+			tenantID = tid
+		} else if tidStr := c.Get("X-Tenant-ID"); tidStr != "" {
 			tenantID, _ = strconv.Atoi(tidStr)
-		}
-		if tenantID == 0 {
-			if tid, ok := c.Locals("tenant_id").(int); ok {
-				tenantID = tid
-			}
 		}
 	}
 

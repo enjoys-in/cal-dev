@@ -4,6 +4,7 @@ import (
 	"log"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/enjoys-in/cal-dev/internal/auth"
@@ -37,31 +38,38 @@ func RequestLogger() fiber.Handler {
 	}
 }
 
-// RateLimiter provides basic rate limiting.
+// RateLimiter provides basic rate limiting with thread-safe client tracking.
 func RateLimiter(maxRequests int, window time.Duration) fiber.Handler {
 	type client struct {
 		count    int
 		lastSeen time.Time
 	}
 	clients := make(map[string]*client)
+	var mu sync.Mutex
 
 	return func(c *fiber.Ctx) error {
 		ip := c.IP()
 
+		mu.Lock()
 		cl, exists := clients[ip]
 		if !exists {
 			clients[ip] = &client{count: 1, lastSeen: time.Now()}
+			mu.Unlock()
 			return c.Next()
 		}
 
 		if time.Since(cl.lastSeen) > window {
 			cl.count = 1
 			cl.lastSeen = time.Now()
+			mu.Unlock()
 			return c.Next()
 		}
 
 		cl.count++
-		if cl.count > maxRequests {
+		count := cl.count
+		mu.Unlock()
+
+		if count > maxRequests {
 			return c.Status(429).SendString("Too Many Requests")
 		}
 
@@ -194,12 +202,15 @@ func XMLSizeLimit(maxSize int) fiber.Handler {
 	}
 }
 
-// resolveTenantID determines the tenant ID using the following priority:
-//  1. X-Tenant-ID request header (parsed to int)
-//  2. access_token cookie → decode JWT → use "mid" claim
-//  3. Fallback to the value provided by auth (mail_accounts.id)
+// resolveTenantID determines the tenant ID.
+// Authenticated user identity (fallback) is authoritative and cannot be overridden by untrusted request headers.
 func resolveTenantID(c *fiber.Ctx, authSvc *auth.Service, fallback int) int {
-	// 1. Explicit header
+	// If already authenticated from token/user, use the authenticated tenant ID
+	if fallback > 0 {
+		return fallback
+	}
+
+	// 1. Explicit header (only if not authenticated via user token)
 	if tid := c.Get("X-Tenant-ID"); tid != "" {
 		if n, err := strconv.Atoi(tid); err == nil {
 			return n
@@ -222,7 +233,6 @@ func resolveTenantID(c *fiber.Ctx, authSvc *auth.Service, fallback int) int {
 		}
 	}
 
-	// 3. Fallback (typically mail_accounts.id from auth)
 	return fallback
 }
 

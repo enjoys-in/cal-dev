@@ -167,6 +167,7 @@ type EventFilter struct {
 	ComponentType  string
 	TimeRangeStart *time.Time
 	TimeRangeEnd   *time.Time
+	UpdatedSince   *time.Time
 	UIDs           []string
 	Limit          int
 	Offset         int

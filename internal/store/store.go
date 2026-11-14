@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -162,6 +163,12 @@ func (s *Store) TouchAppPassword(ctx context.Context, id string) error {
 func (s *Store) DeleteAppPassword(ctx context.Context, id string) error {
 	query := `DELETE FROM caldev_app_passwords WHERE id = $1`
 	_, err := s.db.ExecContext(ctx, query, id)
+	return err
+}
+
+func (s *Store) DeleteAppPasswordForUser(ctx context.Context, userID int, id string) error {
+	query := `DELETE FROM caldev_app_passwords WHERE user_id = $1 AND id = $2`
+	_, err := s.db.ExecContext(ctx, query, userID, id)
 	return err
 }
 
@@ -425,13 +432,18 @@ func (s *Store) queryEvents(ctx context.Context, filter *models.EventFilter) ([]
 		argIdx++
 	}
 	if filter.TimeRangeStart != nil {
-		conditions = append(conditions, fmt.Sprintf("(dtend IS NULL OR dtend > $%d)", argIdx))
+		conditions = append(conditions, fmt.Sprintf("(dtend IS NULL OR dtend > $%d OR recurrence_rule != '')", argIdx))
 		args = append(args, *filter.TimeRangeStart)
 		argIdx++
 	}
 	if filter.TimeRangeEnd != nil {
 		conditions = append(conditions, fmt.Sprintf("dtstart < $%d", argIdx))
 		args = append(args, *filter.TimeRangeEnd)
+		argIdx++
+	}
+	if filter.UpdatedSince != nil {
+		conditions = append(conditions, fmt.Sprintf("updated_at > $%d", argIdx))
+		args = append(args, *filter.UpdatedSince)
 		argIdx++
 	}
 	if len(filter.UIDs) > 0 {
@@ -479,9 +491,107 @@ func (s *Store) queryEvents(ctx context.Context, filter *models.EventFilter) ([]
 			&e.CreatedAt, &e.UpdatedAt); err != nil {
 			return nil, err
 		}
+
+		// If recurrence rule is present, check UNTIL
+		if filter.TimeRangeStart != nil && e.RecurrenceRule != "" && e.DTEnd != nil && e.DTEnd.Before(*filter.TimeRangeStart) {
+			if until := extractUntil(e.RecurrenceRule); !until.IsZero() && until.Before(*filter.TimeRangeStart) {
+				continue
+			}
+		}
+
 		events = append(events, e)
 	}
 	return events, rows.Err()
+}
+
+func extractUntil(rrule string) time.Time {
+	for _, part := range strings.Split(rrule, ";") {
+		if strings.HasPrefix(strings.ToUpper(part), "UNTIL=") {
+			val := part[6:]
+			if t, err := time.Parse("20060102T150405Z", val); err == nil {
+				return t
+			}
+			if t, err := time.Parse("20060102", val); err == nil {
+				return t
+			}
+		}
+	}
+	return time.Time{}
+}
+
+// EventChanges holds the lists of IDs created, updated, and destroyed since a state.
+type EventChanges struct {
+	Created   []string
+	Updated   []string
+	Destroyed []string
+}
+
+// GetEventChangesSinceState returns created, updated, and destroyed event IDs since the given state.
+func (s *Store) GetEventChangesSinceState(ctx context.Context, tenantID, userID int, sinceState string) (*EventChanges, error) {
+	var sinceID int64
+	if sinceState != "" && sinceState != "0" && sinceState != "initial" {
+		var err error
+		sinceID, err = strconv.ParseInt(sinceState, 10, 64)
+		if err != nil || sinceID < 0 {
+			return nil, fmt.Errorf("invalid state: %s", sinceState)
+		}
+	}
+
+	query := `SELECT sc.event_uid, sc.change_type, COALESCE(e.id::text, '')
+		FROM caldev_sync_changes sc
+		LEFT JOIN caldev_events e ON e.tenant_id = sc.tenant_id AND e.uid = sc.event_uid
+		WHERE sc.tenant_id = $1 AND sc.id > $2
+		ORDER BY sc.id ASC`
+	rows, err := s.db.QueryContext(ctx, query, tenantID, sinceID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	createdMap := make(map[string]bool)
+	updatedMap := make(map[string]bool)
+	destroyedMap := make(map[string]bool)
+
+	for rows.Next() {
+		var uid, changeType, eventID string
+		if err := rows.Scan(&uid, &changeType, &eventID); err != nil {
+			return nil, err
+		}
+		targetID := eventID
+		if targetID == "" {
+			targetID = uid
+		}
+		switch changeType {
+		case "created":
+			createdMap[targetID] = true
+			delete(destroyedMap, targetID)
+		case "modified":
+			if !createdMap[targetID] {
+				updatedMap[targetID] = true
+			}
+		case "deleted":
+			delete(createdMap, targetID)
+			delete(updatedMap, targetID)
+			destroyedMap[targetID] = true
+		}
+	}
+
+	changes := &EventChanges{
+		Created:   make([]string, 0, len(createdMap)),
+		Updated:   make([]string, 0, len(updatedMap)),
+		Destroyed: make([]string, 0, len(destroyedMap)),
+	}
+	for id := range createdMap {
+		changes.Created = append(changes.Created, id)
+	}
+	for id := range updatedMap {
+		changes.Updated = append(changes.Updated, id)
+	}
+	for id := range destroyedMap {
+		changes.Destroyed = append(changes.Destroyed, id)
+	}
+
+	return changes, rows.Err()
 }
 
 // MoveEvent moves an event from one calendar to another.
@@ -650,6 +760,15 @@ func (s *Store) UpdateSchedulingMessageStatus(ctx context.Context, id, status, e
 // ============================================================
 
 func (s *Store) GetJMAPState(ctx context.Context, tenantID, userID int, entityType string) (string, error) {
+	if entityType == "CalendarEvent" {
+		var maxID sql.NullInt64
+		query := `SELECT MAX(id) FROM caldev_sync_changes WHERE tenant_id = $1`
+		err := s.db.QueryRowContext(ctx, query, tenantID).Scan(&maxID)
+		if err == nil && maxID.Valid {
+			return fmt.Sprintf("%d", maxID.Int64), nil
+		}
+		return "0", nil
+	}
 	var state string
 	query := `SELECT state FROM caldev_jmap_states
 		WHERE tenant_id = $1 AND user_id = $2 AND entity_type = $3`
@@ -661,10 +780,14 @@ func (s *Store) GetJMAPState(ctx context.Context, tenantID, userID int, entityTy
 }
 
 func (s *Store) GetEventsChangedSince(ctx context.Context, tenantID, userID int, since time.Time) ([]*models.Event, error) {
-	return s.queryEvents(ctx, &models.EventFilter{
+	filter := &models.EventFilter{
 		TenantID: tenantID,
 		UserID:   userID,
-	})
+	}
+	if !since.IsZero() {
+		filter.UpdatedSince = &since
+	}
+	return s.queryEvents(ctx, filter)
 }
 
 // UpsertEvent creates or updates an event based on UID uniqueness.

@@ -42,6 +42,18 @@ func (svc *Service) ProcessEvent(ctx context.Context, event *models.Event, metho
 		return nil
 	}
 
+	// Verify organizer matches the authenticated event owner to prevent organizer spoofing
+	if event.UserID != 0 {
+		user, err := svc.store.GetUserByID(ctx, event.UserID)
+		if err == nil && user != nil {
+			orgEmail := strings.TrimPrefix(strings.ToLower(event.Organizer), "mailto:")
+			if !strings.EqualFold(orgEmail, user.Email) {
+				log.Printf("scheduling: skipping ProcessEvent: organizer %s does not match event owner %s", event.Organizer, user.Email)
+				return nil
+			}
+		}
+	}
+
 	for _, attendee := range attendees {
 		msg := &models.SchedulingMessage{
 			ID:             uuid.New().String(),
@@ -160,18 +172,23 @@ func (svc *Service) ProcessReply(ctx context.Context, tenantID int, eventUID, at
 		return fmt.Errorf("parse attendees: %w", err)
 	}
 
+	found := false
 	for i, a := range attendees {
-		if a.Email == attendeeEmail {
+		if strings.EqualFold(a.Email, attendeeEmail) {
 			attendees[i].Status = partstat
+			found = true
 			break
 		}
+	}
+	if !found {
+		return fmt.Errorf("attendee %s not found on event %s", attendeeEmail, eventUID)
 	}
 
 	attendeesJSON, _ := json.Marshal(attendees)
 	event.Attendees = json.RawMessage(attendeesJSON)
-	event.Sequence++
-	event.ETag = ics.GenerateETag(event.UID + fmt.Sprintf("%d", event.Sequence))
-	// Clear RawICS so GenerateICS actually regenerates from updated fields
+	// Note: RFC 5546 §2.1.4: Only organizer increments SEQUENCE; attendee replies do not bump it.
+	event.ETag = ics.GenerateETag(event.UID + fmt.Sprintf("%d-%s", event.Sequence, time.Now().Format(time.RFC3339Nano)))
+	// Regenerate RawICS to reflect updated attendee status
 	event.RawICS = ""
 	event.RawICS = ics.GenerateICS(event)
 	event.SizeBytes = len(event.RawICS)

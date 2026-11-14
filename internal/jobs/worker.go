@@ -202,6 +202,13 @@ func (w *Worker) maintenanceLoop(ctx context.Context) {
 					log.Printf("worker: failed to enqueue job history cleanup: %v", err)
 				}
 			}
+
+			// Enqueue due calendar subscription syncs
+			if _, ok := w.handlers["enqueue_due_syncs"]; ok {
+				if _, err := w.queue.Enqueue(ctx, "enqueue_due_syncs", nil); err != nil {
+					log.Printf("worker: failed to enqueue due syncs: %v", err)
+				}
+			}
 		}
 	}
 }

@@ -67,6 +67,9 @@ func (h *Handler) Create(c *fiber.Ctx) error {
 	if req.SourceURL == "" {
 		return response.Error(c, 400, "source_url is required")
 	}
+	if err := ValidateSubscriptionURL(req.SourceURL); err != nil {
+		return response.Error(c, 400, "invalid source_url: "+err.Error())
+	}
 
 	// Defaults
 	if req.SourceType == "" {
@@ -97,9 +100,14 @@ func (h *Handler) Create(c *fiber.Ctx) error {
 		}
 	}
 
-	// Create a dedicated calendar for this subscription if not specified
+	// Create a dedicated calendar for this subscription if not specified, or verify ownership
 	calendarID := req.CalendarID
-	if calendarID == "" {
+	if calendarID != "" {
+		existingCal, err := h.store.GetCalendar(c.UserContext(), tenantID, calendarID)
+		if err != nil || existingCal == nil || existingCal.UserID != userID {
+			return response.Error(c, 403, "calendar not found or access denied")
+		}
+	} else {
 		cal := &models.Calendar{
 			ID:                  uuid.New().String(),
 			TenantID:            tenantID,

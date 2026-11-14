@@ -19,6 +19,15 @@ const (
 	ICSDateOnly      = "20060102"
 )
 
+// Alarm represents a VALARM component per RFC 5545 §3.6.6.
+type Alarm struct {
+	Action      string `json:"action"`                // DISPLAY, AUDIO, EMAIL
+	Trigger     string `json:"trigger"`               // e.g. -PT15M, -PT1H
+	Description string `json:"description,omitempty"` // Reminder text
+	Duration    string `json:"duration,omitempty"`
+	Repeat      int    `json:"repeat,omitempty"`
+}
+
 // ParseICS parses a raw ICS string into Event fields.
 func ParseICS(rawICS string, tenantID, userID int, calendarID string) (*models.Event, error) {
 	e := &models.Event{
@@ -41,23 +50,29 @@ func ParseICS(rawICS string, tenantID, userID int, calendarID string) (*models.E
 	lines := unfoldICS(rawICS)
 
 	var inVEvent bool
+	var inVAlarm bool
 	var attendees []models.Attendee
+	var alarms []Alarm
+	var currentAlarm Alarm
+	var exdates []string
+	var rdates []string
 
 	for _, line := range lines {
-		if strings.TrimSpace(line) == "BEGIN:VEVENT" {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "BEGIN:VEVENT" {
 			inVEvent = true
 			continue
 		}
-		if strings.TrimSpace(line) == "END:VEVENT" {
+		if trimmed == "END:VEVENT" {
 			inVEvent = false
 			continue
 		}
-		if strings.TrimSpace(line) == "BEGIN:VTODO" {
+		if trimmed == "BEGIN:VTODO" {
 			e.ComponentType = "VTODO"
 			inVEvent = true
 			continue
 		}
-		if strings.TrimSpace(line) == "END:VTODO" {
+		if trimmed == "END:VTODO" {
 			inVEvent = false
 			continue
 		}
@@ -65,13 +80,43 @@ func ParseICS(rawICS string, tenantID, userID int, calendarID string) (*models.E
 			continue
 		}
 
-		name, params, value := parseLine(line)
+		if trimmed == "BEGIN:VALARM" {
+			inVAlarm = true
+			currentAlarm = Alarm{Action: "DISPLAY", Trigger: "-PT15M"}
+			continue
+		}
+		if trimmed == "END:VALARM" {
+			inVAlarm = false
+			alarms = append(alarms, currentAlarm)
+			continue
+		}
 
-		switch strings.ToUpper(name) {
+		name, params, value := parseLine(line)
+		upperName := strings.ToUpper(name)
+
+		if inVAlarm {
+			switch upperName {
+			case "ACTION":
+				currentAlarm.Action = strings.ToUpper(value)
+			case "TRIGGER":
+				currentAlarm.Trigger = value
+			case "DESCRIPTION":
+				currentAlarm.Description = unescapeICS(value)
+			case "DURATION":
+				currentAlarm.Duration = value
+			case "REPEAT":
+				if n := parseInt(value); n >= 0 {
+					currentAlarm.Repeat = n
+				}
+			}
+			continue
+		}
+
+		switch upperName {
 		case "UID":
 			e.UID = value
 		case "SUMMARY":
-			e.Summary = value
+			e.Summary = unescapeICS(value)
 		case "DESCRIPTION":
 			e.Description = unescapeICS(value)
 		case "LOCATION":
@@ -85,10 +130,30 @@ func ParseICS(rawICS string, tenantID, userID int, calendarID string) (*models.E
 			e.DTEnd = &dt
 		case "DURATION":
 			e.Duration = value
+			if e.DTEnd == nil && !e.DTStart.IsZero() {
+				if d := parseDurationString(value); d > 0 {
+					dt := e.DTStart.Add(d)
+					e.DTEnd = &dt
+				}
+			}
 		case "RRULE":
 			e.RecurrenceRule = value
 		case "RECURRENCE-ID":
 			e.RecurrenceID = value
+		case "EXDATE":
+			for _, ed := range strings.Split(value, ",") {
+				ed = strings.TrimSpace(ed)
+				if ed != "" {
+					exdates = append(exdates, ed)
+				}
+			}
+		case "RDATE":
+			for _, rd := range strings.Split(value, ",") {
+				rd = strings.TrimSpace(rd)
+				if rd != "" {
+					rdates = append(rdates, rd)
+				}
+			}
 		case "SEQUENCE":
 			if n := parseInt(value); n >= 0 {
 				e.Sequence = n
@@ -130,6 +195,25 @@ func ParseICS(rawICS string, tenantID, userID int, calendarID string) (*models.E
 	if len(attendees) > 0 {
 		b, _ := json.Marshal(attendees)
 		e.Attendees = json.RawMessage(b)
+	}
+
+	propsMap := make(map[string]interface{})
+	if len(e.Properties) > 0 && string(e.Properties) != "{}" {
+		_ = json.Unmarshal(e.Properties, &propsMap)
+	}
+	if len(alarms) > 0 {
+		propsMap["alarms"] = alarms
+	}
+	if len(exdates) > 0 {
+		propsMap["exdates"] = exdates
+	}
+	if len(rdates) > 0 {
+		propsMap["rdates"] = rdates
+	}
+	if len(propsMap) > 0 {
+		if b, err := json.Marshal(propsMap); err == nil {
+			e.Properties = json.RawMessage(b)
+		}
 	}
 
 	e.ETag = generateETag(rawICS)
@@ -228,6 +312,50 @@ func GenerateICS(e *models.Event) string {
 		}
 	}
 
+	// Write EXDATE, RDATE and VALARM if in Properties
+	if len(e.Properties) > 0 && string(e.Properties) != "{}" {
+		var propsMap map[string]interface{}
+		if err := json.Unmarshal(e.Properties, &propsMap); err == nil && propsMap != nil {
+			if exdates, ok := propsMap["exdates"].([]interface{}); ok {
+				for _, ed := range exdates {
+					if edStr, ok := ed.(string); ok && edStr != "" {
+						b.WriteString(fmt.Sprintf("EXDATE:%s\r\n", edStr))
+					}
+				}
+			}
+			if rdates, ok := propsMap["rdates"].([]interface{}); ok {
+				for _, rd := range rdates {
+					if rdStr, ok := rd.(string); ok && rdStr != "" {
+						b.WriteString(fmt.Sprintf("RDATE:%s\r\n", rdStr))
+					}
+				}
+			}
+			if alarms, ok := propsMap["alarms"].([]interface{}); ok {
+				for _, al := range alarms {
+					if alMap, ok := al.(map[string]interface{}); ok {
+						action := "DISPLAY"
+						if a, ok := alMap["action"].(string); ok && a != "" {
+							action = a
+						}
+						trigger := "-PT15M"
+						if tr, ok := alMap["trigger"].(string); ok && tr != "" {
+							trigger = tr
+						}
+						desc := "Reminder"
+						if d, ok := alMap["description"].(string); ok && d != "" {
+							desc = d
+						}
+						b.WriteString("BEGIN:VALARM\r\n")
+						b.WriteString(fmt.Sprintf("ACTION:%s\r\n", action))
+						b.WriteString(fmt.Sprintf("TRIGGER:%s\r\n", trigger))
+						b.WriteString(fmt.Sprintf("DESCRIPTION:%s\r\n", escapeICS(desc)))
+						b.WriteString("END:VALARM\r\n")
+					}
+				}
+			}
+		}
+	}
+
 	b.WriteString(fmt.Sprintf("END:%s\r\n", compType))
 	b.WriteString("END:VCALENDAR\r\n")
 
@@ -267,7 +395,11 @@ func GenerateSchedulingICS(e *models.Event, method string) string {
 		b.WriteString(fmt.Sprintf("ORGANIZER:%s\r\n", org))
 	}
 	b.WriteString(fmt.Sprintf("SEQUENCE:%d\r\n", e.Sequence))
-	b.WriteString(fmt.Sprintf("STATUS:%s\r\n", e.Status))
+	status := e.Status
+	if strings.ToUpper(method) == "CANCEL" {
+		status = "CANCELLED"
+	}
+	b.WriteString(fmt.Sprintf("STATUS:%s\r\n", status))
 
 	var attendees []models.Attendee
 	if err := json.Unmarshal(e.Attendees, &attendees); err == nil {
@@ -314,11 +446,21 @@ func unfoldICS(raw string) []string {
 	return result
 }
 
-// parseLine splits an ICS line into name, params, and value.
+// parseLine splits an ICS line into name, params, and value respecting quoted strings (RFC 5545 §3.1).
 func parseLine(line string) (name string, params map[string]string, value string) {
 	params = make(map[string]string)
 
-	colonIdx := strings.Index(line, ":")
+	inQuote := false
+	colonIdx := -1
+	for i := 0; i < len(line); i++ {
+		if line[i] == '"' {
+			inQuote = !inQuote
+		} else if line[i] == ':' && !inQuote {
+			colonIdx = i
+			break
+		}
+	}
+
 	if colonIdx == -1 {
 		return line, params, ""
 	}
@@ -326,21 +468,89 @@ func parseLine(line string) (name string, params map[string]string, value string
 	prefix := line[:colonIdx]
 	value = line[colonIdx+1:]
 
-	semicolonIdx := strings.Index(prefix, ";")
+	semicolonIdx := -1
+	inQuote = false
+	for i := 0; i < len(prefix); i++ {
+		if prefix[i] == '"' {
+			inQuote = !inQuote
+		} else if prefix[i] == ';' && !inQuote {
+			semicolonIdx = i
+			break
+		}
+	}
+
 	if semicolonIdx == -1 {
 		name = prefix
 	} else {
 		name = prefix[:semicolonIdx]
 		paramStr := prefix[semicolonIdx+1:]
-		for _, p := range strings.Split(paramStr, ";") {
+
+		var paramParts []string
+		start := 0
+		inQuote = false
+		for i := 0; i < len(paramStr); i++ {
+			if paramStr[i] == '"' {
+				inQuote = !inQuote
+			} else if paramStr[i] == ';' && !inQuote {
+				paramParts = append(paramParts, paramStr[start:i])
+				start = i + 1
+			}
+		}
+		paramParts = append(paramParts, paramStr[start:])
+
+		for _, p := range paramParts {
 			eqIdx := strings.Index(p, "=")
 			if eqIdx != -1 {
-				params[strings.ToUpper(p[:eqIdx])] = p[eqIdx+1:]
+				params[strings.ToUpper(p[:eqIdx])] = strings.Trim(p[eqIdx+1:], "\"")
 			}
 		}
 	}
 
 	return name, params, value
+}
+
+// parseDurationString parses an ISO 8601 duration string into time.Duration.
+func parseDurationString(durStr string) time.Duration {
+	durStr = strings.ToUpper(durStr)
+	if !strings.HasPrefix(durStr, "P") {
+		return 0
+	}
+	durStr = durStr[1:]
+
+	var total time.Duration
+	inTime := false
+	num := 0
+
+	for _, c := range durStr {
+		if c == 'T' {
+			inTime = true
+			continue
+		}
+		if c >= '0' && c <= '9' {
+			num = num*10 + int(c-'0')
+			continue
+		}
+		switch c {
+		case 'D':
+			total += time.Duration(num) * 24 * time.Hour
+		case 'W':
+			total += time.Duration(num) * 7 * 24 * time.Hour
+		case 'H':
+			if inTime {
+				total += time.Duration(num) * time.Hour
+			}
+		case 'M':
+			if inTime {
+				total += time.Duration(num) * time.Minute
+			}
+		case 'S':
+			if inTime {
+				total += time.Duration(num) * time.Second
+			}
+		}
+		num = 0
+	}
+	return total
 }
 
 // parseDateTime parses ICS date/datetime values.
@@ -366,6 +576,22 @@ func parseDateTime(value string, params map[string]string) (time.Time, bool) {
 	if err == nil {
 		// Apply TZID if present
 		if tzid, ok := params["TZID"]; ok {
+			tzid = strings.Trim(tzid, "\"")
+			tzid = strings.TrimPrefix(tzid, "/")
+			switch tzid {
+			case "India Standard Time":
+				tzid = "Asia/Kolkata"
+			case "Eastern Standard Time":
+				tzid = "America/New_York"
+			case "Central Standard Time":
+				tzid = "America/Chicago"
+			case "Pacific Standard Time":
+				tzid = "America/Los_Angeles"
+			case "Mountain Standard Time":
+				tzid = "America/Denver"
+			case "GMT Standard Time":
+				tzid = "Europe/London"
+			}
 			loc, err := time.LoadLocation(tzid)
 			if err == nil {
 				t = time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(), 0, loc)

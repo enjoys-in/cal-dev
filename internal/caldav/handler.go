@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"encoding/xml"
 	"fmt"
 	"io"
 	"log"
+	"net/url"
 	"strings"
 	"time"
 
@@ -141,7 +143,7 @@ func (h *Handler) Proppatch(c *fiber.Ctx) error {
 	tenantID := c.Locals("tenant_id").(int)
 	path := c.Path()
 
-	_, err := xmlutil.ParseProppatch(bytes.NewReader(c.Body()))
+	req, err := xmlutil.ParseProppatch(bytes.NewReader(c.Body()))
 	if err != nil {
 		return c.Status(400).SendString("Bad Request: " + err.Error())
 	}
@@ -153,12 +155,55 @@ func (h *Handler) Proppatch(c *fiber.Ctx) error {
 			return c.Status(404).SendString("Not Found")
 		}
 
-		// For now accept all property patches on calendars
-		// In production, parse the individual properties and update accordingly
+		updatedProps := make(map[string]string)
+		for _, set := range req.Set {
+			decoder := xml.NewDecoder(strings.NewReader("<root>" + set.Prop.InnerXML + "</root>"))
+			for {
+				tok, err := decoder.Token()
+				if err != nil {
+					break
+				}
+				if se, ok := tok.(xml.StartElement); ok {
+					var val string
+					_ = decoder.DecodeElement(&val, &se)
+					local := strings.ToLower(se.Name.Local)
+					switch local {
+					case "displayname":
+						cal.Name = val
+						updatedProps["displayname"] = "<D:displayname/>"
+					case "calendar-color":
+						cal.Color = val
+						updatedProps["calendar-color"] = "<A:calendar-color/>"
+					case "calendar-description":
+						cal.Description = val
+						updatedProps["calendar-description"] = "<C:calendar-description/>"
+					case "calendar-timezone":
+						cal.Timezone = val
+						updatedProps["calendar-timezone"] = "<C:calendar-timezone/>"
+					case "calendar-order":
+						var order int
+						if n, _ := fmt.Sscanf(val, "%d", &order); n > 0 {
+							cal.SortOrder = order
+						}
+						updatedProps["calendar-order"] = "<A:calendar-order/>"
+					}
+				}
+			}
+		}
+
+		if len(updatedProps) == 0 {
+			updatedProps["displayname"] = "<D:displayname/>"
+		}
+
+		if err := h.store.UpdateCalendar(ctx, cal); err != nil {
+			log.Printf("caldav: PROPPATCH update error: %v", err)
+			return c.Status(500).SendString("Internal Server Error")
+		}
+
 		response := xmlutil.DAVResponse{
 			Href: path,
 			PropStats: []xmlutil.PropStat{{
-				Props:  map[string]string{"result": `<D:displayname/>`},
+				Props:  updatedProps,
 				Status: 200,
 			}},
 		}
@@ -195,6 +240,8 @@ func (h *Handler) Report(c *fiber.Ctx) error {
 		return h.reportCalendarMultiget(c, ctx, tenantID, path, body)
 	case strings.Contains(bodyStr, "sync-collection"):
 		return h.reportSyncCollection(c, ctx, tenantID, path, body)
+	case strings.Contains(bodyStr, "free-busy-query"):
+		return h.reportFreeBusy(c, ctx, tenantID, userID, path, body)
 	default:
 		return c.Status(400).SendString("Unsupported REPORT type")
 	}
@@ -317,6 +364,84 @@ func (h *Handler) reportSyncCollection(c *fiber.Ctx, ctx context.Context, tenant
 	return c.Send(buf.Bytes())
 }
 
+func (h *Handler) reportFreeBusy(c *fiber.Ctx, ctx context.Context, tenantID, userID int, path string, body []byte) error {
+	calendarID := extractCalendarID(path)
+
+	// Extract time-range from free-busy-query XML: <C:time-range start="..." end="..."/>
+	var timeRangeStart, timeRangeEnd *time.Time
+	bodyStr := string(body)
+
+	startIdx := strings.Index(bodyStr, `start="`)
+	if startIdx != -1 {
+		startVal := bodyStr[startIdx+7:]
+		if endQuote := strings.Index(startVal, `"`); endQuote != -1 {
+			if t, err := time.Parse("20060102T150405Z", startVal[:endQuote]); err == nil {
+				timeRangeStart = &t
+			}
+		}
+	}
+
+	endIdx := strings.Index(bodyStr, `end="`)
+	if endIdx != -1 {
+		endVal := bodyStr[endIdx+5:]
+		if endQuote := strings.Index(endVal, `"`); endQuote != -1 {
+			if t, err := time.Parse("20060102T150405Z", endVal[:endQuote]); err == nil {
+				timeRangeEnd = &t
+			}
+		}
+	}
+
+	filter := &models.EventFilter{
+		TenantID:       tenantID,
+		CalendarID:     calendarID,
+		TimeRangeStart: timeRangeStart,
+		TimeRangeEnd:   timeRangeEnd,
+	}
+
+	events, err := h.store.QueryEvents(ctx, filter)
+	if err != nil {
+		return c.Status(500).SendString("Internal Server Error")
+	}
+
+	nowStr := time.Now().UTC().Format("20060102T150405Z")
+	startStr := nowStr
+	if timeRangeStart != nil {
+		startStr = timeRangeStart.Format("20060102T150405Z")
+	}
+	endStr := time.Now().UTC().Add(30 * 24 * time.Hour).Format("20060102T150405Z")
+	if timeRangeEnd != nil {
+		endStr = timeRangeEnd.Format("20060102T150405Z")
+	}
+
+	var b strings.Builder
+	b.WriteString("BEGIN:VCALENDAR\r\n")
+	b.WriteString("VERSION:2.0\r\n")
+	b.WriteString("PRODID:-//CalDev//CalDAV Server//EN\r\n")
+	b.WriteString("BEGIN:VFREEBUSY\r\n")
+	b.WriteString(fmt.Sprintf("UID:%s@caldev\r\n", uuid.New().String()))
+	b.WriteString(fmt.Sprintf("DTSTAMP:%s\r\n", nowStr))
+	b.WriteString(fmt.Sprintf("DTSTART:%s\r\n", startStr))
+	b.WriteString(fmt.Sprintf("DTEND:%s\r\n", endStr))
+
+	for _, evt := range events {
+		if strings.ToUpper(evt.Transparency) == "TRANSPARENT" || strings.ToUpper(evt.Status) == "CANCELLED" {
+			continue
+		}
+		evtStart := evt.DTStart.UTC().Format("20060102T150405Z")
+		evtEnd := evt.DTStart.UTC().Add(time.Hour).Format("20060102T150405Z")
+		if evt.DTEnd != nil {
+			evtEnd = evt.DTEnd.UTC().Format("20060102T150405Z")
+		}
+		b.WriteString(fmt.Sprintf("FREEBUSY:%s/%s\r\n", evtStart, evtEnd))
+	}
+
+	b.WriteString("END:VFREEBUSY\r\n")
+	b.WriteString("END:VCALENDAR\r\n")
+
+	c.Set("Content-Type", "text/calendar; charset=utf-8")
+	return c.SendString(b.String())
+}
+
 // ============================================================
 // PUT — Create/Update Events (RFC 4791 §5.3.2)
 // ============================================================
@@ -329,6 +454,15 @@ func (h *Handler) Put(c *fiber.Ctx) error {
 
 	calendarID := extractCalendarID(path)
 	uid := extractEventUID(path)
+
+	// Check WebDAV lock (RFC 4918 §9.10)
+	if existingLock, err := h.store.GetLock(ctx, tenantID, path); err == nil && existingLock != nil {
+		ifHdr := c.Get("If")
+		lockHdr := c.Get("Lock-Token")
+		if !strings.Contains(ifHdr, existingLock.LockToken) && !strings.Contains(lockHdr, existingLock.LockToken) {
+			return c.Status(423).SendString("Locked")
+		}
+	}
 
 	// Validate content type
 	contentType := c.Get("Content-Type")
@@ -421,6 +555,15 @@ func (h *Handler) Delete(c *fiber.Ctx) error {
 	if isEventResource(path) {
 		calendarID := extractCalendarID(path)
 		uid := extractEventUID(path)
+
+		// Check WebDAV lock (RFC 4918 §9.10)
+		if existingLock, err := h.store.GetLock(ctx, tenantID, path); err == nil && existingLock != nil {
+			ifHdr := c.Get("If")
+			lockHdr := c.Get("Lock-Token")
+			if !strings.Contains(ifHdr, existingLock.LockToken) && !strings.Contains(lockHdr, existingLock.LockToken) {
+				return c.Status(423).SendString("Locked")
+			}
+		}
 
 		// Fetch event before deletion (needed for cancellation emails)
 		event, err := h.store.GetEvent(ctx, tenantID, calendarID, uid)
@@ -562,6 +705,14 @@ func (h *Handler) Move(c *fiber.Ctx) error {
 		calendarID := extractCalendarID(path)
 		uid := extractEventUID(path)
 		destCalendarID := extractCalendarID(destination)
+		if destCalendarID == "" {
+			return c.Status(400).SendString("Bad Request: Invalid destination")
+		}
+
+		destCal, err := h.store.GetCalendar(ctx, tenantID, destCalendarID)
+		if err != nil || destCal == nil {
+			return c.Status(404).SendString("Destination calendar not found")
+		}
 
 		if err := h.store.MoveEvent(ctx, tenantID, calendarID, uid, destCalendarID); err != nil {
 			return c.Status(500).SendString("Internal Server Error")
@@ -590,6 +741,14 @@ func (h *Handler) Copy(c *fiber.Ctx) error {
 		calendarID := extractCalendarID(path)
 		uid := extractEventUID(path)
 		destCalendarID := extractCalendarID(destination)
+		if destCalendarID == "" {
+			return c.Status(400).SendString("Bad Request: Invalid destination")
+		}
+
+		destCal, err := h.store.GetCalendar(ctx, tenantID, destCalendarID)
+		if err != nil || destCal == nil {
+			return c.Status(404).SendString("Destination calendar not found")
+		}
 
 		newID := uuid.New().String()
 		newETag := ics.GenerateETag(newID)
@@ -783,6 +942,7 @@ func (h *Handler) buildCalendarResponse(path string, cal *models.Calendar) xmlut
 		`<D:supported-report><D:report><C:calendar-query/></D:report></D:supported-report>` +
 		`<D:supported-report><D:report><C:calendar-multiget/></D:report></D:supported-report>` +
 		`<D:supported-report><D:report><D:sync-collection/></D:report></D:supported-report>` +
+		`<D:supported-report><D:report><C:free-busy-query/></D:report></D:supported-report>` +
 		`</D:supported-report-set>`
 
 	// Current user privilege set
@@ -901,16 +1061,26 @@ func extractCalendarID(path string) string {
 }
 
 func extractEventUID(path string) string {
+	if u, err := url.Parse(path); err == nil && u.Path != "" {
+		path = u.Path
+	}
 	parts := strings.Split(path, "/")
 	for _, p := range parts {
 		if strings.HasSuffix(p, ".ics") {
-			return strings.TrimSuffix(p, ".ics")
+			raw := strings.TrimSuffix(p, ".ics")
+			if unescaped, err := url.PathUnescape(raw); err == nil {
+				return unescaped
+			}
+			return raw
 		}
 	}
 	return ""
 }
 
 func splitPath(path string) []string {
+	if u, err := url.Parse(path); err == nil && u.Path != "" {
+		path = u.Path
+	}
 	path = strings.Trim(path, "/")
 	if path == "" {
 		return nil

@@ -10,6 +10,20 @@ CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 
 -- ============================================================
+-- Shared Mail Accounts (created if standalone / testing)
+-- ============================================================
+CREATE TABLE IF NOT EXISTS mail_accounts (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(255) NOT NULL DEFAULT '',
+    email VARCHAR(255) NOT NULL UNIQUE,
+    tenant_name VARCHAR(255) NOT NULL DEFAULT '',
+    status VARCHAR(50) NOT NULL DEFAULT 'ACTIVE',
+    type VARCHAR(50) NOT NULL DEFAULT 'USER',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- ============================================================
 -- App Passwords (for CalDAV Basic Auth — like Nextcloud/Fastmail)
 -- Users authenticate CalDAV clients with email + app-password.
 -- ============================================================

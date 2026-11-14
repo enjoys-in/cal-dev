@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -37,6 +39,36 @@ type Service struct {
 }
 
 // NewService creates a new sync service.
+// ValidateSubscriptionURL validates that a subscription URL uses a supported protocol
+// and does not point to internal or private networks (SSRF prevention).
+func ValidateSubscriptionURL(rawURL string) error {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return fmt.Errorf("invalid URL: %w", err)
+	}
+	scheme := strings.ToLower(u.Scheme)
+	if scheme != "http" && scheme != "https" && scheme != "webcal" {
+		return fmt.Errorf("unsupported protocol: %s", u.Scheme)
+	}
+	hostname := u.Hostname()
+	if hostname == "" {
+		return fmt.Errorf("empty hostname")
+	}
+	if strings.EqualFold(hostname, "localhost") {
+		return fmt.Errorf("access to localhost is forbidden")
+	}
+
+	ips, err := net.LookupIP(hostname)
+	if err == nil {
+		for _, ip := range ips {
+			if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified() {
+				return fmt.Errorf("access to internal address %s is forbidden", ip.String())
+			}
+		}
+	}
+	return nil
+}
+
 func NewService(s *store.Store, q *jobs.Queue) *Service {
 	return &Service{
 		store: s,
@@ -47,7 +79,7 @@ func NewService(s *store.Store, q *jobs.Queue) *Service {
 				if len(via) > 5 {
 					return fmt.Errorf("too many redirects")
 				}
-				return nil
+				return ValidateSubscriptionURL(req.URL.String())
 			},
 		},
 	}
@@ -237,50 +269,102 @@ func (s *Service) fetchFeed(ctx context.Context, sub *models.CalendarSubscriptio
 
 // ── ICS Parsing ──────────────────────────────────────────────
 
-// parseAllEvents extracts all VEVENT/VTODO components from a multi-event ICS feed.
+// parseAllEvents extracts all calendar object resources from a multi-event ICS feed.
+// In accordance with RFC 4791 §4.1, all components (master and recurrence overrides)
+// sharing the same UID are stored together in a single calendar object resource.
 func parseAllEvents(rawICS string, tenantID, userID int, calendarID string) ([]*models.Event, error) {
 	if err := ics.ValidateICS(rawICS); err != nil {
 		return nil, err
 	}
 
-	// Split the feed into individual VEVENT blocks
+	// Split the feed into individual component blocks
 	blocks := extractComponentBlocks(rawICS)
 	if len(blocks) == 0 {
 		return nil, nil // empty calendar, not an error
 	}
 
-	var events []*models.Event
-	seen := make(map[string]bool)
+	// Group blocks by UID
+	type uidGroup struct {
+		masterBlock    string
+		overrideBlocks []string
+	}
+	groups := make(map[string]*uidGroup)
+	var uidOrder []string
 
 	for _, block := range blocks {
-		// Wrap each block in VCALENDAR for ParseICS
-		wrapped := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\n" + block + "\r\nEND:VCALENDAR\r\n"
+		uid := extractUIDFromBlock(block)
+		if uid == "" {
+			uid = uuid.New().String()
+		}
+		isOverride := strings.Contains(block, "RECURRENCE-ID")
+
+		g, exists := groups[uid]
+		if !exists {
+			g = &uidGroup{}
+			groups[uid] = g
+			uidOrder = append(uidOrder, uid)
+		}
+
+		if isOverride {
+			g.overrideBlocks = append(g.overrideBlocks, block)
+		} else {
+			if g.masterBlock == "" {
+				g.masterBlock = block
+			} else {
+				g.overrideBlocks = append(g.overrideBlocks, block)
+			}
+		}
+	}
+
+	var events []*models.Event
+	for _, uid := range uidOrder {
+		g := groups[uid]
+		if g.masterBlock == "" && len(g.overrideBlocks) > 0 {
+			g.masterBlock = g.overrideBlocks[0]
+			g.overrideBlocks = g.overrideBlocks[1:]
+		}
+
+		// Assemble full raw_ics containing master + all overrides
+		var fullICS strings.Builder
+		fullICS.WriteString("BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//CalDev//CalDAV Server//EN\r\n")
+		if g.masterBlock != "" {
+			fullICS.WriteString(g.masterBlock)
+		}
+		for _, ob := range g.overrideBlocks {
+			if ob != g.masterBlock {
+				fullICS.WriteString(ob)
+			}
+		}
+		fullICS.WriteString("END:VCALENDAR\r\n")
+
+		wrapped := fullICS.String()
 		event, err := ics.ParseICS(wrapped, tenantID, userID, calendarID)
 		if err != nil {
-			log.Printf("sync: failed to parse event block: %v", err)
+			log.Printf("sync: failed to parse combined event %s: %v", uid, err)
 			continue
 		}
 
-		// Deduplicate by UID (recurrence instances may share UID — keep all)
-		key := event.UID
-		if event.RecurrenceID != "" {
-			key = event.UID + ":" + event.RecurrenceID
-		}
-		if seen[key] {
-			continue
-		}
-		seen[key] = true
-
-		// Assign a fresh ID
 		event.ID = uuid.New().String()
-
-		// Keep the raw block as the event's RawICS (for faithful re-export)
+		event.UID = uid
 		event.RawICS = wrapped
+		event.SizeBytes = len(wrapped)
+		event.ETag = ics.GenerateETag(wrapped)
 
 		events = append(events, event)
 	}
 
 	return events, nil
+}
+
+func extractUIDFromBlock(block string) string {
+	lines := strings.Split(block, "\n")
+	for _, l := range lines {
+		l = strings.TrimSpace(l)
+		if strings.HasPrefix(strings.ToUpper(l), "UID:") {
+			return strings.TrimSpace(l[4:])
+		}
+	}
+	return ""
 }
 
 // extractComponentBlocks splits an ICS feed into VEVENT/VTODO blocks.
