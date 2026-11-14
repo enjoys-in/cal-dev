@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -28,28 +29,153 @@ type Alarm struct {
 	Repeat      int    `json:"repeat,omitempty"`
 }
 
-// ParseICS parses a raw ICS string into Event fields.
+// ParseICS parses a raw ICS string and returns its primary component: the master event, or
+// the first component when the resource has no master. Use ParseICSAll to get every
+// component of a resource that also carries RECURRENCE-ID overrides.
 func ParseICS(rawICS string, tenantID, userID int, calendarID string) (*models.Event, error) {
+	events, err := ParseICSAll(rawICS, tenantID, userID, calendarID)
+	if err != nil {
+		return nil, err
+	}
+	return events[0], nil
+}
+
+// component is one VEVENT/VTODO block of a resource (unfolded lines, without BEGIN/END).
+type component struct {
+	kind  string
+	lines []string
+}
+
+// splitComponents returns the VEVENT/VTODO blocks of a calendar object. VTIMEZONE and other
+// components are skipped; nested VALARMs stay inside their parent block.
+func splitComponents(lines []string) []component {
+	var out []component
+	var cur *component
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		switch {
+		case cur == nil && (trimmed == "BEGIN:VEVENT" || trimmed == "BEGIN:VTODO"):
+			cur = &component{kind: strings.TrimPrefix(trimmed, "BEGIN:")}
+		case cur != nil && trimmed == "END:"+cur.kind:
+			out = append(out, *cur)
+			cur = nil
+		case cur != nil:
+			cur.lines = append(cur.lines, line)
+		}
+	}
+	return out
+}
+
+// wrapComponent renders a single component as a standalone calendar object.
+func wrapComponent(c component) string {
+	var b strings.Builder
+	b.WriteString("BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//CalDev//CalDAV Server//EN\r\n")
+	b.WriteString("BEGIN:" + c.kind + "\r\n")
+	for _, l := range c.lines {
+		b.WriteString(l + "\r\n")
+	}
+	b.WriteString("END:" + c.kind + "\r\nEND:VCALENDAR\r\n")
+	return b.String()
+}
+
+// ParseICSAll parses every VEVENT/VTODO component of one calendar object resource into its own
+// event: the master series (RecurrenceID == "") and one event per RECURRENCE-ID override. The
+// result is never empty and the primary row (master, else earliest override) comes first.
+//
+// Storage invariant for all rows of a resource: they share the resource's ETag and SizeBytes.
+// The primary row's RawICS is the complete resource exactly as received; every other row's RawICS
+// is just its own component wrapped in a VCALENDAR.
+func ParseICSAll(rawICS string, tenantID, userID int, calendarID string) ([]*models.Event, error) {
+	blocks := splitComponents(unfoldICS(rawICS))
+
+	type parsed struct {
+		e   *models.Event
+		blk component
+	}
+	var items []parsed
+	if len(blocks) == 0 {
+		// No component at all: keep the historic lenient behaviour (one default event).
+		items = append(items, parsed{e: parseComponent(nil, "VEVENT", tenantID, userID, calendarID)})
+	}
+	for _, blk := range blocks {
+		items = append(items, parsed{e: parseComponent(blk.lines, blk.kind, tenantID, userID, calendarID), blk: blk})
+	}
+
+	// Every component of a resource must carry the same UID (RFC 4791 §4.1).
+	uid := ""
+	for _, it := range items {
+		if it.e.UID == "" {
+			continue
+		}
+		if uid == "" {
+			uid = it.e.UID
+		} else if it.e.UID != uid {
+			return nil, fmt.Errorf("all components of a calendar object resource must share one UID (found %q and %q)", uid, it.e.UID)
+		}
+	}
+	if uid == "" {
+		uid = uuid.New().String()
+	}
+
+	sort.SliceStable(items, func(i, j int) bool {
+		a, b := items[i].e.RecurrenceID, items[j].e.RecurrenceID
+		if (a == "") != (b == "") {
+			return a == "" // master first
+		}
+		return a < b
+	})
+
+	etag := generateETag(rawICS)
+	events := make([]*models.Event, 0, len(items))
+	for i, it := range items {
+		e := it.e
+		e.UID = uid
+		e.ETag = etag
+		e.SizeBytes = len(rawICS)
+		if i == 0 {
+			e.RawICS = rawICS
+		} else {
+			e.RawICS = wrapComponent(it.blk)
+		}
+		events = append(events, e)
+	}
+	return events, nil
+}
+
+var recurrenceIDRe = regexp.MustCompile(`^\d{8}(T\d{6}Z?)?$`)
+
+// normalizeRecurrenceID turns a RECURRENCE-ID into a canonical key: a UTC instant
+// (20261116T033000Z) for timed events or a plain date (20261116) for all-day ones, so the same
+// occurrence always yields the same key whatever zone the client wrote it in.
+func normalizeRecurrenceID(value string, params map[string]string) string {
+	value = strings.TrimSpace(value)
+	if !recurrenceIDRe.MatchString(value) {
+		return value
+	}
+	t, allDay := parseDateTime(value, params)
+	if allDay {
+		return t.Format(ICSDateOnly)
+	}
+	return t.UTC().Format(ICSDateTimeUTC)
+}
+
+// parseComponent parses the property lines of one VEVENT/VTODO (without its BEGIN/END).
+func parseComponent(lines []string, kind string, tenantID, userID int, calendarID string) *models.Event {
 	e := &models.Event{
 		ID:             uuid.New().String(),
 		TenantID:       tenantID,
 		UserID:         userID,
 		CalendarID:     calendarID,
-		RawICS:         rawICS,
-		SizeBytes:      len(rawICS),
 		Status:         "CONFIRMED",
 		Transparency:   "OPAQUE",
 		Classification: "PUBLIC",
-		ComponentType:  "VEVENT",
+		ComponentType:  kind,
 		Attendees:      json.RawMessage("[]"),
 		Categories:     []string{},
 		Properties:     json.RawMessage("{}"),
 		DTStamp:        time.Now().UTC(),
 	}
 
-	lines := unfoldICS(rawICS)
-
-	var inVEvent bool
 	var inVAlarm bool
 	var attendees []models.Attendee
 	var alarms []Alarm
@@ -60,27 +186,6 @@ func ParseICS(rawICS string, tenantID, userID int, calendarID string) (*models.E
 
 	for _, line := range lines {
 		trimmed := strings.TrimSpace(line)
-		if trimmed == "BEGIN:VEVENT" {
-			inVEvent = true
-			continue
-		}
-		if trimmed == "END:VEVENT" {
-			inVEvent = false
-			continue
-		}
-		if trimmed == "BEGIN:VTODO" {
-			e.ComponentType = "VTODO"
-			inVEvent = true
-			continue
-		}
-		if trimmed == "END:VTODO" {
-			inVEvent = false
-			continue
-		}
-		if !inVEvent {
-			continue
-		}
-
 		if trimmed == "BEGIN:VALARM" {
 			inVAlarm = true
 			currentAlarm = Alarm{Action: "DISPLAY", Trigger: "-PT15M"}
@@ -145,7 +250,7 @@ func ParseICS(rawICS string, tenantID, userID int, calendarID string) (*models.E
 		case "RRULE":
 			e.RecurrenceRule = value
 		case "RECURRENCE-ID":
-			e.RecurrenceID = value
+			e.RecurrenceID = normalizeRecurrenceID(value, params)
 		case "EXDATE":
 			for _, ed := range strings.Split(value, ",") {
 				ed = strings.TrimSpace(ed)
@@ -191,9 +296,6 @@ func ParseICS(rawICS string, tenantID, userID int, calendarID string) (*models.E
 		}
 	}
 
-	if e.UID == "" {
-		e.UID = uuid.New().String()
-	}
 	if e.DTStamp.IsZero() {
 		e.DTStamp = time.Now().UTC()
 	}
@@ -204,9 +306,6 @@ func ParseICS(rawICS string, tenantID, userID int, calendarID string) (*models.E
 	}
 
 	propsMap := make(map[string]interface{})
-	if len(e.Properties) > 0 && string(e.Properties) != "{}" {
-		_ = json.Unmarshal(e.Properties, &propsMap)
-	}
 	if len(alarms) > 0 {
 		propsMap["alarms"] = alarms
 	}
@@ -224,10 +323,7 @@ func ParseICS(rawICS string, tenantID, userID int, calendarID string) (*models.E
 			e.Properties = json.RawMessage(b)
 		}
 	}
-
-	e.ETag = generateETag(rawICS)
-
-	return e, nil
+	return e
 }
 
 // GenerateICS generates a valid ICS string from an Event.
@@ -237,11 +333,73 @@ func GenerateICS(e *models.Event) string {
 	}
 
 	var b strings.Builder
+	writeCalendarHeader(&b)
+	writeComponent(&b, e)
+	b.WriteString("END:VCALENDAR\r\n")
+	return b.String()
+}
+
+func writeCalendarHeader(b *strings.Builder) {
 	b.WriteString("BEGIN:VCALENDAR\r\n")
 	b.WriteString("VERSION:2.0\r\n")
 	b.WriteString("PRODID:-//CalDev//CalDAV Server//EN\r\n")
 	b.WriteString("CALSCALE:GREGORIAN\r\n")
+}
 
+// GenerateResourceICS renders all rows of one resource (master + RECURRENCE-ID overrides) as a
+// single calendar object, master first.
+func GenerateResourceICS(events []*models.Event) string {
+	sorted := append([]*models.Event(nil), events...)
+	sort.SliceStable(sorted, func(i, j int) bool {
+		a, b := sorted[i].RecurrenceID, sorted[j].RecurrenceID
+		if (a == "") != (b == "") {
+			return a == ""
+		}
+		return a < b
+	})
+	var b strings.Builder
+	writeCalendarHeader(&b)
+	for _, e := range sorted {
+		writeComponent(&b, e)
+	}
+	b.WriteString("END:VCALENDAR\r\n")
+	return b.String()
+}
+
+// FinalizeResource regenerates the raw ICS of every row from its fields and applies the
+// storage invariant documented on ParseICSAll: the primary row (master, else earliest override)
+// holds the whole resource, the others hold only their own component, and all rows share the
+// resource's ETag and size. Call it whenever fields changed and the original raw text is stale.
+// The rows are returned primary-first.
+func FinalizeResource(events []*models.Event) []*models.Event {
+	if len(events) == 0 {
+		return events
+	}
+	sorted := append([]*models.Event(nil), events...)
+	sort.SliceStable(sorted, func(i, j int) bool {
+		a, b := sorted[i].RecurrenceID, sorted[j].RecurrenceID
+		if (a == "") != (b == "") {
+			return a == ""
+		}
+		return a < b
+	})
+	full := GenerateResourceICS(sorted)
+	etag := generateETag(full)
+	for i, e := range sorted {
+		if i == 0 {
+			e.RawICS = full
+		} else {
+			e.RawICS = ""
+			e.RawICS = GenerateICS(e)
+		}
+		e.ETag = etag
+		e.SizeBytes = len(full)
+	}
+	return sorted
+}
+
+// writeComponent writes one VEVENT/VTODO (without the VCALENDAR wrapper).
+func writeComponent(b *strings.Builder, e *models.Event) {
 	compType := e.ComponentType
 	if compType == "" {
 		compType = "VEVENT"
@@ -279,7 +437,11 @@ func GenerateICS(e *models.Event) string {
 		b.WriteString(fmt.Sprintf("RRULE:%s\r\n", e.RecurrenceRule))
 	}
 	if e.RecurrenceID != "" {
-		b.WriteString(fmt.Sprintf("RECURRENCE-ID:%s\r\n", e.RecurrenceID))
+		if len(e.RecurrenceID) == 8 { // date-only key of an all-day occurrence
+			b.WriteString(fmt.Sprintf("RECURRENCE-ID;VALUE=DATE:%s\r\n", e.RecurrenceID))
+		} else {
+			b.WriteString(fmt.Sprintf("RECURRENCE-ID:%s\r\n", e.RecurrenceID))
+		}
 	}
 	if e.Status != "" {
 		b.WriteString(fmt.Sprintf("STATUS:%s\r\n", e.Status))
@@ -366,9 +528,6 @@ func GenerateICS(e *models.Event) string {
 	}
 
 	b.WriteString(fmt.Sprintf("END:%s\r\n", compType))
-	b.WriteString("END:VCALENDAR\r\n")
-
-	return b.String()
 }
 
 // GenerateSchedulingICS generates a METHOD-bearing ICS for scheduling.
@@ -739,6 +898,58 @@ func ValidateICS(raw string) error {
 		return fmt.Errorf("no calendar component found (VEVENT/VTODO/VJOURNAL)")
 	}
 	return nil
+}
+
+// FreeBusyRequest is a parsed iTIP VFREEBUSY request (RFC 6638 §5).
+type FreeBusyRequest struct {
+	Organizer string
+	Attendees []string
+	Start     time.Time
+	End       time.Time
+}
+
+// ParseFreeBusyRequest extracts organizer, attendees and the requested window from a
+// METHOD:REQUEST calendar object containing a VFREEBUSY component.
+func ParseFreeBusyRequest(raw string) (*FreeBusyRequest, error) {
+	if !strings.Contains(raw, "BEGIN:VFREEBUSY") {
+		return nil, fmt.Errorf("no VFREEBUSY component")
+	}
+	req := &FreeBusyRequest{}
+	in := false
+	for _, line := range unfoldICS(raw) {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "BEGIN:VFREEBUSY" {
+			in = true
+			continue
+		}
+		if trimmed == "END:VFREEBUSY" {
+			in = false
+			continue
+		}
+		if !in {
+			continue
+		}
+		name, params, value := parseLine(line)
+		switch strings.ToUpper(name) {
+		case "ORGANIZER":
+			req.Organizer = extractCalAddress(value)
+		case "ATTENDEE":
+			if a := extractCalAddress(value); a != "" {
+				req.Attendees = append(req.Attendees, a)
+			}
+		case "DTSTART":
+			req.Start, _ = parseDateTime(value, params)
+		case "DTEND":
+			req.End, _ = parseDateTime(value, params)
+		}
+	}
+	if req.Start.IsZero() || req.End.IsZero() || !req.End.After(req.Start) {
+		return nil, fmt.Errorf("VFREEBUSY needs DTSTART and a later DTEND")
+	}
+	if len(req.Attendees) == 0 {
+		return nil, fmt.Errorf("VFREEBUSY has no ATTENDEE")
+	}
+	return req, nil
 }
 
 // SchedulingReply holds the parsed data from a METHOD:REPLY ICS.

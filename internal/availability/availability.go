@@ -31,26 +31,33 @@ type Interval struct {
 // invitation is not busy; an unanswered or tentative one is tentative).
 func Compute(events []*models.Event, ownerEmail string, from, to time.Time) []Interval {
 	var segs []Interval
-	for _, e := range events {
-		if e.ComponentType != "" && !strings.EqualFold(e.ComponentType, "VEVENT") {
-			continue
-		}
-		if strings.EqualFold(e.Transparency, "TRANSPARENT") || strings.EqualFold(e.Status, "CANCELLED") {
-			continue
-		}
-		status := StatusConfirmed
-		if strings.EqualFold(e.Status, "TENTATIVE") {
-			status = StatusTentative
-		}
-		if ps := ownPartstat(e, ownerEmail); ps != "" {
+	// Group rows into series so RECURRENCE-ID overrides replace (or cancel, or move) the
+	// occurrences they stand for. Every occurrence is then judged by the component that
+	// defines it: an override carries its own STATUS, TRANSP and attendee state (RFC 5545:
+	// an override is a full component, not a patch of the master).
+	for _, series := range recurrence.Group(events) {
+		for _, occ := range series.Expand(from, to, recurrence.DefaultLimit) {
+			src := occ.Event
+			if src.ComponentType != "" && !strings.EqualFold(src.ComponentType, "VEVENT") {
+				continue
+			}
+			if strings.EqualFold(src.Transparency, "TRANSPARENT") || strings.EqualFold(src.Status, "CANCELLED") {
+				continue
+			}
+			status := StatusConfirmed
+			if strings.EqualFold(src.Status, "TENTATIVE") {
+				status = StatusTentative
+			}
+			ps := ownPartstat(src, ownerEmail)
+			if ps == "" && src != series.Master {
+				ps = ownPartstat(series.Master, ownerEmail) // override without ATTENDEE lines
+			}
 			switch strings.ToUpper(ps) {
 			case "DECLINED":
 				continue
 			case "TENTATIVE", "NEEDS-ACTION":
 				status = StatusTentative
 			}
-		}
-		for _, occ := range recurrence.Expand(e, from, to, recurrence.DefaultLimit) {
 			if !occ.End.After(occ.Start) {
 				continue // zero-length events do not occupy time
 			}
@@ -189,7 +196,7 @@ func (svc *Service) CanView(ctx context.Context, viewer, owner *models.User) (bo
 
 // Busy returns owner's merged busy intervals in [from, to).
 func (svc *Service) Busy(ctx context.Context, owner *models.User, from, to time.Time) ([]Interval, error) {
-	events, err := svc.store.QueryEvents(ctx, &models.EventFilter{
+	events, err := svc.store.QueryEventsWithOverrides(ctx, &models.EventFilter{
 		TenantID:       owner.ID,
 		UserID:         owner.ID,
 		ComponentType:  "VEVENT",

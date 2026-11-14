@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/enjoys-in/cal-dev/internal/availability"
 	"github.com/enjoys-in/cal-dev/internal/ics"
 	"github.com/enjoys-in/cal-dev/internal/models"
 	"github.com/enjoys-in/cal-dev/internal/scheduling"
@@ -25,6 +26,7 @@ import (
 type Handler struct {
 	store      *store.Store
 	scheduling *scheduling.Service
+	avail      *availability.Service
 }
 
 // NewHandler creates a new CalDAV handler.
@@ -74,7 +76,26 @@ func (h *Handler) Propfind(c *fiber.Ctx) error {
 
 	case isPrincipal(path):
 		// /dav/{tenant}/{user}/ — Principal resource
-		responses = h.propfindPrincipal(tenantID, userID, path, req)
+		email, _ := c.Locals("email").(string)
+		responses = h.propfindPrincipal(tenantID, userID, email, path, req)
+
+	case isScheduleInbox(path), isScheduleOutbox(path):
+		// RFC 6638 scheduling collections. Invitations are delivered straight into calendars,
+		// so the inbox stays empty; the outbox accepts free-busy POSTs.
+		kind := "schedule-inbox"
+		if isScheduleOutbox(path) {
+			kind = "schedule-outbox"
+		}
+		responses = []xmlutil.DAVResponse{{
+			Href: path,
+			PropStats: []xmlutil.PropStat{{
+				Props: map[string]string{
+					"resourcetype": fmt.Sprintf(`<D:resourcetype><D:collection/><C:%s/></D:resourcetype>`, kind),
+					"displayname":  fmt.Sprintf(`<D:displayname>%s</D:displayname>`, kind),
+				},
+				Status: 200,
+			}},
+		}}
 
 	case isCalendarHome(path):
 		// /dav/{tenant}/{user}/calendars/ — Calendar home set
@@ -99,7 +120,7 @@ func (h *Handler) Propfind(c *fiber.Ctx) error {
 
 		// If depth=1 include calendar events
 		if depth == "1" || depth == "infinity" {
-			events, err := h.store.GetEventsByCalendar(ctx, tenantID, calendarID)
+			events, err := h.store.GetResourcesByCalendar(ctx, tenantID, calendarID)
 			if err != nil {
 				return c.Status(500).SendString("Internal Server Error")
 			}
@@ -241,7 +262,7 @@ func (h *Handler) Report(c *fiber.Ctx) error {
 	case strings.Contains(bodyStr, "sync-collection"):
 		return h.reportSyncCollection(c, ctx, tenantID, path, body)
 	case strings.Contains(bodyStr, "free-busy-query"):
-		return h.reportFreeBusy(c, ctx, tenantID, userID, path, body)
+		return h.reportFreeBusy(c, tenantID, userID, path, body)
 	default:
 		return c.Status(400).SendString("Unsupported REPORT type")
 	}
@@ -266,7 +287,13 @@ func (h *Handler) reportCalendarQuery(c *fiber.Ctx, ctx context.Context, tenantI
 		h.applyCompFilter(filter, req.Filter)
 	}
 
-	events, err := h.store.QueryEvents(ctx, filter)
+	matched, err := h.store.QueryEvents(ctx, filter)
+	if err != nil {
+		return c.Status(500).SendString("Internal Server Error")
+	}
+	// The query matches components (rows); the response is per resource (href), once each, built
+	// from the resource's primary row so the calendar-data holds master and overrides together.
+	events, err := h.store.PrimaryEventsFor(ctx, tenantID, matched)
 	if err != nil {
 		return c.Status(500).SendString("Internal Server Error")
 	}
@@ -335,22 +362,30 @@ func (h *Handler) reportSyncCollection(c *fiber.Ctx, ctx context.Context, tenant
 		return c.Status(500).SendString("Internal Server Error")
 	}
 
+	// A resource is one href however many rows (master + overrides) changed, and a single PUT can
+	// log both "deleted" (a dropped override) and "modified" rows for the same UID. So report each
+	// UID once, by what exists now: present -> its current state, gone -> 404.
 	var responses []xmlutil.DAVResponse
+	reported := make(map[string]bool, len(changes))
 	for _, ch := range changes {
+		if reported[ch.EventUID] {
+			continue
+		}
+		reported[ch.EventUID] = true
 		eventPath := fmt.Sprintf("%s%s.ics", path, ch.EventUID)
 
-		if ch.ChangeType == "deleted" {
+		evt, err := h.store.GetEvent(ctx, tenantID, calendarID, ch.EventUID)
+		if err != nil {
+			continue
+		}
+		if evt == nil {
 			responses = append(responses, xmlutil.DAVResponse{
 				Href:       eventPath,
 				StatusCode: 404,
 			})
-		} else {
-			evt, err := h.store.GetEvent(ctx, tenantID, calendarID, ch.EventUID)
-			if err != nil || evt == nil {
-				continue
-			}
-			responses = append(responses, h.reportEventResponse(eventPath, evt, req.Prop))
+			continue
 		}
+		responses = append(responses, h.reportEventResponse(eventPath, evt, req.Prop))
 	}
 
 	// Get new sync token
@@ -362,84 +397,6 @@ func (h *Handler) reportSyncCollection(c *fiber.Ctx, ctx context.Context, tenant
 	var buf bytes.Buffer
 	xmlutil.WriteSyncResponse(&buf, responses, newSyncToken)
 	return c.Send(buf.Bytes())
-}
-
-func (h *Handler) reportFreeBusy(c *fiber.Ctx, ctx context.Context, tenantID, userID int, path string, body []byte) error {
-	calendarID := extractCalendarID(path)
-
-	// Extract time-range from free-busy-query XML: <C:time-range start="..." end="..."/>
-	var timeRangeStart, timeRangeEnd *time.Time
-	bodyStr := string(body)
-
-	startIdx := strings.Index(bodyStr, `start="`)
-	if startIdx != -1 {
-		startVal := bodyStr[startIdx+7:]
-		if endQuote := strings.Index(startVal, `"`); endQuote != -1 {
-			if t, err := time.Parse("20060102T150405Z", startVal[:endQuote]); err == nil {
-				timeRangeStart = &t
-			}
-		}
-	}
-
-	endIdx := strings.Index(bodyStr, `end="`)
-	if endIdx != -1 {
-		endVal := bodyStr[endIdx+5:]
-		if endQuote := strings.Index(endVal, `"`); endQuote != -1 {
-			if t, err := time.Parse("20060102T150405Z", endVal[:endQuote]); err == nil {
-				timeRangeEnd = &t
-			}
-		}
-	}
-
-	filter := &models.EventFilter{
-		TenantID:       tenantID,
-		CalendarID:     calendarID,
-		TimeRangeStart: timeRangeStart,
-		TimeRangeEnd:   timeRangeEnd,
-	}
-
-	events, err := h.store.QueryEvents(ctx, filter)
-	if err != nil {
-		return c.Status(500).SendString("Internal Server Error")
-	}
-
-	nowStr := time.Now().UTC().Format("20060102T150405Z")
-	startStr := nowStr
-	if timeRangeStart != nil {
-		startStr = timeRangeStart.Format("20060102T150405Z")
-	}
-	endStr := time.Now().UTC().Add(30 * 24 * time.Hour).Format("20060102T150405Z")
-	if timeRangeEnd != nil {
-		endStr = timeRangeEnd.Format("20060102T150405Z")
-	}
-
-	var b strings.Builder
-	b.WriteString("BEGIN:VCALENDAR\r\n")
-	b.WriteString("VERSION:2.0\r\n")
-	b.WriteString("PRODID:-//CalDev//CalDAV Server//EN\r\n")
-	b.WriteString("BEGIN:VFREEBUSY\r\n")
-	b.WriteString(fmt.Sprintf("UID:%s@caldev\r\n", uuid.New().String()))
-	b.WriteString(fmt.Sprintf("DTSTAMP:%s\r\n", nowStr))
-	b.WriteString(fmt.Sprintf("DTSTART:%s\r\n", startStr))
-	b.WriteString(fmt.Sprintf("DTEND:%s\r\n", endStr))
-
-	for _, evt := range events {
-		if strings.ToUpper(evt.Transparency) == "TRANSPARENT" || strings.ToUpper(evt.Status) == "CANCELLED" {
-			continue
-		}
-		evtStart := evt.DTStart.UTC().Format("20060102T150405Z")
-		evtEnd := evt.DTStart.UTC().Add(time.Hour).Format("20060102T150405Z")
-		if evt.DTEnd != nil {
-			evtEnd = evt.DTEnd.UTC().Format("20060102T150405Z")
-		}
-		b.WriteString(fmt.Sprintf("FREEBUSY:%s/%s\r\n", evtStart, evtEnd))
-	}
-
-	b.WriteString("END:VFREEBUSY\r\n")
-	b.WriteString("END:VCALENDAR\r\n")
-
-	c.Set("Content-Type", "text/calendar; charset=utf-8")
-	return c.SendString(b.String())
 }
 
 // ============================================================
@@ -454,6 +411,19 @@ func (h *Handler) Put(c *fiber.Ctx) error {
 
 	calendarID := extractCalendarID(path)
 	uid := extractEventUID(path)
+
+	// The target calendar must belong to the caller and be writable. (Without this a user could
+	// write rows pointing at someone else's calendar id, or into a read-only subscription calendar.)
+	targetCal, err := h.store.GetCalendar(ctx, tenantID, calendarID)
+	if err != nil {
+		return c.Status(500).SendString("Internal Server Error")
+	}
+	if targetCal == nil || targetCal.UserID != userID {
+		return c.Status(404).SendString("Calendar not found")
+	}
+	if targetCal.IsReadOnly {
+		return c.Status(403).SendString("Calendar is read-only")
+	}
 
 	// Check WebDAV lock (RFC 4918 §9.10)
 	if existingLock, err := h.store.GetLock(ctx, tenantID, path); err == nil && existingLock != nil {
@@ -477,16 +447,20 @@ func (h *Handler) Put(c *fiber.Ctx) error {
 		return c.Status(400).SendString("Invalid ICS: " + err.Error())
 	}
 
-	// Parse ICS into event model
-	event, err := ics.ParseICS(rawICS, tenantID, userID, calendarID)
+	// Parse every component of the resource: the master series plus one row per
+	// RECURRENCE-ID override (they used to be flattened into a single event).
+	components, err := ics.ParseICSAll(rawICS, tenantID, userID, calendarID)
 	if err != nil {
 		return c.Status(400).SendString("Failed to parse ICS: " + err.Error())
 	}
 
 	// Override UID from path if provided
 	if uid != "" {
-		event.UID = uid
+		for _, comp := range components {
+			comp.UID = uid
+		}
 	}
+	event := components[0] // primary row: the master, or the earliest override
 
 	// Check If-Match (ETag precondition) for updates
 	ifMatch := c.Get("If-Match")
@@ -507,26 +481,24 @@ func (h *Handler) Put(c *fiber.Ctx) error {
 		}
 	}
 
-	var statusCode int
+	// Store the whole resource atomically: components are inserted/updated in place (ids are
+	// kept) and components the client dropped, such as a removed override, are deleted.
+	statusCode := 201
 	if existing != nil {
-		event.ID = existing.ID
-		err = h.store.UpdateEvent(ctx, event)
 		statusCode = 204
-	} else {
-		err = h.store.CreateEvent(ctx, event)
-		statusCode = 201
 	}
+	err = h.store.ReplaceResource(ctx, tenantID, calendarID, event.UID, components)
 
 	if err != nil {
 		log.Printf("caldav: PUT error: %v", err)
 		return c.Status(500).SendString("Internal Server Error")
 	}
 
-	// Send scheduling emails to attendees (invitations or updates)
+	// Scheduling: invite/update/cancel attendees (organizer edit) or reply to the organizer (attendee edit)
 	if h.scheduling != nil {
 		go func() {
-			if err := h.scheduling.ProcessEvent(context.Background(), event, "REQUEST"); err != nil {
-				log.Printf("caldav: scheduling ProcessEvent error: %v", err)
+			if err := h.scheduling.ProcessUpdate(context.Background(), event, existing); err != nil {
+				log.Printf("caldav: scheduling ProcessUpdate error: %v", err)
 			}
 		}()
 	}
@@ -714,13 +686,56 @@ func (h *Handler) Move(c *fiber.Ctx) error {
 			return c.Status(404).SendString("Destination calendar not found")
 		}
 
+		srcCal, err := h.store.GetCalendar(ctx, tenantID, calendarID)
+		if err != nil || srcCal == nil {
+			return c.Status(404).SendString("Not Found")
+		}
+		if srcCal.IsReadOnly || destCal.IsReadOnly {
+			return c.Status(403).SendString("Calendar is read-only")
+		}
+		status, done := h.prepareTransfer(c, tenantID, calendarID, destCalendarID, uid)
+		if done {
+			return nil // the error response is already written
+		}
+
 		if err := h.store.MoveEvent(ctx, tenantID, calendarID, uid, destCalendarID); err != nil {
 			return c.Status(500).SendString("Internal Server Error")
 		}
-		return c.SendStatus(201)
+		return c.SendStatus(status)
 	}
 
 	return c.Status(403).SendString("Forbidden")
+}
+
+// prepareTransfer applies the RFC 4918 rules shared by COPY and MOVE (§9.8.5, §9.9.4):
+//   - source and destination being the same resource is 403;
+//   - an existing destination is replaced (204) unless the client sent "Overwrite: F" (412).
+//
+// It returns the success status to use. When done is true the error response has already been
+// written to c and the caller must return immediately without doing the transfer.
+func (h *Handler) prepareTransfer(c *fiber.Ctx, tenantID int, srcCal, destCal, uid string) (status int, done bool) {
+	ctx := c.UserContext()
+	if srcCal == destCal {
+		_ = c.Status(403).SendString("Source and destination are the same resource")
+		return 0, true
+	}
+	existing, err := h.store.GetEvent(ctx, tenantID, destCal, uid)
+	if err != nil {
+		_ = c.Status(500).SendString("Internal Server Error")
+		return 0, true
+	}
+	if existing == nil {
+		return 201, false
+	}
+	if strings.EqualFold(strings.TrimSpace(c.Get("Overwrite")), "F") {
+		_ = c.Status(412).SendString("Precondition Failed: destination exists and Overwrite is F")
+		return 0, true
+	}
+	if err := h.store.DeleteEvent(ctx, tenantID, destCal, uid); err != nil {
+		_ = c.Status(500).SendString("Internal Server Error")
+		return 0, true
+	}
+	return 204, false
 }
 
 // ============================================================
@@ -750,13 +765,21 @@ func (h *Handler) Copy(c *fiber.Ctx) error {
 			return c.Status(404).SendString("Destination calendar not found")
 		}
 
+		if destCal.IsReadOnly {
+			return c.Status(403).SendString("Calendar is read-only")
+		}
+		status, done := h.prepareTransfer(c, tenantID, calendarID, destCalendarID, uid)
+		if done {
+			return nil // the error response is already written
+		}
+
 		newID := uuid.New().String()
 		newETag := ics.GenerateETag(newID)
 
 		if err := h.store.CopyEvent(ctx, tenantID, calendarID, uid, destCalendarID, newID, newETag); err != nil {
 			return c.Status(500).SendString("Internal Server Error")
 		}
-		return c.SendStatus(201)
+		return c.SendStatus(status)
 	}
 
 	return c.Status(403).SendString("Forbidden")
@@ -865,7 +888,7 @@ func (h *Handler) propfindRoot(tenantID, userID int, path string, req *xmlutil.P
 	}}
 }
 
-func (h *Handler) propfindPrincipal(tenantID, userID int, path string, req *xmlutil.PropfindRequest) []xmlutil.DAVResponse {
+func (h *Handler) propfindPrincipal(tenantID, userID int, email, path string, req *xmlutil.PropfindRequest) []xmlutil.DAVResponse {
 	calHomePath := fmt.Sprintf("/dav/%d/%d/calendars/", tenantID, userID)
 	principalPath := fmt.Sprintf("/dav/%d/%d/", tenantID, userID)
 
@@ -873,6 +896,12 @@ func (h *Handler) propfindPrincipal(tenantID, userID int, path string, req *xmlu
 	props["resourcetype"] = `<D:resourcetype><D:collection/><D:principal/></D:resourcetype>`
 	props["current-user-principal"] = fmt.Sprintf(`<D:current-user-principal><D:href>%s</D:href></D:current-user-principal>`, principalPath)
 	props["calendar-home-set"] = fmt.Sprintf(`<C:calendar-home-set><D:href>%s</D:href></C:calendar-home-set>`, calHomePath)
+	// RFC 6638: where to find the scheduling collections and which addresses identify this user
+	props["schedule-inbox-URL"] = fmt.Sprintf(`<C:schedule-inbox-URL><D:href>%sinbox/</D:href></C:schedule-inbox-URL>`, principalPath)
+	props["schedule-outbox-URL"] = fmt.Sprintf(`<C:schedule-outbox-URL><D:href>%soutbox/</D:href></C:schedule-outbox-URL>`, principalPath)
+	if email != "" {
+		props["calendar-user-address-set"] = fmt.Sprintf(`<C:calendar-user-address-set><D:href>mailto:%s</D:href></C:calendar-user-address-set>`, xmlEscapeStr(email))
+	}
 	props["displayname"] = fmt.Sprintf(`<D:displayname>%d</D:displayname>`, userID)
 	props["principal-URL"] = fmt.Sprintf(`<D:principal-URL><D:href>%s</D:href></D:principal-URL>`, principalPath)
 

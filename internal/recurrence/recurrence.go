@@ -4,6 +4,7 @@ package recurrence
 
 import (
 	"encoding/json"
+	"fmt"
 	"sort"
 	"strings"
 	"time"
@@ -17,6 +18,10 @@ import (
 type Occurrence struct {
 	Start time.Time
 	End   time.Time
+	// Event is the component that defines this instance: the master series, or the
+	// RECURRENCE-ID override that replaced it. Callers read status, transparency, title
+	// and attendee state from here, not from the master.
+	Event *models.Event
 }
 
 // DefaultLimit caps the occurrences returned for a single event.
@@ -56,7 +61,7 @@ func Expand(e *models.Event, from, to time.Time, limit int) []Occurrence {
 
 	if strings.TrimSpace(e.RecurrenceRule) == "" && !hasRDates(e) {
 		if overlaps(e.DTStart, dur, from, to) {
-			return []Occurrence{{Start: e.DTStart, End: e.DTStart.Add(dur)}}
+			return []Occurrence{{Start: e.DTStart, End: e.DTStart.Add(dur), Event: e}}
 		}
 		return nil
 	}
@@ -100,7 +105,103 @@ func Expand(e *models.Event, from, to time.Time, limit int) []Occurrence {
 		if !overlaps(s, dur, from, to) {
 			continue
 		}
-		out = append(out, Occurrence{Start: s, End: s.Add(dur)})
+		out = append(out, Occurrence{Start: s, End: s.Add(dur), Event: e})
+	}
+	sortOccurrences(out)
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out
+}
+
+// Series is a master event together with its RECURRENCE-ID overrides. A resource that has
+// overrides but no master (e.g. an invitation to a single instance) is represented as one
+// Series per override, each standing alone.
+type Series struct {
+	Master    *models.Event
+	Overrides []*models.Event
+}
+
+// Group collects rows into series by (calendar, uid), in order of first appearance.
+func Group(events []*models.Event) []Series {
+	type bucket struct {
+		master    *models.Event
+		overrides []*models.Event
+	}
+	buckets := map[string]*bucket{}
+	var order []string
+	for _, e := range events {
+		key := e.CalendarID + "\x00" + e.UID
+		if e.UID == "" {
+			key = fmt.Sprintf("%p", e) // no UID: cannot be part of a series, never group
+		}
+		b := buckets[key]
+		if b == nil {
+			b = &bucket{}
+			buckets[key] = b
+			order = append(order, key)
+		}
+		if e.RecurrenceID == "" {
+			b.master = e
+		} else {
+			b.overrides = append(b.overrides, e)
+		}
+	}
+	var out []Series
+	for _, key := range order {
+		b := buckets[key]
+		if b.master != nil {
+			out = append(out, Series{Master: b.master, Overrides: b.overrides})
+			continue
+		}
+		for _, o := range b.overrides {
+			out = append(out, Series{Master: o})
+		}
+	}
+	return out
+}
+
+// occurrenceKey is the RECURRENCE-ID-style key of a master occurrence starting at t.
+func occurrenceKey(master *models.Event, t time.Time) string {
+	if master.AllDay {
+		return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC).Format(ics.ICSDateOnly)
+	}
+	return t.UTC().Format(ics.ICSDateTimeUTC)
+}
+
+// Expand returns the series' occurrences overlapping [from, to), ordered by start, with
+// overrides applied: an overridden occurrence is replaced by the override (which may have been
+// moved or retimed, even into or out of the window), and a CANCELLED override removes it.
+func (s Series) Expand(from, to time.Time, limit int) []Occurrence {
+	if limit <= 0 {
+		limit = DefaultLimit
+	}
+	if len(s.Overrides) == 0 {
+		return Expand(s.Master, from, to, limit)
+	}
+
+	replaced := make(map[string]bool, len(s.Overrides))
+	for _, o := range s.Overrides {
+		replaced[o.RecurrenceID] = true
+	}
+
+	var out []Occurrence
+	for _, oc := range Expand(s.Master, from, to, limit+len(s.Overrides)) {
+		if !replaced[occurrenceKey(s.Master, oc.Start)] {
+			out = append(out, oc)
+		}
+	}
+	for _, o := range s.Overrides {
+		if strings.EqualFold(o.Status, "CANCELLED") {
+			continue
+		}
+		dur := Duration(o)
+		if dur == 0 && o.DTEnd == nil && o.Duration == "" {
+			dur = Duration(s.Master) // an override without DTEND/DURATION keeps the series' length
+		}
+		if overlaps(o.DTStart, dur, from, to) {
+			out = append(out, Occurrence{Start: o.DTStart, End: o.DTStart.Add(dur), Event: o})
+		}
 	}
 	sortOccurrences(out)
 	if len(out) > limit {

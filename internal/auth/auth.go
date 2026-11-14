@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -28,6 +29,12 @@ type Service struct {
 func NewService(s *store.Store, cfg *config.AuthConfig) *Service {
 	return &Service{store: s, config: cfg}
 }
+
+// Sentinel errors so callers (and logs) can tell why a valid token was still refused.
+var (
+	ErrUserNotFound    = errors.New("no account with this email/id in mail_accounts")
+	ErrAccountInactive = errors.New("account is not active")
+)
 
 // Claims represents JWT claims (compatible with the shared issuer token format).
 // The external mail system JWT uses "mid" (mail_accounts.id) as the tenant identifier.
@@ -89,6 +96,11 @@ func (s *Service) ValidateToken(tokenString string) (*Claims, error) {
 	// If issuer is configured, enforce it
 	if s.config.JWTIssuer != "" {
 		parserOpts = append(parserOpts, jwt.WithIssuer(s.config.JWTIssuer))
+	}
+
+	// A token without exp would be valid forever (and keep working after the user is removed).
+	if s.config.RequireExp {
+		parserOpts = append(parserOpts, jwt.WithExpirationRequired())
 	}
 
 	token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
@@ -261,10 +273,10 @@ func (s *Service) ResolveUserFromToken(ctx context.Context, claims *Claims) (*Re
 	}
 
 	if user == nil {
-		return nil, fmt.Errorf("auth: user not found in mail_accounts")
+		return nil, fmt.Errorf("auth: %w", ErrUserNotFound)
 	}
 	if strings.ToUpper(user.Status) != "ACTIVE" {
-		return nil, fmt.Errorf("auth: account is %s", user.Status)
+		return nil, fmt.Errorf("auth: %w (status %s)", ErrAccountInactive, user.Status)
 	}
 
 	// Always use canonical values from mail_accounts

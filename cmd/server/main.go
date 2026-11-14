@@ -13,6 +13,7 @@ import (
 	"github.com/joho/godotenv"
 
 	"github.com/enjoys-in/cal-dev/internal/auth"
+	"github.com/enjoys-in/cal-dev/internal/availability"
 	"github.com/enjoys-in/cal-dev/internal/caldav"
 	"github.com/enjoys-in/cal-dev/internal/config"
 	"github.com/enjoys-in/cal-dev/internal/feeds"
@@ -20,8 +21,10 @@ import (
 	"github.com/enjoys-in/cal-dev/internal/jobs"
 	"github.com/enjoys-in/cal-dev/internal/middleware"
 	"github.com/enjoys-in/cal-dev/internal/publisher"
+	"github.com/enjoys-in/cal-dev/internal/realtime"
 	"github.com/enjoys-in/cal-dev/internal/response"
 	"github.com/enjoys-in/cal-dev/internal/scheduling"
+	"github.com/enjoys-in/cal-dev/internal/sharing"
 	"github.com/enjoys-in/cal-dev/internal/store"
 	extsync "github.com/enjoys-in/cal-dev/internal/sync"
 	"github.com/gofiber/fiber/v2"
@@ -39,6 +42,17 @@ func main() {
 
 	// Load configuration
 	cfg := config.Load()
+	if fatal, warnings := cfg.Validate(); len(fatal) > 0 || len(warnings) > 0 {
+		for _, w := range warnings {
+			log.Printf("SECURITY WARNING: %s", w)
+		}
+		if len(fatal) > 0 {
+			for _, f := range fatal {
+				log.Printf("SECURITY ERROR: %s", f)
+			}
+			log.Fatalf("refusing to start with insecure configuration (%d problem(s) above)", len(fatal))
+		}
+	}
 	log.Printf("Starting CalDAV+JMAP server on %s", cfg.Server.Addr())
 
 	// Connect to database
@@ -60,6 +74,7 @@ func main() {
 	migrationFiles := []string{
 		"migrations/001_init.sql",
 		"migrations/002_sharing_realtime.sql",
+		"migrations/003_recurrence_overrides.sql",
 	}
 	for _, mf := range migrationFiles {
 		sqlBytes, err := os.ReadFile(mf)
@@ -83,6 +98,13 @@ func main() {
 		if err := db.RecordMigration(mf); err != nil {
 			log.Printf("Failed to record migration %s: %v", mf, err)
 		}
+	}
+
+	// Split resources saved before recurrence overrides had their own rows (idempotent).
+	if n, err := db.RepairFlattenedResources(context.Background()); err != nil {
+		log.Printf("WARNING: repairing flattened recurring events failed: %v", err)
+	} else if n > 0 {
+		log.Printf("Repaired %d recurring event(s) that had been stored without their overrides", n)
 	}
 
 	// Connect to Valkey (Redis-compatible)
@@ -117,13 +139,22 @@ func main() {
 	defer cancel()
 	worker.Start(ctx)
 
+	// Availability (free/busy) + realtime push. The hub listens on Postgres NOTIFY, so it sees
+	// every write regardless of which API (CalDAV, JMAP, sync, scheduling) made it.
+	availSvc := availability.NewService(db, cfg.Sharing.OrgVisible)
+	rtHub := realtime.NewHub(db, availSvc)
+	rtHub.Start(ctx, cfg.Database.DSN())
+
 	// Initialize handlers
 	caldavHandler := caldav.NewHandler(db, schedulingSvc)
+	caldavHandler.SetAvailability(availSvc)
 	baseURL := "https://localhost:" + fmt.Sprintf("%d", cfg.Server.Port)
 	if !cfg.TLS.Enabled {
 		baseURL = "http://localhost:" + fmt.Sprintf("%d", cfg.Server.Port)
 	}
 	jmapHandler := jmap.NewHandler(db, baseURL, schedulingSvc)
+	jmapHandler.SetRealtime(rtHub)
+	jmapHandler.SetAvailability(availSvc)
 
 	// Create Fiber app with WebDAV method support
 	app := fiber.New(fiber.Config{
@@ -142,7 +173,10 @@ func main() {
 
 	// Global middleware
 	app.Use(recover.New())
-	app.Use(compress.New())
+	// Never compress the SSE stream: gzip would buffer events until the buffer fills.
+	app.Use(compress.New(compress.Config{
+		Next: func(c *fiber.Ctx) bool { return c.Path() == "/jmap/eventsource" },
+	}))
 	app.Use(middleware.SecurityHeaders())
 	app.Use(middleware.RequestLogger())
 	app.Use(middleware.CORSHeaders())
@@ -178,6 +212,12 @@ func main() {
 	davGroup.All("/:tenant/:user", handleDAVMethod(caldavHandler)).Name("principal")
 	davGroup.All("/:tenant/:user/", handleDAVMethod(caldavHandler))
 
+	// Scheduling inbox/outbox (RFC 6638): free-busy requests are POSTed to the outbox
+	davGroup.All("/:tenant/:user/inbox", handleDAVMethod(caldavHandler))
+	davGroup.All("/:tenant/:user/inbox/", handleDAVMethod(caldavHandler))
+	davGroup.All("/:tenant/:user/outbox", handleDAVMethod(caldavHandler))
+	davGroup.All("/:tenant/:user/outbox/", handleDAVMethod(caldavHandler))
+
 	// Calendar Home
 	davGroup.All("/:tenant/:user/calendars", handleDAVMethod(caldavHandler))
 	davGroup.All("/:tenant/:user/calendars/", handleDAVMethod(caldavHandler))
@@ -201,6 +241,29 @@ func main() {
 
 	// JMAP EventSource (RFC 8620 §7)
 	jmapGroup.Get("/eventsource", jmapHandler.EventSource)
+
+	// ============================================================
+	// Team availability & sharing (REST)
+	// ============================================================
+	sharingHandler := sharing.NewHandler(db, availSvc, cfg.Sharing.OrgVisible)
+
+	// Free/busy of teammates who shared with you: GET /api/availability?emails=a@x,b@x&start=&end=
+	availGroup := app.Group("/api/availability", middleware.JMAPAuth(authSvc, db))
+	availGroup.Get("/", sharingHandler.Lookup)
+	availGroup.Get("/shares", sharingHandler.ListAvailabilityShares)
+	availGroup.Post("/shares", sharingHandler.CreateAvailabilityShare)
+	availGroup.Delete("/shares/:user_id", sharingHandler.DeleteAvailabilityShare)
+
+	// Share one of your calendars read-only
+	calShareGroup := app.Group("/api/calendars", middleware.JMAPAuth(authSvc, db))
+	calShareGroup.Get("/:id/shares", sharingHandler.ListCalendarShares)
+	calShareGroup.Post("/:id/shares", sharingHandler.CreateCalendarShare)
+	calShareGroup.Delete("/:id/shares/:user_id", sharingHandler.DeleteCalendarShare)
+
+	// Calendars others shared with you
+	sharedGroup := app.Group("/api/shared/calendars", middleware.JMAPAuth(authSvc, db))
+	sharedGroup.Get("/", sharingHandler.ListSharedCalendars)
+	sharedGroup.Get("/:id/events", sharingHandler.SharedCalendarEvents)
 
 	// ============================================================
 	// ICS Feed Routes — /feeds/{tenant}/{user}/... (Outlook, Google, Apple)
@@ -301,6 +364,8 @@ func handleDAVMethod(h *caldav.Handler) fiber.Handler {
 			return h.Report(c)
 		case "GET", "HEAD":
 			return h.Get(c)
+		case "POST":
+			return h.Post(c)
 		case "PUT":
 			return h.Put(c)
 		case "DELETE":

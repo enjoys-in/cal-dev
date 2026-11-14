@@ -42,7 +42,7 @@ func (h *Handler) CalendarFeed(c *fiber.Ctx) error {
 	}
 
 	// Get all events in the calendar
-	events, err := h.store.GetEventsByCalendar(c.UserContext(), tenantID, calendarID)
+	events, err := h.store.GetResourcesByCalendar(c.UserContext(), tenantID, calendarID)
 	if err != nil {
 		return c.Status(500).SendString("Internal server error")
 	}
@@ -84,7 +84,7 @@ func (h *Handler) AllCalendarsFeed(c *fiber.Ctx) error {
 	var allEvents []*models.Event
 	var ctags []string
 	for _, cal := range calendars {
-		events, err := h.store.GetEventsByCalendar(c.UserContext(), tenantID, cal.ID)
+		events, err := h.store.GetResourcesByCalendar(c.UserContext(), tenantID, cal.ID)
 		if err != nil {
 			continue
 		}
@@ -210,13 +210,13 @@ func buildMergedICS(calendars []*models.Calendar, events []*models.Event) string
 }
 
 func writeEventComponent(b *strings.Builder, e *models.Event) {
-	// If we have raw ICS and it contains VEVENT, extract just the event block
+	// The primary row's raw ICS is the whole resource: the master AND its RECURRENCE-ID overrides.
+	// Emit every VEVENT/VTODO component so moved or cancelled occurrences reach the subscriber.
 	if e.RawICS != "" {
-		startIdx := strings.Index(e.RawICS, "BEGIN:VEVENT")
-		endIdx := strings.Index(e.RawICS, "END:VEVENT")
-		if startIdx >= 0 && endIdx >= 0 {
-			b.WriteString(e.RawICS[startIdx : endIdx+len("END:VEVENT")])
-			b.WriteString("\r\n")
+		if blocks := componentBlocks(e.RawICS); len(blocks) > 0 {
+			for _, blk := range blocks {
+				b.WriteString(blk)
+			}
 			return
 		}
 	}
@@ -260,6 +260,31 @@ func writeEventComponent(b *strings.Builder, e *models.Event) {
 }
 
 // ── Helpers ───────────────────────────────────────────────────
+
+// componentBlocks returns every VEVENT/VTODO component of a calendar object, each ending in CRLF.
+func componentBlocks(raw string) []string {
+	var out []string
+	var cur strings.Builder
+	kind := ""
+	for _, line := range strings.Split(raw, "\n") {
+		line = strings.TrimRight(line, "\r")
+		t := strings.TrimSpace(line)
+		if kind == "" {
+			if t == "BEGIN:VEVENT" || t == "BEGIN:VTODO" {
+				kind = strings.TrimPrefix(t, "BEGIN:")
+				cur.Reset()
+				cur.WriteString(t + "\r\n")
+			}
+			continue
+		}
+		cur.WriteString(line + "\r\n")
+		if t == "END:"+kind {
+			out = append(out, cur.String())
+			kind = ""
+		}
+	}
+	return out
+}
 
 func formatDT(t time.Time) string {
 	return t.UTC().Format("20060102T150405Z")

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -16,6 +17,14 @@ type Config struct {
 	App      AppConfig
 	TLS      TLSConfig
 	Worker   WorkerConfig
+	Sharing  SharingConfig
+}
+
+// SharingConfig controls who can see whose free/busy.
+type SharingConfig struct {
+	// OrgVisible lets users with the same non-empty mail_accounts.tenant_name see each
+	// other's free/busy (never event details) without an explicit share. Default false.
+	OrgVisible bool
 }
 
 // AppConfig holds application-level header validation settings.
@@ -61,6 +70,7 @@ type RedisConfig struct {
 type AuthConfig struct {
 	JWTSecret        string
 	JWTIssuer        string // shared issuer with mail/other services
+	RequireExp       bool   // reject tokens without an exp claim (AUTH_REQUIRE_EXP, default true)
 	TokenExpiry      time.Duration
 	OAuth2Enabled    bool
 	BasicAuthEnabled bool
@@ -126,6 +136,7 @@ func Load() *Config {
 		Auth: AuthConfig{
 			JWTSecret:        envStr("AUTH_JWT_SECRET", "change-me-in-production"),
 			JWTIssuer:        envStr("AUTH_JWT_ISSUER", ""),
+			RequireExp:       envBool("AUTH_REQUIRE_EXP", true),
 			TokenExpiry:      envDuration("AUTH_TOKEN_EXPIRY", 24*time.Hour),
 			OAuth2Enabled:    envBool("AUTH_OAUTH2_ENABLED", false),
 			BasicAuthEnabled: envBool("AUTH_BASIC_ENABLED", true),
@@ -143,6 +154,9 @@ func Load() *Config {
 			CertFile: envStr("TLS_CERT_FILE", ""),
 			KeyFile:  envStr("TLS_KEY_FILE", ""),
 		},
+		Sharing: SharingConfig{
+			OrgVisible: envBool("AVAILABILITY_ORG_VISIBLE", false),
+		},
 		Worker: WorkerConfig{
 			Concurrency:     envInt("WORKER_CONCURRENCY", 4),
 			QueuePrefix:     envStr("WORKER_QUEUE_PREFIX", "caldev:jobs"),
@@ -151,6 +165,48 @@ func Load() *Config {
 			ShutdownTimeout: envDuration("WORKER_SHUTDOWN_TIMEOUT", 10*time.Second),
 		},
 	}
+}
+
+// weakSecrets are well-known placeholder values that must never sign production tokens.
+var weakSecrets = map[string]bool{
+	"":                        true,
+	"change-me-in-production": true,
+	"changeme":                true,
+	"secret":                  true,
+	"test":                    true,
+}
+
+// defaultAdminKey is the value shipped in docker-compose.yml.
+const defaultAdminKey = "caldev-admin-secret-key-change-me"
+
+// Validate checks security-critical settings. Fatal problems should stop startup; warnings
+// should be logged. Set ALLOW_INSECURE_DEFAULTS=true to downgrade fatal problems to warnings
+// (local development only).
+func (c *Config) Validate() (fatal, warnings []string) {
+	allowInsecure := envBool("ALLOW_INSECURE_DEFAULTS", false)
+	add := func(msg string) {
+		if allowInsecure {
+			warnings = append(warnings, msg+" (allowed by ALLOW_INSECURE_DEFAULTS)")
+		} else {
+			fatal = append(fatal, msg+" (set ALLOW_INSECURE_DEFAULTS=true to bypass in local development)")
+		}
+	}
+
+	if weakSecrets[strings.ToLower(strings.TrimSpace(c.Auth.JWTSecret))] {
+		add("AUTH_JWT_SECRET is empty or a well-known placeholder: anyone could forge login tokens")
+	} else if len(c.Auth.JWTSecret) < 16 {
+		warnings = append(warnings, "AUTH_JWT_SECRET is shorter than 16 characters")
+	}
+	if c.Auth.JWTIssuer == "" {
+		warnings = append(warnings, "AUTH_JWT_ISSUER is not set: tokens from any issuer with the same secret are accepted")
+	}
+	if !c.Auth.RequireExp {
+		warnings = append(warnings, "AUTH_REQUIRE_EXP=false: tokens without an expiry are accepted forever")
+	}
+	if c.Auth.AdminAPIKey == defaultAdminKey {
+		warnings = append(warnings, "ADMIN_API_KEY is the default shipped in docker-compose.yml: anyone who has seen the repository knows it")
+	}
+	return fatal, warnings
 }
 
 func envStr(key, fallback string) string {

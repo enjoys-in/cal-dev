@@ -103,17 +103,23 @@ func (h *Handler) IncomingIMIP(c *fiber.Ctx) error {
 		})
 
 	case "CANCEL":
-		// Organizer cancelled the event — we could mark it as CANCELLED
-		log.Printf("scheduling: received CANCEL for event %s", reply.EventUID)
-		return response.Success(c, "Cancellation acknowledged", fiber.Map{
+		// Organizer cancelled the event — remove the recipient's copy (organizer must match).
+		if err := h.svc.HandleInboundCancel(c.UserContext(), tenantID, rawICS); err != nil {
+			log.Printf("scheduling: CANCEL for event %s not applied: %v", reply.EventUID, err)
+			return response.Error(c, 422, "cancellation not applied", err.Error())
+		}
+		return response.Success(c, "Cancellation applied", fiber.Map{
 			"method":    "CANCEL",
 			"event_uid": reply.EventUID,
 		})
 
 	case "REQUEST":
-		// New invitation — could auto-create event in attendee's calendar
-		log.Printf("scheduling: received REQUEST for event %s", reply.EventUID)
-		return response.Success(c, "Invitation received", fiber.Map{
+		// New or updated invitation — add it to the recipient's calendar.
+		if err := h.svc.HandleInboundRequest(c.UserContext(), tenantID, rawICS); err != nil {
+			log.Printf("scheduling: REQUEST for event %s not applied: %v", reply.EventUID, err)
+			return response.Error(c, 422, "invitation not applied", err.Error())
+		}
+		return response.Success(c, "Invitation added to calendar", fiber.Map{
 			"method":    "REQUEST",
 			"event_uid": reply.EventUID,
 		})

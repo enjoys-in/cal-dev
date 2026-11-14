@@ -317,7 +317,7 @@ func (h *Handler) SharedCalendarEvents(c *fiber.Ctx) error {
 		return response.Error(c, 400, msg)
 	}
 
-	events, err := h.store.QueryEvents(c.UserContext(), &models.EventFilter{
+	events, err := h.store.QueryEventsWithOverrides(c.UserContext(), &models.EventFilter{
 		TenantID:       cal.TenantID,
 		CalendarID:     cal.ID,
 		ComponentType:  "VEVENT",
@@ -329,12 +329,15 @@ func (h *Handler) SharedCalendarEvents(c *fiber.Ctx) error {
 	}
 
 	out := make([]sharedEvent, 0, len(events))
-	for _, e := range events {
-		private := strings.EqualFold(e.Classification, "PRIVATE") || strings.EqualFold(e.Classification, "CONFIDENTIAL")
-		for _, occ := range recurrence.Expand(e, from, to, 500) {
+	for _, series := range recurrence.Group(events) {
+		for _, occ := range series.Expand(from, to, 500) {
+			// Each instance is described by the component that defines it: a moved or renamed
+			// occurrence shows its own title/time, and privacy follows that component's CLASS.
+			e := occ.Event
+			private := strings.EqualFold(e.Classification, "PRIVATE") || strings.EqualFold(e.Classification, "CONFIDENTIAL")
 			se := sharedEvent{
-				ID: e.ID, UID: e.UID, Start: occ.Start.UTC(), End: occ.End.UTC(), AllDay: e.AllDay,
-				Status: e.Status, Recurring: e.RecurrenceRule != "",
+				ID: series.Master.ID, UID: e.UID, Start: occ.Start.UTC(), End: occ.End.UTC(), AllDay: e.AllDay,
+				Status: e.Status, Recurring: series.Master.RecurrenceRule != "",
 			}
 			if private {
 				se.Title, se.Private = "Busy", true

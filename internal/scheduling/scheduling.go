@@ -54,36 +54,48 @@ func (svc *Service) ProcessEvent(ctx context.Context, event *models.Event, metho
 		}
 	}
 
+	organizer := normEmail(event.Organizer)
 	for _, attendee := range attendees {
-		msg := &models.SchedulingMessage{
-			ID:             uuid.New().String(),
-			TenantID:       event.TenantID,
-			SenderID:       event.UserID,
-			RecipientEmail: attendee.Email,
-			EventUID:       event.UID,
-			Method:         method,
-			Status:         "pending",
-			RawICS:         ics.GenerateSchedulingICS(event, method),
+		if normEmail(attendee.Email) == organizer {
+			continue // the organizer never invites themselves
 		}
-
-		if err := svc.store.CreateSchedulingMessage(ctx, msg); err != nil {
-			log.Printf("scheduling: failed to create message for %s: %v", attendee.Email, err)
-			continue
-		}
-
-		// Enqueue to Valkey for background processing
-		if svc.queue != nil {
-			payload := &jobs.SchedulingEmailPayload{
-				MessageID: msg.ID,
-				TenantID:  event.TenantID,
-			}
-			if _, err := svc.queue.Enqueue(ctx, jobs.JobSendSchedulingEmail, payload); err != nil {
-				log.Printf("scheduling: failed to enqueue email job for %s: %v", attendee.Email, err)
-			}
-		}
+		// Local attendees get the event in their own calendar straight away...
+		svc.deliverLocal(ctx, event, attendee, method)
+		// ...and everyone also gets the standard iMIP email.
+		svc.enqueueMessage(ctx, event, attendee, method)
 	}
 
 	return nil
+}
+
+// enqueueMessage records one scheduling message and queues it for delivery by the mail server.
+func (svc *Service) enqueueMessage(ctx context.Context, event *models.Event, attendee models.Attendee, method string) {
+	msg := &models.SchedulingMessage{
+		ID:             uuid.New().String(),
+		TenantID:       event.TenantID,
+		SenderID:       event.UserID,
+		RecipientEmail: attendee.Email,
+		EventUID:       event.UID,
+		Method:         method,
+		Status:         "pending",
+		RawICS:         ics.GenerateSchedulingICS(event, method),
+	}
+
+	if err := svc.store.CreateSchedulingMessage(ctx, msg); err != nil {
+		log.Printf("scheduling: failed to create message for %s: %v", attendee.Email, err)
+		return
+	}
+
+	// Enqueue to Valkey for background processing
+	if svc.queue != nil {
+		payload := &jobs.SchedulingEmailPayload{
+			MessageID: msg.ID,
+			TenantID:  event.TenantID,
+		}
+		if _, err := svc.queue.Enqueue(ctx, jobs.JobSendSchedulingEmail, payload); err != nil {
+			log.Printf("scheduling: failed to enqueue email job for %s: %v", attendee.Email, err)
+		}
+	}
 }
 
 // SendInvitation publishes a scheduling message to Redis Pub/Sub
@@ -157,43 +169,46 @@ func (svc *Service) SendInvitation(ctx context.Context, msg *models.SchedulingMe
 
 // ProcessReply handles an incoming scheduling reply (PARTSTAT update).
 func (svc *Service) ProcessReply(ctx context.Context, tenantID int, eventUID, attendeeEmail, partstat string) error {
-	events, err := svc.store.QueryEvents(ctx, &models.EventFilter{
-		TenantID: tenantID,
-		UIDs:     []string{eventUID},
-	})
-	if err != nil || len(events) == 0 {
-		return fmt.Errorf("event not found: %s", eventUID)
+	_, err := svc.setAttendeeStatus(ctx, tenantID, eventUID, attendeeEmail, partstat)
+	return err
+}
+
+// setAttendeeStatus sets one attendee's PARTSTAT on the copy of eventUID held by tenantID
+// and returns the updated event.
+func (svc *Service) setAttendeeStatus(ctx context.Context, tenantID int, eventUID, attendeeEmail, partstat string) (*models.Event, error) {
+	// Work on the whole resource (master + overrides): a response applies to the attendee
+	// throughout the series, and regenerating must not lose any component.
+	rows, err := svc.store.FindResourceByUID(ctx, tenantID, eventUID)
+	if err != nil || len(rows) == 0 {
+		return nil, fmt.Errorf("event not found: %s", eventUID)
 	}
 
-	event := events[0]
-
-	var attendees []models.Attendee
-	if err := json.Unmarshal(event.Attendees, &attendees); err != nil {
-		return fmt.Errorf("parse attendees: %w", err)
-	}
-
-	found := false
-	for i, a := range attendees {
-		if strings.EqualFold(a.Email, attendeeEmail) {
-			attendees[i].Status = partstat
-			found = true
-			break
+	foundAny := false
+	for _, event := range rows {
+		var attendees []models.Attendee
+		if err := json.Unmarshal(event.Attendees, &attendees); err != nil {
+			return nil, fmt.Errorf("parse attendees: %w", err)
 		}
+		for i, a := range attendees {
+			if strings.EqualFold(a.Email, attendeeEmail) {
+				attendees[i].Status = partstat
+				foundAny = true
+				break
+			}
+		}
+		attendeesJSON, _ := json.Marshal(attendees)
+		event.Attendees = json.RawMessage(attendeesJSON)
 	}
-	if !found {
-		return fmt.Errorf("attendee %s not found on event %s", attendeeEmail, eventUID)
+	if !foundAny {
+		return nil, fmt.Errorf("attendee %s not found on event %s", attendeeEmail, eventUID)
 	}
 
-	attendeesJSON, _ := json.Marshal(attendees)
-	event.Attendees = json.RawMessage(attendeesJSON)
 	// Note: RFC 5546 §2.1.4: Only organizer increments SEQUENCE; attendee replies do not bump it.
-	event.ETag = ics.GenerateETag(event.UID + fmt.Sprintf("%d-%s", event.Sequence, time.Now().Format(time.RFC3339Nano)))
-	// Regenerate RawICS to reflect updated attendee status
-	event.RawICS = ""
-	event.RawICS = ics.GenerateICS(event)
-	event.SizeBytes = len(event.RawICS)
-
-	return svc.store.UpdateEvent(ctx, event)
+	rows = ics.FinalizeResource(rows)
+	if err := svc.store.ReplaceResource(ctx, tenantID, rows[0].CalendarID, eventUID, rows); err != nil {
+		return nil, err
+	}
+	return rows[0], nil
 }
 
 // SendCancellation sends a METHOD:CANCEL for a deleted event.
@@ -212,7 +227,17 @@ func (svc *Service) SendReplyToOrganizer(ctx context.Context, tenantID int, even
 		return fmt.Errorf("event not found: %s", eventUID)
 	}
 
-	event := events[0]
+	return svc.replyToOrganizer(ctx, events[0], attendeeEmail, partstat)
+}
+
+// replyToOrganizer delivers an attendee's response for event (the attendee's own copy).
+// A local organizer is updated directly; an external one gets a METHOD:REPLY email.
+func (svc *Service) replyToOrganizer(ctx context.Context, event *models.Event, attendeeEmail, partstat string) error {
+	tenantID, eventUID := event.TenantID, event.UID
+
+	if handled, err := svc.propagateReply(ctx, event, attendeeEmail, partstat); handled {
+		return err
+	}
 
 	// Extract organizer email
 	organizerEmail := event.Organizer

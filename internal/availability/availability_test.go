@@ -127,3 +127,87 @@ func TestZeroLengthEventNotBusy(t *testing.T) {
 		t.Fatalf("zero-length event must not be busy, got %+v", got)
 	}
 }
+
+// ---- RECURRENCE-ID overrides ----
+
+func series() (*models.Event, func(recID string, start, end time.Time, mods ...func(*models.Event)) *models.Event) {
+	// Mondays 09:00-10:00 UTC: Jan 5, 12, 19, 26 2026
+	m := ev(at(5, 9, 0), at(5, 10, 0), func(e *models.Event) {
+		e.CalendarID, e.UID, e.RecurrenceRule = "cal", "s1", "FREQ=WEEKLY"
+	})
+	mk := func(recID string, start, end time.Time, mods ...func(*models.Event)) *models.Event {
+		return ev(start, end, append([]func(*models.Event){func(e *models.Event) {
+			e.CalendarID, e.UID, e.RecurrenceID = "cal", "s1", recID
+		}}, mods...)...)
+	}
+	return m, mk
+}
+
+func TestMovedOccurrenceIsBusyAtNewTimeNotOld(t *testing.T) {
+	m, mk := series()
+	moved := mk("20260112T090000Z", at(12, 14, 0), at(12, 15, 0))
+	got := Compute([]*models.Event{m, moved}, "me@x.com", at(1, 0, 0), at(31, 0, 0))
+	if len(got) != 4 {
+		t.Fatalf("still four busy blocks, got %+v", got)
+	}
+	for _, g := range got {
+		if g.Start.Equal(at(12, 9, 0)) {
+			t.Fatal("the original 09:00 slot must be free: that occurrence was moved")
+		}
+	}
+	found := false
+	for _, g := range got {
+		if g.Start.Equal(at(12, 14, 0)) && g.End.Equal(at(12, 15, 0)) {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("the new 14:00 slot must be busy: %+v", got)
+	}
+}
+
+func TestCancelledOverrideFreesOnlyThatInstance(t *testing.T) {
+	m, mk := series()
+	cancelled := mk("20260119T090000Z", at(19, 9, 0), at(19, 10, 0), func(e *models.Event) { e.Status = "CANCELLED" })
+	got := Compute([]*models.Event{m, cancelled}, "me@x.com", at(1, 0, 0), at(31, 0, 0))
+	if len(got) != 3 {
+		t.Fatalf("want 3 busy blocks, got %+v", got)
+	}
+}
+
+func TestTransparentOverrideFreesThatInstance(t *testing.T) {
+	m, mk := series()
+	free := mk("20260126T090000Z", at(26, 9, 0), at(26, 10, 0), func(e *models.Event) { e.Transparency = "TRANSPARENT" })
+	got := Compute([]*models.Event{m, free}, "me@x.com", at(1, 0, 0), at(31, 0, 0))
+	if len(got) != 3 {
+		t.Fatalf("a TRANSPARENT override must free that one instance, got %+v", got)
+	}
+}
+
+func TestOverrideMovedIntoWindowOnlyOverrideRowLoaded(t *testing.T) {
+	// the query returned only the override row (its own start is in the window), not the master
+	_, mk := series()
+	moved := mk("20260302T090000Z", at(14, 11, 0), at(14, 12, 0))
+	got := Compute([]*models.Event{moved}, "me@x.com", at(1, 0, 0), at(31, 0, 0))
+	if len(got) != 1 || !got[0].Start.Equal(at(14, 11, 0)) {
+		t.Fatalf("an override without its master must still count as busy, got %+v", got)
+	}
+}
+
+func TestDeclinedOverrideOnAcceptedSeries(t *testing.T) {
+	m, mk := series()
+	m.Organizer = "boss@x.com"
+	setStatus := func(s string) func(*models.Event) {
+		return func(e *models.Event) {
+			e.Organizer = "boss@x.com"
+			b, _ := json.Marshal([]models.Attendee{{Email: "me@x.com", Status: s}})
+			e.Attendees = b
+		}
+	}
+	setStatus("ACCEPTED")(m)
+	declined := mk("20260112T090000Z", at(12, 9, 0), at(12, 10, 0), setStatus("DECLINED"))
+	got := Compute([]*models.Event{m, declined}, "me@x.com", at(1, 0, 0), at(31, 0, 0))
+	if len(got) != 3 {
+		t.Fatalf("declining one instance must free just that instance, got %+v", got)
+	}
+}

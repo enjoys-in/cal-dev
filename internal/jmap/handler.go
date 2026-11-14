@@ -189,19 +189,19 @@ func (h *Handler) calendarEventGet(c *fiber.Ctx, tenantID, userID int, call *JMA
 		return jmapMethodError("invalidArguments", "Invalid arguments", call.CallID)
 	}
 
-	var events []*models.Event
+	var folded []foldedEvent
 	var notFound []string
 
 	if len(args.IDs) == 0 {
-		// Return all events for user
-		var err error
-		events, err = h.store.QueryEvents(c.UserContext(), &models.EventFilter{
+		// Return all events for user: one object per series, overrides folded into it
+		events, err := h.store.QueryResources(c.UserContext(), &models.EventFilter{
 			TenantID: tenantID,
 			UserID:   userID,
 		})
 		if err != nil {
 			return jmapMethodError("serverFail", err.Error(), call.CallID)
 		}
+		folded = foldResources(events)
 	} else {
 		for _, id := range args.IDs {
 			evt, err := h.store.GetEventByID(c.UserContext(), tenantID, id)
@@ -210,17 +210,29 @@ func (h *Handler) calendarEventGet(c *fiber.Ctx, tenantID, userID int, call *JMA
 			}
 			if evt == nil {
 				notFound = append(notFound, id)
-			} else {
-				events = append(events, evt)
+				continue
 			}
+			fe := foldedEvent{event: evt}
+			if evt.RecurrenceID == "" {
+				rows, err := h.store.GetResource(c.UserContext(), tenantID, evt.CalendarID, evt.UID)
+				if err != nil {
+					return jmapMethodError("serverFail", err.Error(), call.CallID)
+				}
+				for _, r := range rows {
+					if r.RecurrenceID != "" {
+						fe.overrides = append(fe.overrides, r)
+					}
+				}
+			}
+			folded = append(folded, fe)
 		}
 	}
 
 	state, _ := h.store.GetJMAPState(c.UserContext(), tenantID, userID, "CalendarEvent")
 
-	list := make([]map[string]interface{}, 0, len(events))
-	for _, evt := range events {
-		list = append(list, eventToJMAP(evt))
+	list := make([]map[string]interface{}, 0, len(folded))
+	for _, fe := range folded {
+		list = append(list, eventToJMAP(fe.event, fe.overrides))
 	}
 
 	result := map[string]interface{}{
@@ -271,6 +283,12 @@ func (h *Handler) calendarEventSet(c *fiber.Ctx, tenantID, userID int, call *JMA
 	// Handle creates
 	for tempID, props := range args.Create {
 		evt := jmapToEvent(props, tenantID, userID)
+		// An event with attendees needs an organizer or scheduling is skipped entirely and nobody is
+		// invited. The creator is the organizer; never trust an organizer sent by the client.
+		evt.Organizer = ""
+		if email, _ := c.Locals("email").(string); email != "" && hasAttendees(evt.Attendees) {
+			evt.Organizer = email
+		}
 		if evt.CalendarID == "" {
 			// Get default calendar
 			calendars, err := h.store.GetCalendarsByUser(c.UserContext(), tenantID, userID)
@@ -278,11 +296,30 @@ func (h *Handler) calendarEventSet(c *fiber.Ctx, tenantID, userID int, call *JMA
 				notCreated[tempID] = map[string]string{"type": "serverFail", "description": "No calendar found"}
 				continue
 			}
-			evt.CalendarID = calendars[0].ID
+			// Prefer the default calendar, else any writable one; never a read-only subscription
+			// calendar (its events are replaced on every sync).
+			picked := ""
+			for _, cal := range calendars {
+				if cal.IsReadOnly {
+					continue
+				}
+				if cal.IsDefault {
+					picked = cal.ID
+					break
+				}
+				if picked == "" {
+					picked = cal.ID
+				}
+			}
+			if picked == "" {
+				notCreated[tempID] = map[string]string{"type": "forbidden", "description": "No writable calendar"}
+				continue
+			}
+			evt.CalendarID = picked
 		} else {
 			cal, err := h.store.GetCalendar(c.UserContext(), tenantID, evt.CalendarID)
-			if err != nil || cal == nil || cal.UserID != userID {
-				notCreated[tempID] = map[string]string{"type": "forbidden", "description": "Calendar not found or access denied"}
+			if err != nil || cal == nil || cal.UserID != userID || cal.IsReadOnly {
+				notCreated[tempID] = map[string]string{"type": "forbidden", "description": "Calendar not found, read-only or access denied"}
 				continue
 			}
 		}
@@ -322,14 +359,54 @@ func (h *Handler) calendarEventSet(c *fiber.Ctx, tenantID, userID int, call *JMA
 			continue
 		}
 
-		// Apply updates
-		applyJMAPUpdates(evt, props)
-		evt.RawICS = "" // Clear so GenerateICS regenerates from updated fields
-		evt.RawICS = ics.GenerateICS(evt)
-		evt.SizeBytes = len(evt.RawICS)
-		evt.ETag = ics.GenerateETag(evt.RawICS)
+		// Load the whole resource (master + overrides) so an edit can never drop an override.
+		rows, err := h.store.GetResource(c.UserContext(), tenantID, evt.CalendarID, evt.UID)
+		if err != nil || len(rows) == 0 {
+			notUpdated[id] = map[string]string{"type": "serverFail", "description": "cannot load event"}
+			continue
+		}
+		if evt.RecurrenceID != "" && rows[0].RecurrenceID == "" {
+			notUpdated[id] = map[string]string{"type": "invalidProperties",
+				"description": "this id is a single occurrence; update the series id and use recurrenceOverrides"}
+			continue
+		}
+		if cal, _ := h.store.GetCalendar(c.UserContext(), tenantID, evt.CalendarID); cal != nil && cal.IsReadOnly {
+			notUpdated[id] = map[string]string{"type": "forbidden", "description": "Calendar is read-only"}
+			continue
+		}
+		// Edit the loaded master row itself (the one FinalizeResource/ReplaceResource will write).
+		// An orphan override addressed by its own id is its own resource: rows[0] is then that override.
+		evt = rows[0]
 
-		if err := h.store.UpdateEvent(c.UserContext(), evt); err != nil {
+		// Moving to another calendar: only into one of the caller's own writable calendars.
+		if newCal, ok := props["calendarId"].(string); ok && newCal != "" && newCal != evt.CalendarID {
+			dest, err := h.store.GetCalendar(c.UserContext(), tenantID, newCal)
+			if err != nil || dest == nil || dest.UserID != userID || dest.IsReadOnly {
+				notUpdated[id] = map[string]string{"type": "forbidden", "description": "Calendar not found or access denied"}
+				continue
+			}
+			if err := h.store.MoveEvent(c.UserContext(), tenantID, evt.CalendarID, evt.UID, newCal); err != nil {
+				notUpdated[id] = map[string]string{"type": "serverFail", "description": err.Error()}
+				continue
+			}
+			for _, r := range rows {
+				r.CalendarID = newCal
+			}
+		}
+
+		// Apply updates (keep a snapshot of the previous version for scheduling diffs;
+		// applyJMAPUpdates reassigns fields rather than mutating shared slices).
+		oldEvt := *evt
+		applyJMAPUpdates(evt, props)
+		if patches, ok := props["recurrenceOverrides"].(map[string]interface{}); ok {
+			if rows, err = applyOverridePatches(rows, patches); err != nil {
+				notUpdated[id] = map[string]string{"type": "invalidProperties", "description": err.Error()}
+				continue
+			}
+		}
+		rows = ics.FinalizeResource(rows) // regenerates every component; overrides, alarms and EXDATEs survive
+
+		if err := h.store.ReplaceResource(c.UserContext(), tenantID, evt.CalendarID, evt.UID, rows); err != nil {
 			notUpdated[id] = map[string]string{"type": "serverFail", "description": err.Error()}
 			continue
 		}
@@ -338,9 +415,10 @@ func (h *Handler) calendarEventSet(c *fiber.Ctx, tenantID, userID int, call *JMA
 		// Send update notification to attendees
 		if h.scheduling != nil {
 			evtCopy := evt
+			oldCopy := oldEvt
 			go func() {
-				if err := h.scheduling.ProcessEvent(context.Background(), evtCopy, "REQUEST"); err != nil {
-					log.Printf("jmap: scheduling ProcessEvent (update) error: %v", err)
+				if err := h.scheduling.ProcessUpdate(context.Background(), evtCopy, &oldCopy); err != nil {
+					log.Printf("jmap: scheduling ProcessUpdate error: %v", err)
 				}
 			}()
 		}
@@ -352,6 +430,18 @@ func (h *Handler) calendarEventSet(c *fiber.Ctx, tenantID, userID int, call *JMA
 		if err != nil || evt == nil {
 			notDestroyed[id] = map[string]string{"type": "notFound", "description": "Event not found"}
 			continue
+		}
+		if cal, _ := h.store.GetCalendar(c.UserContext(), tenantID, evt.CalendarID); cal != nil && cal.IsReadOnly {
+			notDestroyed[id] = map[string]string{"type": "forbidden", "description": "Calendar is read-only"}
+			continue
+		}
+		if evt.RecurrenceID != "" {
+			if master, _ := h.store.GetEvent(c.UserContext(), tenantID, evt.CalendarID, evt.UID); master != nil && master.RecurrenceID == "" {
+				// destroying one occurrence must not delete the whole series
+				notDestroyed[id] = map[string]string{"type": "invalidProperties",
+					"description": "this id is a single occurrence; set recurrenceOverrides[<start>] = {\"excluded\": true} on the series instead"}
+				continue
+			}
 		}
 		if err := h.store.DeleteEvent(c.UserContext(), tenantID, evt.CalendarID, evt.UID); err != nil {
 			notDestroyed[id] = map[string]string{"type": "serverFail", "description": err.Error()}
@@ -431,14 +521,16 @@ func (h *Handler) calendarEventQuery(c *fiber.Ctx, tenantID, userID int, call *J
 		}
 	}
 
-	events, err := h.store.QueryEvents(c.UserContext(), filter)
+	events, err := h.store.QueryResources(c.UserContext(), filter)
 	if err != nil {
 		return jmapMethodError("serverFail", err.Error(), call.CallID)
 	}
 
-	ids := make([]string, 0, len(events))
-	for _, evt := range events {
-		ids = append(ids, evt.ID)
+	// One id per series: an override that matched on its own resolves to its master's id.
+	folded := foldResources(events)
+	ids := make([]string, 0, len(folded))
+	for _, fe := range folded {
+		ids = append(ids, fe.event.ID)
 	}
 
 	state, _ := h.store.GetJMAPState(c.UserContext(), tenantID, userID, "CalendarEvent")
@@ -592,6 +684,16 @@ func (h *Handler) calendarSet(c *fiber.Ctx, tenantID, userID int, call *JMAPMeth
 
 	// Handle creates
 	for tempID, props := range args.Create {
+		// Enforce: per email only one calendar
+		existing, err := h.store.GetCalendarsByUser(c.UserContext(), tenantID, userID)
+		if err == nil && len(existing) >= 1 {
+			notCreated[tempID] = map[string]string{
+				"type":        "forbidden",
+				"description": "Only one calendar per email is allowed",
+			}
+			continue
+		}
+
 		cal := &models.Calendar{
 			ID:                  uuid.New().String(),
 			TenantID:            tenantID,
@@ -805,7 +907,7 @@ func parseMethodCall(raw json.RawMessage) (*JMAPMethodCall, error) {
 	}, nil
 }
 
-func eventToJMAP(evt *models.Event) map[string]interface{} {
+func eventToJMAP(evt *models.Event, overrides []*models.Event) map[string]interface{} {
 	result := map[string]interface{}{
 		"id":             evt.ID,
 		"calendarId":     evt.CalendarID,
@@ -822,6 +924,14 @@ func eventToJMAP(evt *models.Event) map[string]interface{} {
 		"classification": evt.Classification,
 		"created":        evt.CreatedAt.Format(time.RFC3339),
 		"updated":        evt.UpdatedAt.Format(time.RFC3339),
+	}
+	if evt.RecurrenceID != "" { // an override that has no master in this account
+		if key, _, ok := overrideIDToKey(evt.RecurrenceID); ok {
+			result["recurrenceId"] = key
+		}
+	}
+	if ov := recurrenceOverridesJMAP(evt, overrides); ov != nil {
+		result["recurrenceOverrides"] = ov
 	}
 
 	if evt.DTEnd != nil {
@@ -972,6 +1082,11 @@ func applyJMAPUpdates(evt *models.Event, props map[string]interface{}) {
 		evt.Attendees = atts
 	}
 	evt.Sequence++
+}
+
+func hasAttendees(raw json.RawMessage) bool {
+	var atts []models.Attendee
+	return json.Unmarshal(raw, &atts) == nil && len(atts) > 0
 }
 
 func parseJMAPParticipants(props map[string]interface{}) (json.RawMessage, bool) {

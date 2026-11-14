@@ -355,7 +355,9 @@ func (s *Store) UpdateEvent(ctx context.Context, e *models.Event) error {
 		priority = $20, url = $21, geo = $22, dtstamp = $23,
 		etag = $24, raw_ics = $25, size_bytes = $26,
 		component_type = $27, properties = $28
-		WHERE tenant_id = $1 AND calendar_id = $2 AND uid = $3`
+		WHERE tenant_id = $1 AND calendar_id = $2 AND uid = $3 AND recurrence_id = $29`
+	// recurrence_id is part of the key: a resource has one row per component (master + overrides),
+	// so without it this would overwrite every row of the UID with this one row's values.
 	_, err := s.db.ExecContext(ctx, query,
 		e.TenantID, e.CalendarID, e.UID,
 		e.Summary, e.Description, e.Location,
@@ -365,7 +367,7 @@ func (s *Store) UpdateEvent(ctx context.Context, e *models.Event) error {
 		e.Organizer, e.Attendees, pq.Array(e.Categories),
 		e.Priority, e.URL, e.Geo, e.DTStamp,
 		e.ETag, e.RawICS, e.SizeBytes,
-		e.ComponentType, e.Properties)
+		e.ComponentType, e.Properties, e.RecurrenceID)
 	return err
 }
 
@@ -376,7 +378,8 @@ func (s *Store) GetEvent(ctx context.Context, tenantID int, calendarID, uid stri
 		status, transparency, classification, organizer, attendees, categories,
 		priority, url, geo, dtstamp, etag, raw_ics, size_bytes, component_type, properties,
 		created_at, updated_at
-		FROM caldev_events WHERE tenant_id = $1 AND calendar_id = $2 AND uid = $3`
+		FROM caldev_events WHERE tenant_id = $1 AND calendar_id = $2 AND uid = $3
+		ORDER BY recurrence_id ASC LIMIT 1` // the resource's primary row: the master ('' sorts first), else the earliest override
 	err := s.db.QueryRowContext(ctx, query, tenantID, calendarID, uid).
 		Scan(&e.ID, &e.TenantID, &e.UserID, &e.CalendarID, &e.UID,
 			&e.Summary, &e.Description, &e.Location,
@@ -574,9 +577,16 @@ func (s *Store) GetEventChangesSinceState(ctx context.Context, tenantID, userID 
 		}
 	}
 
-	query := `SELECT sc.event_uid, sc.change_type, COALESCE(e.id::text, '')
+	// JMAP clients know the master's id (overrides are folded into it as recurrenceOverrides).
+	//  - change to a master row            -> that event's own id (recorded in event_id, so even a
+	//                                         deleted event is reported under its real id)
+	//  - change to an override row         -> the master was modified, if the master still exists
+	//  - change to an override of no master -> the override is itself the visible event
+	query := `SELECT sc.event_uid, sc.recurrence_id, sc.change_type,
+			COALESCE(sc.event_id::text, ''), COALESCE(m.id::text, '')
 		FROM caldev_sync_changes sc
-		LEFT JOIN caldev_events e ON e.tenant_id = sc.tenant_id AND e.uid = sc.event_uid
+		LEFT JOIN caldev_events m ON m.tenant_id = sc.tenant_id AND m.calendar_id = sc.calendar_id
+			AND m.uid = sc.event_uid AND m.recurrence_id = ''
 		WHERE sc.tenant_id = $1 AND sc.id > $2
 		ORDER BY sc.id ASC`
 	rows, err := s.db.QueryContext(ctx, query, tenantID, sinceID)
@@ -588,13 +598,25 @@ func (s *Store) GetEventChangesSinceState(ctx context.Context, tenantID, userID 
 	createdMap := make(map[string]bool)
 	updatedMap := make(map[string]bool)
 	destroyedMap := make(map[string]bool)
+	// Deleting a series also deletes its override rows. Clients only ever held the master's id
+	// (overrides are folded into it), so those row ids must not be reported as destroyed events.
+	destroyedOverrideOf := make(map[string]string) // override row id -> uid
+	destroyedMasters := make(map[string]bool)      // uid of series whose master row was deleted
 
 	for rows.Next() {
-		var uid, changeType, eventID string
-		if err := rows.Scan(&uid, &changeType, &eventID); err != nil {
+		var uid, recurrenceID, changeType, rowID, masterID string
+		if err := rows.Scan(&uid, &recurrenceID, &changeType, &rowID, &masterID); err != nil {
 			return nil, err
 		}
-		targetID := eventID
+		targetID := rowID
+		if recurrenceID != "" && masterID != "" {
+			// an override changed while its master lives on: the master is what clients hold
+			targetID = masterID
+			changeType = "modified"
+		}
+		if targetID == "" {
+			targetID = masterID // rows recorded before event_id existed
+		}
 		if targetID == "" {
 			targetID = uid
 		}
@@ -610,6 +632,16 @@ func (s *Store) GetEventChangesSinceState(ctx context.Context, tenantID, userID 
 			delete(createdMap, targetID)
 			delete(updatedMap, targetID)
 			destroyedMap[targetID] = true
+			if recurrenceID == "" {
+				destroyedMasters[uid] = true
+			} else {
+				destroyedOverrideOf[targetID] = uid
+			}
+		}
+	}
+	for id, uid := range destroyedOverrideOf {
+		if destroyedMasters[uid] {
+			delete(destroyedMap, id)
 		}
 	}
 
@@ -646,19 +678,21 @@ func (s *Store) MoveEvent(ctx context.Context, tenantID int, oldCalendarID, uid,
 	return nil
 }
 
-// CopyEvent copies an event to another calendar.
+// CopyEvent copies a whole resource (master and every override) to another calendar.
+// Every copied row gets its own fresh id and keeps the source's content-derived ETag;
+// newID and newETag are accepted for API compatibility only.
 func (s *Store) CopyEvent(ctx context.Context, tenantID int, srcCalendarID, uid, destCalendarID, newID, newETag string) error {
 	query := `INSERT INTO caldev_events
 		(id, tenant_id, user_id, calendar_id, uid, summary, description, location,
 		 dtstart, dtend, duration, all_day, recurrence_rule, recurrence_id, sequence,
 		 status, transparency, classification, organizer, attendees, categories,
 		 priority, url, geo, dtstamp, etag, raw_ics, size_bytes, component_type, properties)
-		SELECT $4, tenant_id, user_id, $5, uid, summary, description, location,
+		SELECT uuid_generate_v4(), tenant_id, user_id, $4, uid, summary, description, location,
 		 dtstart, dtend, duration, all_day, recurrence_rule, recurrence_id, sequence,
 		 status, transparency, classification, organizer, attendees, categories,
-		 priority, url, geo, dtstamp, $6, raw_ics, size_bytes, component_type, properties
+		 priority, url, geo, dtstamp, etag, raw_ics, size_bytes, component_type, properties
 		FROM caldev_events WHERE tenant_id = $1 AND calendar_id = $2 AND uid = $3`
-	_, err := s.db.ExecContext(ctx, query, tenantID, srcCalendarID, uid, newID, destCalendarID, newETag)
+	_, err := s.db.ExecContext(ctx, query, tenantID, srcCalendarID, uid, destCalendarID)
 	return err
 }
 
@@ -829,15 +863,7 @@ func (s *Store) GetEventsChangedSince(ctx context.Context, tenantID, userID int,
 
 // UpsertEvent creates or updates an event based on UID uniqueness.
 func (s *Store) UpsertEvent(ctx context.Context, e *models.Event) error {
-	existing, err := s.GetEvent(ctx, e.TenantID, e.CalendarID, e.UID)
-	if err != nil {
-		return err
-	}
-	if existing != nil {
-		e.ID = existing.ID
-		return s.UpdateEvent(ctx, e)
-	}
-	return s.CreateEvent(ctx, e)
+	return upsertEvent(ctx, s.db, e) // keyed on (calendar, uid, recurrence_id)
 }
 
 // EventExistsByUID checks if an event with the given UID exists in the calendar.

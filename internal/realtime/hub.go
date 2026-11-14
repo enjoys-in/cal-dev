@@ -325,6 +325,7 @@ func (h *Hub) sharesChanged(n notification) {
 				continue
 			}
 			if cur, err := h.avail.CurrentStatus(ctx, owner, time.Now()); err == nil {
+				h.rememberStatus(owner.ID, cur) // so the next tick does not announce it again
 				h.deliver(s, availabilityMessage(owner, cur))
 			}
 		}

@@ -147,12 +147,16 @@ func (s *Service) SyncSubscription(ctx context.Context, sub *models.CalendarSubs
 	}
 
 	imported := 0
+	seen := make(map[string]bool)
 	for _, event := range events {
 		if err := s.store.CreateEvent(ctx, event); err != nil {
 			log.Printf("sync: failed to import event %s: %v", event.UID, err)
 			continue
 		}
-		imported++
+		if !seen[event.UID] { // count resources (events), not their override rows
+			seen[event.UID] = true
+			imported++
+		}
 	}
 
 	log.Printf("sync: subscription %s synced — %d events imported", sub.ID, imported)
@@ -338,19 +342,14 @@ func parseAllEvents(rawICS string, tenantID, userID int, calendarID string) ([]*
 		fullICS.WriteString("END:VCALENDAR\r\n")
 
 		wrapped := fullICS.String()
-		event, err := ics.ParseICS(wrapped, tenantID, userID, calendarID)
+		// One row per component (master + each RECURRENCE-ID override); the primary row keeps the
+		// complete resource text. The UNIQUE key (calendar, uid, recurrence_id) allows them side by side.
+		rows, err := ics.ParseICSAll(wrapped, tenantID, userID, calendarID)
 		if err != nil {
 			log.Printf("sync: failed to parse combined event %s: %v", uid, err)
 			continue
 		}
-
-		event.ID = uuid.New().String()
-		event.UID = uid
-		event.RawICS = wrapped
-		event.SizeBytes = len(wrapped)
-		event.ETag = ics.GenerateETag(wrapped)
-
-		events = append(events, event)
+		events = append(events, rows...)
 	}
 
 	return events, nil

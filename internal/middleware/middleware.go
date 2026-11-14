@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"errors"
 	"log"
 	"os"
 	"strconv"
@@ -105,9 +106,10 @@ func DAVAuth(authSvc *auth.Service, s *store.Store) fiber.Handler {
 			token := strings.TrimPrefix(authHeader, "Bearer ")
 			claims, err := authSvc.ValidateToken(token)
 			if err != nil {
+				code, msg := rejectBearer(c, "validate", err, "")
 				// Browser/API request — don't trigger Basic Auth dialog
 				if fromCookie || c.Get("Origin") != "" {
-					return c.Status(401).JSON(fiber.Map{"error": "Invalid token"})
+					return c.Status(401).JSON(fiber.Map{"error": msg, "code": code})
 				}
 				c.Set("WWW-Authenticate", `Basic realm="CalDAV Server"`)
 				return c.Status(401).SendString("Invalid token")
@@ -116,8 +118,9 @@ func DAVAuth(authSvc *auth.Service, s *store.Store) fiber.Handler {
 			// Resolve user from mail_accounts to get canonical IDs
 			resolved, err := authSvc.ResolveUserFromToken(c.UserContext(), claims)
 			if err != nil {
+				code, msg := rejectBearer(c, "resolve", err, claims.Email)
 				if fromCookie || c.Get("Origin") != "" {
-					return c.Status(401).JSON(fiber.Map{"error": "User not found"})
+					return c.Status(401).JSON(fiber.Map{"error": msg, "code": code})
 				}
 				c.Set("WWW-Authenticate", `Basic realm="CalDAV Server"`)
 				return c.Status(401).SendString("User not found")
@@ -186,12 +189,14 @@ func JMAPAuth(authSvc *auth.Service, s *store.Store) fiber.Handler {
 		}
 		claims, err := authSvc.ValidateToken(token)
 		if err != nil {
-			return c.Status(401).JSON(fiber.Map{"error": "Invalid token"})
+			code, msg := rejectBearer(c, "validate", err, "")
+			return c.Status(401).JSON(fiber.Map{"error": msg, "code": code})
 		}
 
 		resolved, err := authSvc.ResolveUserFromToken(c.UserContext(), claims)
 		if err != nil {
-			return c.Status(401).JSON(fiber.Map{"error": "User not found"})
+			code, msg := rejectBearer(c, "resolve", err, claims.Email)
+			return c.Status(401).JSON(fiber.Map{"error": msg, "code": code})
 		}
 
 		c.Locals("user_id", resolved.UserID)
@@ -199,6 +204,24 @@ func JMAPAuth(authSvc *auth.Service, s *store.Store) fiber.Handler {
 		c.Locals("email", resolved.Email)
 		return c.Next()
 	}
+}
+
+// rejectBearer logs why a bearer token was refused (never the token itself) and returns a
+// stable machine-readable code plus the message clients already receive. The log line is what
+// distinguishes "token invalid" from "user has no mail_accounts row" from "account suspended".
+func rejectBearer(c *fiber.Ctx, stage string, err error, email string) (code, msg string) {
+	code, msg = "invalid_token", "Invalid token"
+	switch {
+	case errors.Is(err, auth.ErrAccountInactive):
+		code, msg = "account_inactive", "User not found"
+	case errors.Is(err, auth.ErrUserNotFound):
+		code, msg = "user_not_found", "User not found"
+	case stage == "resolve":
+		code, msg = "user_lookup_failed", "User not found"
+	}
+	log.Printf("auth: 401 %s %s ip=%s stage=%s code=%s email=%q cause=%v",
+		c.Method(), c.Path(), c.IP(), stage, code, email, err)
+	return code, msg
 }
 
 // XMLSizeLimit limits XML request body size.
@@ -396,6 +419,11 @@ func CORSHeaders() fiber.Handler {
 		}
 
 		if c.Method() == "OPTIONS" {
+			// A real WebDAV capability probe (no CORS preflight header) must reach the DAV handler so
+			// CalDAV clients receive the DAV/Allow headers. Everything else is a browser preflight.
+			if strings.HasPrefix(c.Path(), "/dav/") && c.Get("Access-Control-Request-Method") == "" {
+				return c.Next()
+			}
 			return c.SendStatus(204)
 		}
 
