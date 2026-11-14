@@ -56,6 +56,7 @@ func ParseICS(rawICS string, tenantID, userID int, calendarID string) (*models.E
 	var currentAlarm Alarm
 	var exdates []string
 	var rdates []string
+	var tzidName string
 
 	for _, line := range lines {
 		trimmed := strings.TrimSpace(line)
@@ -125,6 +126,11 @@ func ParseICS(rawICS string, tenantID, userID int, calendarID string) (*models.E
 			dt, allDay := parseDateTime(value, params)
 			e.DTStart = dt
 			e.AllDay = allDay
+			if tz, ok := params["TZID"]; ok {
+				if loc, ok := ResolveTZID(tz); ok {
+					tzidName = loc.String()
+				}
+			}
 		case "DTEND":
 			dt, _ := parseDateTime(value, params)
 			e.DTEnd = &dt
@@ -209,6 +215,9 @@ func ParseICS(rawICS string, tenantID, userID int, calendarID string) (*models.E
 	}
 	if len(rdates) > 0 {
 		propsMap["rdates"] = rdates
+	}
+	if tzidName != "" {
+		propsMap["tzid"] = tzidName
 	}
 	if len(propsMap) > 0 {
 		if b, err := json.Marshal(propsMap); err == nil {
@@ -509,6 +518,12 @@ func parseLine(line string) (name string, params map[string]string, value string
 	return name, params, value
 }
 
+// ParseDuration parses an RFC 5545 / ISO 8601 duration (e.g. PT1H, P1D) into a time.Duration.
+// It returns 0 when the value is not a valid duration.
+func ParseDuration(s string) time.Duration {
+	return parseDurationString(s)
+}
+
 // parseDurationString parses an ISO 8601 duration string into time.Duration.
 func parseDurationString(durStr string) time.Duration {
 	durStr = strings.ToUpper(durStr)
@@ -553,6 +568,38 @@ func parseDurationString(durStr string) time.Duration {
 	return total
 }
 
+// windowsTZ maps common Windows time zone names to IANA names.
+var windowsTZ = map[string]string{
+	"India Standard Time":       "Asia/Kolkata",
+	"Eastern Standard Time":     "America/New_York",
+	"Central Standard Time":     "America/Chicago",
+	"Pacific Standard Time":     "America/Los_Angeles",
+	"Mountain Standard Time":    "America/Denver",
+	"GMT Standard Time":         "Europe/London",
+	"W. Europe Standard Time":   "Europe/Berlin",
+	"Romance Standard Time":     "Europe/Paris",
+	"China Standard Time":       "Asia/Shanghai",
+	"Tokyo Standard Time":       "Asia/Tokyo",
+	"AUS Eastern Standard Time": "Australia/Sydney",
+}
+
+// ResolveTZID resolves an iCalendar TZID value (IANA or common Windows name) to a location.
+func ResolveTZID(tzid string) (*time.Location, bool) {
+	tzid = strings.Trim(strings.TrimSpace(tzid), "\"")
+	tzid = strings.TrimPrefix(tzid, "/")
+	if tzid == "" {
+		return nil, false
+	}
+	if mapped, ok := windowsTZ[tzid]; ok {
+		tzid = mapped
+	}
+	loc, err := time.LoadLocation(tzid)
+	if err != nil {
+		return nil, false
+	}
+	return loc, true
+}
+
 // parseDateTime parses ICS date/datetime values.
 func parseDateTime(value string, params map[string]string) (time.Time, bool) {
 	value = strings.TrimSpace(value)
@@ -576,24 +623,7 @@ func parseDateTime(value string, params map[string]string) (time.Time, bool) {
 	if err == nil {
 		// Apply TZID if present
 		if tzid, ok := params["TZID"]; ok {
-			tzid = strings.Trim(tzid, "\"")
-			tzid = strings.TrimPrefix(tzid, "/")
-			switch tzid {
-			case "India Standard Time":
-				tzid = "Asia/Kolkata"
-			case "Eastern Standard Time":
-				tzid = "America/New_York"
-			case "Central Standard Time":
-				tzid = "America/Chicago"
-			case "Pacific Standard Time":
-				tzid = "America/Los_Angeles"
-			case "Mountain Standard Time":
-				tzid = "America/Denver"
-			case "GMT Standard Time":
-				tzid = "Europe/London"
-			}
-			loc, err := time.LoadLocation(tzid)
-			if err == nil {
+			if loc, ok := ResolveTZID(tzid); ok {
 				t = time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(), 0, loc)
 			}
 		}

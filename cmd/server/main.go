@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -18,7 +19,6 @@ import (
 	"github.com/enjoys-in/cal-dev/internal/jmap"
 	"github.com/enjoys-in/cal-dev/internal/jobs"
 	"github.com/enjoys-in/cal-dev/internal/middleware"
-	"github.com/enjoys-in/cal-dev/internal/models"
 	"github.com/enjoys-in/cal-dev/internal/publisher"
 	"github.com/enjoys-in/cal-dev/internal/response"
 	"github.com/enjoys-in/cal-dev/internal/scheduling"
@@ -27,7 +27,6 @@ import (
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/compress"
 	"github.com/gofiber/fiber/v2/middleware/recover"
-	"github.com/google/uuid"
 )
 
 func main() {
@@ -60,6 +59,7 @@ func main() {
 	// Run migrations in order
 	migrationFiles := []string{
 		"migrations/001_init.sql",
+		"migrations/002_sharing_realtime.sql",
 	}
 	for _, mf := range migrationFiles {
 		sqlBytes, err := os.ReadFile(mf)
@@ -246,10 +246,14 @@ func main() {
 	subGroup.Post("/:id/sync", syncHandler.SyncNow)
 
 	// ============================================================
-	// Admin API — API-key protected user provisioning
+	// User Onboarding & Admin API
 	// ============================================================
+	onboardHandler := createUserHandler(db, authSvc)
+	app.Post("/api/calendar/onboard", onboardHandler)
+	app.Post("/api/users/onboard", onboardHandler)
+
 	adminGroup := app.Group("/api/admin", middleware.APIKeyAuth(cfg.Auth.AdminAPIKey))
-	adminGroup.Post("/users", createUserHandler(db))
+	adminGroup.Post("/users", onboardHandler)
 
 	// ============================================================
 	// Graceful Shutdown
@@ -370,51 +374,55 @@ func deleteAppPasswordHandler(db *store.Store) fiber.Handler {
 	}
 }
 
-// createUserHandler looks up an existing mail_accounts user and creates their default calendar.
-func createUserHandler(db *store.Store) fiber.Handler {
+// createUserHandler provisions a user in mail_accounts (one per email) and creates their default calendar.
+func createUserHandler(db *store.Store, authSvc *auth.Service) fiber.Handler {
 	return func(c *fiber.Ctx) error {
 		var req struct {
 			Email string `json:"email"`
+			Name  string `json:"name"`
 		}
-		if err := c.BodyParser(&req); err != nil {
-			return response.Error(c, 400, "invalid request body")
+		_ = c.BodyParser(&req)
+
+		// If email not in body, try to extract from Bearer token
+		if req.Email == "" {
+			if authHeader := c.Get("Authorization"); strings.HasPrefix(authHeader, "Bearer ") {
+				token := strings.TrimPrefix(authHeader, "Bearer ")
+				if claims, err := authSvc.ValidateToken(token); err == nil && claims.Email != "" {
+					req.Email = claims.Email
+					if req.Name == "" {
+						req.Name = claims.DisplayName
+					}
+				}
+			}
 		}
+
 		if req.Email == "" {
 			return response.Error(c, 400, "email is required")
 		}
 
-		// Look up user from mail_accounts
-		user, err := db.GetUserByEmail(c.UserContext(), req.Email)
-		if err != nil || user == nil {
-			return response.Error(c, 404, "user not found in mail_accounts")
+		// Look up or insert user into mail_accounts (ensuring 1 user per email)
+		user, err := db.EnsureUserByEmail(c.UserContext(), req.Email, req.Name)
+		if err != nil {
+			return response.Error(c, 500, "failed to provision user: "+err.Error())
 		}
 
-		// Create default calendar (tenant_id = user.ID)
-		cal := &models.Calendar{
-			ID:                  uuid.New().String(),
-			TenantID:            user.ID,
-			UserID:              user.ID,
-			Name:                "Personal",
-			Description:         "Default calendar",
-			Color:               "#0078D4",
-			Timezone:            "UTC",
-			IsDefault:           true,
-			IsVisible:           true,
-			CTag:                uuid.New().String(),
-			SyncToken:           "sync-" + uuid.New().String(),
-			SupportedComponents: []string{"VEVENT", "VTODO"},
-			MaxResourceSize:     10485760,
-			Properties:          []byte("{}"),
-		}
-		if err := db.CreateCalendar(c.UserContext(), cal); err != nil {
-			log.Printf("Warning: default calendar may already exist: %v", err)
+		// Ensure default calendar exists (tenant_id == user.ID)
+		if err := db.EnsureDefaultCalendar(c.UserContext(), user.ID, user.ID); err != nil {
+			log.Printf("Warning: ensure default calendar: %v", err)
 		}
 
-		return response.Created(c, "User provisioned for CalDev", fiber.Map{
+		cals, _ := db.GetCalendarsByUser(c.UserContext(), user.ID, user.ID)
+		var calID string
+		if len(cals) > 0 {
+			calID = cals[0].ID
+		}
+
+		return response.Success(c, "User connected to Calendar Service", fiber.Map{
 			"user_id":     user.ID,
 			"email":       user.Email,
 			"tenant_id":   user.ID,
-			"calendar_id": cal.ID,
+			"calendar_id": calID,
+			"calendars":   cals,
 		})
 	}
 }

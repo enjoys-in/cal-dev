@@ -281,11 +281,13 @@ func APIKeyAuth(apiKey string) fiber.Handler {
 // Requests missing or mismatching any of these headers are rejected.
 func AppHeaders(appCfg *config.AppConfig) fiber.Handler {
 	return func(c *fiber.Ctx) error {
-		// Skip health-check, well-known discovery, EventSource, and CalDAV/feed paths from header validation
+		// Skip health-check, well-known discovery, EventSource, onboarding, and CalDAV/feed paths from header validation
 		path := c.Path()
 		if path == "/health" || strings.HasPrefix(path, "/.well-known/") ||
 			strings.HasPrefix(path, "/dav/") || strings.HasPrefix(path, "/feeds/") ||
-			path == "/jmap/eventsource" {
+			path == "/jmap/eventsource" ||
+			strings.HasPrefix(path, "/api/calendar/onboard") ||
+			strings.HasPrefix(path, "/api/users/onboard") {
 			return c.Next()
 		}
 

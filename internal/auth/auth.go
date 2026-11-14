@@ -32,10 +32,11 @@ func NewService(s *store.Store, cfg *config.AuthConfig) *Service {
 // Claims represents JWT claims (compatible with the shared issuer token format).
 // The external mail system JWT uses "mid" (mail_accounts.id) as the tenant identifier.
 type Claims struct {
-	UserID   string `json:"user_id"`
-	TenantID string `json:"tenant_id"`
-	MID      string `json:"mid"` // mail_accounts.id — used as tenant ID
-	Email    string `json:"email"`
+	UserID      string `json:"user_id"`
+	TenantID    string `json:"tenant_id"`
+	MID         string `json:"mid"` // mail_accounts.id — used as tenant ID
+	Email       string `json:"email"`
+	DisplayName string `json:"display_name,omitempty"`
 	jwt.RegisteredClaims
 }
 

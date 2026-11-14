@@ -11,6 +11,7 @@ import (
 
 	"github.com/enjoys-in/cal-dev/internal/config"
 	"github.com/enjoys-in/cal-dev/internal/models"
+	"github.com/enjoys-in/cal-dev/internal/recurrence"
 	"github.com/google/uuid"
 	"github.com/lib/pq"
 	_ "github.com/lib/pq"
@@ -90,7 +91,13 @@ func (s *Store) GetUserByEmail(ctx context.Context, email string) (*models.User,
 	err := s.db.QueryRowContext(ctx, query, email).
 		Scan(&u.ID, &u.Name, &u.Email, &u.TenantName, &u.Status, &u.Type, &u.CreatedAt, &u.UpdatedAt)
 	if err == sql.ErrNoRows {
-		return nil, nil
+		// Emails are case-insensitive in practice: retry ignoring case (the exact match above stays index-friendly).
+		ciQuery := strings.Replace(query, "WHERE email = $1", "WHERE lower(email) = lower($1)", 1) + " ORDER BY id LIMIT 1"
+		err = s.db.QueryRowContext(ctx, ciQuery, strings.TrimSpace(email)).
+			Scan(&u.ID, &u.Name, &u.Email, &u.TenantName, &u.Status, &u.Type, &u.CreatedAt, &u.UpdatedAt)
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
 	}
 	return u, err
 }
@@ -106,6 +113,28 @@ func (s *Store) GetUserByID(ctx context.Context, id int) (*models.User, error) {
 		return nil, nil
 	}
 	return u, err
+}
+
+// EnsureUserByEmail inserts or returns an existing user from mail_accounts.
+// Enforces that there is only one user account per email address.
+func (s *Store) EnsureUserByEmail(ctx context.Context, email, name string) (*models.User, error) {
+	if name == "" {
+		name = email
+	}
+	u := &models.User{}
+	query := `INSERT INTO mail_accounts (email, name, tenant_name, password, status, type)
+		VALUES ($1, $2, $2, '', 'ACTIVE', 'USER')
+		ON CONFLICT (email) DO UPDATE SET
+			name = CASE WHEN mail_accounts.name = '' THEN EXCLUDED.name ELSE mail_accounts.name END,
+			status = 'ACTIVE'
+		RETURNING id, COALESCE(name, '') as name, email, COALESCE(tenant_name, '') as tenant_name,
+			COALESCE(status, 'ACTIVE') as status, COALESCE(type, 'USER') as type, created_at, updated_at`
+	err := s.db.QueryRowContext(ctx, query, email, name).
+		Scan(&u.ID, &u.Name, &u.Email, &u.TenantName, &u.Status, &u.Type, &u.CreatedAt, &u.UpdatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return u, nil
 }
 
 func (s *Store) GetUserByTenantAndEmail(ctx context.Context, tenantID int, email string) (*models.User, error) {
@@ -492,9 +521,17 @@ func (s *Store) queryEvents(ctx context.Context, filter *models.EventFilter) ([]
 			return nil, err
 		}
 
-		// If recurrence rule is present, check UNTIL
-		if filter.TimeRangeStart != nil && e.RecurrenceRule != "" && e.DTEnd != nil && e.DTEnd.Before(*filter.TimeRangeStart) {
-			if until := extractUntil(e.RecurrenceRule); !until.IsZero() && until.Before(*filter.TimeRangeStart) {
+		// Recurring events only match when at least one occurrence overlaps the window.
+		if e.RecurrenceRule != "" && (filter.TimeRangeStart != nil || filter.TimeRangeEnd != nil) {
+			from := e.DTStart.Add(-24 * time.Hour)
+			if filter.TimeRangeStart != nil {
+				from = *filter.TimeRangeStart
+			}
+			to := from.AddDate(100, 0, 0)
+			if filter.TimeRangeEnd != nil {
+				to = *filter.TimeRangeEnd
+			}
+			if !recurrence.HasOccurrenceIn(e, from, to) {
 				continue
 			}
 		}
@@ -774,7 +811,7 @@ func (s *Store) GetJMAPState(ctx context.Context, tenantID, userID int, entityTy
 		WHERE tenant_id = $1 AND user_id = $2 AND entity_type = $3`
 	err := s.db.QueryRowContext(ctx, query, tenantID, userID, entityType).Scan(&state)
 	if err == sql.ErrNoRows {
-		return "", nil
+		return "0", nil // no change recorded yet: stable initial state
 	}
 	return state, err
 }
