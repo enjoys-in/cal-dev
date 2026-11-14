@@ -173,6 +173,14 @@ func JMAPAuth(authSvc *auth.Service, s *store.Store) fiber.Handler {
 			token = c.Cookies("access_token")
 		}
 
+		// 3. Fall back to query parameter (for browser EventSource / SSE)
+		if token == "" {
+			token = c.Query("access_token")
+			if token == "" {
+				token = c.Query("token")
+			}
+		}
+
 		if token == "" {
 			return c.Status(401).JSON(fiber.Map{"error": "Authentication required"})
 		}
@@ -273,10 +281,11 @@ func APIKeyAuth(apiKey string) fiber.Handler {
 // Requests missing or mismatching any of these headers are rejected.
 func AppHeaders(appCfg *config.AppConfig) fiber.Handler {
 	return func(c *fiber.Ctx) error {
-		// Skip health-check, well-known discovery, and CalDAV/feed paths from header validation
+		// Skip health-check, well-known discovery, EventSource, and CalDAV/feed paths from header validation
 		path := c.Path()
 		if path == "/health" || strings.HasPrefix(path, "/.well-known/") ||
-			strings.HasPrefix(path, "/dav/") || strings.HasPrefix(path, "/feeds/") {
+			strings.HasPrefix(path, "/dav/") || strings.HasPrefix(path, "/feeds/") ||
+			path == "/jmap/eventsource" {
 			return c.Next()
 		}
 

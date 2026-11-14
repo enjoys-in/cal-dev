@@ -945,7 +945,7 @@ func (h *Handler) EventSource(c *fiber.Ctx) error {
 		},
 	}
 	data, _ := json.Marshal(payload)
-	return c.SendString(fmt.Sprintf("event: state\r\ndata: %s\r\n\r\n", string(data)))
+	return c.SendString(fmt.Sprintf("retry: 3000\r\nevent: state\r\ndata: %s\r\n\r\n", string(data)))
 }
 
 func jmapError(errType, description string) map[string]interface{} {
