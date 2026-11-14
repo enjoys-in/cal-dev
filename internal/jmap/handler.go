@@ -1,15 +1,20 @@
 package jmap
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
 	"log"
+	"os"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/enjoys-in/cal-dev/internal/availability"
 	"github.com/enjoys-in/cal-dev/internal/ics"
 	"github.com/enjoys-in/cal-dev/internal/models"
+	"github.com/enjoys-in/cal-dev/internal/realtime"
 	"github.com/enjoys-in/cal-dev/internal/scheduling"
 	"github.com/enjoys-in/cal-dev/internal/store"
 	"github.com/gofiber/fiber/v2"
@@ -21,7 +26,15 @@ type Handler struct {
 	store      *store.Store
 	baseURL    string
 	scheduling *scheduling.Service
+	hub        *realtime.Hub
+	avail      *availability.Service
 }
+
+// SetRealtime enables live streaming on /jmap/eventsource.
+func (h *Handler) SetRealtime(hub *realtime.Hub) { h.hub = hub }
+
+// SetAvailability enables the JMAP Principal/getAvailability method.
+func (h *Handler) SetAvailability(a *availability.Service) { h.avail = a }
 
 // NewHandler creates a new JMAP handler.
 func NewHandler(s *store.Store, baseURL string, sched *scheduling.Service) *Handler {
@@ -54,7 +67,7 @@ func (h *Handler) Session(c *fiber.Ctx) error {
 			"urn:ietf:params:jmap:calendars": map[string]interface{}{
 				"supportsRecurrences":  true,
 				"supportsParticipants": true,
-				"supportsAvailability": true,
+				"supportsAvailability": h.avail != nil,
 				"supportsScheduling":   true,
 				"maxCalendarsPerEvent": 1,
 				"maxAttendeesPerEvent": 1000,
@@ -150,6 +163,8 @@ func (h *Handler) dispatchMethod(c *fiber.Ctx, tenantID, userID int, call *JMAPM
 		return h.calendarGet(c, tenantID, userID, call)
 	case "Calendar/set":
 		return h.calendarSet(c, tenantID, userID, call)
+	case "Principal/getAvailability":
+		return h.principalGetAvailability(c, userID, call)
 	default:
 		return []interface{}{"error", map[string]string{
 			"type":        "unknownMethod",
@@ -676,6 +691,93 @@ func (h *Handler) calendarSet(c *fiber.Ctx, tenantID, userID int, call *JMAPMeth
 }
 
 // ============================================================
+// Principal/getAvailability (JMAP Calendars)
+// ============================================================
+
+type getAvailabilityArgs struct {
+	AccountID string `json:"accountId"`
+	ID        string `json:"id"` // principal: "tenant:user" account id, numeric user id, or email
+	UTCStart  string `json:"utcStart"`
+	UTCEnd    string `json:"utcEnd"`
+}
+
+const maxAvailabilityWindow = 62 * 24 * time.Hour
+
+// principalGetAvailability returns the busy blocks of another user the caller may see.
+// A principal that does not exist and one the caller may not see look identical (notFound)
+// so the method cannot be used to discover accounts. Event details are never returned.
+func (h *Handler) principalGetAvailability(c *fiber.Ctx, userID int, call *JMAPMethodCall) interface{} {
+	if h.avail == nil {
+		return jmapMethodError("unknownMethod", "Availability is not enabled", call.CallID)
+	}
+	var args getAvailabilityArgs
+	if err := json.Unmarshal(call.Args, &args); err != nil || args.ID == "" {
+		return jmapMethodError("invalidArguments", "id, utcStart and utcEnd are required", call.CallID)
+	}
+	from, err1 := time.Parse(time.RFC3339, args.UTCStart)
+	to, err2 := time.Parse(time.RFC3339, args.UTCEnd)
+	if err1 != nil || err2 != nil || !to.After(from) {
+		return jmapMethodError("invalidArguments", "utcStart/utcEnd must be RFC 3339 with utcEnd after utcStart", call.CallID)
+	}
+	if to.Sub(from) > maxAvailabilityWindow {
+		return jmapMethodError("invalidArguments", "window too large (max 62 days)", call.CallID)
+	}
+
+	ctx := c.UserContext()
+	viewer, err := h.store.GetUserByID(ctx, userID)
+	if err != nil || viewer == nil {
+		return jmapMethodError("serverFail", "cannot resolve current user", call.CallID)
+	}
+	owner := h.resolvePrincipal(c, args.ID)
+	if owner == nil {
+		return jmapMethodError("notFound", "No such principal", call.CallID)
+	}
+	ok, err := h.avail.CanView(ctx, viewer, owner)
+	if err != nil {
+		return jmapMethodError("serverFail", err.Error(), call.CallID)
+	}
+	if !ok {
+		return jmapMethodError("notFound", "No such principal", call.CallID)
+	}
+	busy, err := h.avail.Busy(ctx, owner, from, to)
+	if err != nil {
+		return jmapMethodError("serverFail", err.Error(), call.CallID)
+	}
+
+	list := make([]map[string]interface{}, 0, len(busy))
+	for _, b := range busy {
+		list = append(list, map[string]interface{}{
+			"utcStart":   b.Start.UTC().Format(time.RFC3339),
+			"utcEnd":     b.End.UTC().Format(time.RFC3339),
+			"busyStatus": b.Status,
+		})
+	}
+	return []interface{}{"Principal/getAvailability", map[string]interface{}{
+		"accountId": args.AccountID,
+		"list":      list,
+	}, call.CallID}
+}
+
+// resolvePrincipal maps a JMAP principal id to a user: "tenant:user", numeric id, or email.
+func (h *Handler) resolvePrincipal(c *fiber.Ctx, id string) *models.User {
+	ctx := c.UserContext()
+	id = strings.TrimSpace(id)
+	if strings.Contains(id, "@") {
+		u, _ := h.store.GetUserByEmail(ctx, id)
+		return u
+	}
+	if i := strings.LastIndex(id, ":"); i >= 0 {
+		id = id[i+1:]
+	}
+	n, err := strconv.Atoi(id)
+	if err != nil {
+		return nil
+	}
+	u, _ := h.store.GetUserByID(ctx, n)
+	return u
+}
+
+// ============================================================
 // Helpers
 // ============================================================
 
@@ -922,10 +1024,116 @@ func parseJMAPRecurrence(props map[string]interface{}) (string, bool) {
 	return "", false
 }
 
-// EventSource provides Server-Sent Events for JMAP push notifications (RFC 8620 §7).
+// maxStreamLife bounds how long one SSE connection may stay open. The client reconnects
+// (re-authenticating with its token), so an expired or revoked token cannot keep a stream alive.
+const maxStreamLife = 30 * time.Minute
+
+// heartbeatInterval is how often an idle stream writes a keep-alive comment. The write also
+// detects clients that disappeared. Override with SSE_HEARTBEAT_SECONDS (tests, proxies).
+func heartbeatInterval() time.Duration {
+	if v := os.Getenv("SSE_HEARTBEAT_SECONDS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return time.Duration(n) * time.Second
+		}
+	}
+	return 20 * time.Second
+}
+
+func writeSSE(w *bufio.Writer, m realtime.Message) error {
+	if m.ID != "" {
+		if _, err := fmt.Fprintf(w, "id: %s\n", m.ID); err != nil {
+			return err
+		}
+	}
+	if _, err := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", m.Event, m.Data); err != nil {
+		return err
+	}
+	return w.Flush()
+}
+
+// EventSource streams live updates over Server-Sent Events (RFC 8620 §7.3):
+//   - event "state":        JMAP StateChange for the caller's own account
+//   - event "availability": busy/free status of teammates who share availability with the caller
+//   - event "shares":       a share involving the caller changed; re-read the share lists
+//   - event "resync":       events may have been missed; refetch everything
 func (h *Handler) EventSource(c *fiber.Ctx) error {
 	tenantID := c.Locals("tenant_id").(int)
 	userID := c.Locals("user_id").(int)
+	if h.hub == nil {
+		return h.eventSourceOnce(c, tenantID, userID)
+	}
+
+	user, err := h.store.GetUserByID(c.UserContext(), userID)
+	if err != nil || user == nil {
+		return c.Status(401).JSON(fiber.Map{"error": "User not found"})
+	}
+
+	// The fiber context is recycled once this handler returns, so capture everything the
+	// stream needs now and use an independent context inside the stream writer.
+	ctx, cancel := context.WithTimeout(context.Background(), maxStreamLife)
+	sub, unsubscribe, err := h.hub.Subscribe(ctx, user)
+	if err != nil {
+		cancel()
+		return c.Status(429).JSON(fiber.Map{"error": err.Error()})
+	}
+	conn := c.Context().Conn()
+	beat := heartbeatInterval()
+
+	c.Set("Content-Type", "text/event-stream")
+	c.Set("Cache-Control", "no-cache, no-transform")
+	c.Set("Connection", "keep-alive")
+	c.Set("X-Accel-Buffering", "no") // tell nginx not to buffer the stream
+	c.Status(200)
+
+	c.Context().SetBodyStreamWriter(func(w *bufio.Writer) {
+		defer cancel()
+		defer unsubscribe()
+
+		write := func(m realtime.Message) bool {
+			if conn != nil {
+				// fasthttp's WriteTimeout would otherwise cut long-lived streams.
+				_ = conn.SetWriteDeadline(time.Now().Add(15 * time.Second))
+			}
+			return writeSSE(w, m) == nil
+		}
+
+		if _, err := fmt.Fprint(w, "retry: 5000\n\n"); err != nil || w.Flush() != nil {
+			return
+		}
+		for _, m := range h.hub.Snapshot(ctx, sub) {
+			if !write(m) {
+				return
+			}
+		}
+
+		ticker := time.NewTicker(beat)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case m := <-sub.C:
+				if !write(m) {
+					return
+				}
+			case <-ticker.C:
+				if conn != nil {
+					_ = conn.SetWriteDeadline(time.Now().Add(15 * time.Second))
+				}
+				if _, err := fmt.Fprint(w, ": ping\n\n"); err != nil || w.Flush() != nil {
+					return
+				}
+			}
+			if sub.Lagged() && !write(realtime.ResyncMessage()) {
+				return
+			}
+		}
+	})
+	return nil
+}
+
+// eventSourceOnce is the legacy single-snapshot behaviour, used only when no realtime hub is configured.
+func (h *Handler) eventSourceOnce(c *fiber.Ctx, tenantID, userID int) error {
 	accountID := fmt.Sprintf("%d:%d", tenantID, userID)
 
 	c.Set("Content-Type", "text/event-stream")
