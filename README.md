@@ -209,6 +209,14 @@ To change one occurrence, `CalendarEvent/set` **update** the series id with `rec
 
 Data stored by earlier versions (where a series and its exceptions were merged into one row) is repaired automatically at startup from the original `raw_ics`; this is idempotent and keeps ETags.
 
+#### Time zones
+
+A timed event is stored as a UTC instant plus, when it has one, the IANA zone its wall-clock times belong to (`properties.tzid`, set from `DTSTART;TZID=…` over CalDAV or from the JMAP `timeZone` property). The zone is what keeps "every Monday 09:00 New York" at 09:00 across daylight-saving changes: expansion uses it, and **every ICS the server writes carries it** — `DTSTART`/`DTEND`/`EXDATE`/`RDATE`/`RECURRENCE-ID` are written as `;TZID=America/New_York:20270301T090000` rather than a fixed UTC time (events without a zone, and all-day events, are unchanged). That includes text regenerated after a JMAP edit, an RSVP or a local invitation, and the iMIP emailed to external attendees.
+
+- JMAP `timeZone`: returned on every timed event (`"Etc/UTC"` for a fixed UTC time), accepted on create and update (IANA or common Windows names; `null`/`""`/`"UTC"` = UTC; unknown names → `invalidProperties`). A recurring event created without one takes its calendar's `timezone` (default `UTC`, i.e. no change); an update only does so when it changes the recurrence rule of an event that has no zone.
+- Changing a series' zone keeps every instant fixed, moves the zone of its exceptions with it, and pins `EXDATE`/`RDATE` values written as local time to UTC so they keep pointing at the same occurrence.
+- The server writes `TZID` with the IANA name but no `VTIMEZONE` block. Recurring events that were *created through JMAP before `timeZone` existed* have no zone and stay fixed-UTC until a client sets one.
+
 ### Team Availability, Sharing & Live Updates
 
 Free/busy is derived from a user's events (recurring series are expanded; `TRANSPARENT`, `CANCELLED` and declined events don't count; unanswered invitations show as `tentative`). Only busy/free blocks are ever shared, never titles or details.
