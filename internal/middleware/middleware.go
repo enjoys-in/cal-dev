@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"log"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -311,26 +312,74 @@ func AppHeaders(appCfg *config.AppConfig) fiber.Handler {
 	}
 }
 
-// CORSHeaders adds CORS headers for JMAP endpoints.
-func CORSHeaders() fiber.Handler {
-	allowedOrigins := map[string]bool{
+// isAllowedOrigin checks if the origin is permitted for CORS.
+func isAllowedOrigin(origin string) bool {
+	if origin == "" {
+		return false
+	}
+
+	allowed := map[string]bool{
+		"http://localhost":            true,
+		"https://localhost":           true,
+		"http://127.0.0.1":            true,
+		"https://127.0.0.1":           true,
+		"http://localhost:3000":       true,
+		"https://localhost:3000":      true,
+		"http://localhost:3001":       true,
+		"https://localhost:3001":      true,
 		"http://localhost:9500":       true,
 		"https://localhost:9500":      true,
+		"http://localhost:9503":       true,
+		"https://localhost:9503":      true,
+		"http://127.0.0.1:3000":       true,
+		"http://127.0.0.1:3001":       true,
+		"http://127.0.0.1:9500":       true,
+		"http://127.0.0.1:9503":       true,
 		"https://airsend.in":          true,
 		"https://calender.airsend.in": true,
 	}
+	if allowed[origin] {
+		return true
+	}
 
+	// Allow any localhost and 127.0.0.1 port in dev
+	if strings.HasPrefix(origin, "http://localhost:") ||
+		strings.HasPrefix(origin, "https://localhost:") ||
+		strings.HasPrefix(origin, "http://127.0.0.1:") ||
+		strings.HasPrefix(origin, "https://127.0.0.1:") {
+		return true
+	}
+
+	// Custom allowed origins from environment variable
+	if custom := os.Getenv("CORS_ALLOWED_ORIGINS"); custom != "" {
+		for _, o := range strings.Split(custom, ",") {
+			if strings.TrimSpace(o) == origin {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+// CORSHeaders adds CORS headers for JMAP endpoints.
+func CORSHeaders() fiber.Handler {
 	return func(c *fiber.Ctx) error {
 		origin := c.Get("Origin")
 
 		// Always set Vary so caches distinguish responses by origin.
 		c.Set("Vary", "Origin")
 
-		if allowedOrigins[origin] {
+		if isAllowedOrigin(origin) {
 			c.Set("Access-Control-Allow-Origin", origin)
 			c.Set("Access-Control-Allow-Credentials", "true")
 			c.Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS, PROPFIND, PROPPATCH, REPORT, MKCALENDAR, MOVE, COPY, LOCK, UNLOCK")
-			c.Set("Access-Control-Allow-Headers", "Authorization, Content-Type, Depth, If-Match, If-None-Match, Lock-Token, Destination, Overwrite, Prefer, Brief, X-App-Version, X-App-Name, x-api-key, x-signature, X-Tenant-ID")
+			allowHeaders := "Authorization, Content-Type, Depth, If-Match, If-None-Match, Lock-Token, Destination, Overwrite, Prefer, Brief, X-App-Version, X-App-Name, x-api-key, x-signature, X-Tenant-ID, Accept, Origin, X-Requested-With"
+			if reqHeaders := c.Get("Access-Control-Request-Headers"); reqHeaders != "" {
+				c.Set("Access-Control-Allow-Headers", allowHeaders+", "+reqHeaders)
+			} else {
+				c.Set("Access-Control-Allow-Headers", allowHeaders)
+			}
 			c.Set("Access-Control-Expose-Headers", "ETag, DAV, Allow, Lock-Token")
 			c.Set("Access-Control-Max-Age", "86400")
 		}
