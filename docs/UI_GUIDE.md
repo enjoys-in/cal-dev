@@ -49,7 +49,7 @@ Send the mail system's JWT in one of three ways, in this order of preference:
 
 1. `Authorization: Bearer <jwt>` header
 2. the `access_token` cookie (use `fetch(..., { credentials: "include" })`)
-3. `?access_token=<jwt>` query parameter — meant **only** for the SSE stream (browsers cannot set headers on `EventSource`). Don't use it for normal calls: URLs end up in logs and history.
+3. `?access_token=<jwt>` query parameter — accepted **only** on `/jmap/eventsource` (browsers cannot set headers on `EventSource`). Any other route ignores it and answers `401`.
 
 Tokens **must carry an `exp` claim** (unless the server sets `AUTH_REQUIRE_EXP=false`).
 
@@ -68,7 +68,7 @@ plus `x-api-key` and `x-signature` if the deployment configures them. Without th
 
 ### CORS
 
-Allowed origins: any `http(s)://localhost:<port>` / `127.0.0.1:<port>`, `https://airsend.in`, `https://calender.airsend.in`, plus anything in the server's `CORS_ALLOWED_ORIGINS`. Cookies work cross-origin only for those origins.
+Allowed origins: `https://airsend.in`, `https://calender.airsend.in`, a fixed list of local dev ports (3000, 3001, 9500, 9503), anything in the server's `CORS_ALLOWED_ORIGINS`, and — on a dev server only (no `CALDEV_PUBLIC_URL`, or a localhost one) — any `http(s)://localhost:<port>` / `127.0.0.1:<port>`. Cookies work cross-origin only for those origins.
 
 ### Error shapes
 
@@ -212,11 +212,13 @@ interface Participant {
 ["CalendarEvent/get", { "accountId": "7:7", "#ids": { "resultOf": "q", "name": "CalendarEvent/query", "path": "/ids" } }, "g"]
 ```
 
-If your client does not resolve back-references, make two calls and pass `ids: [...]` yourself.
+The server resolves `#` back-references (RFC 8620 §3.7) such as `/ids`, `/list/*/id` and `/created/<id>/id`; a bad reference returns `invalidResultReference`.
 
 - `query` returns ids of events that have **any occurrence** in the window (recurring series included). It returns **series**, not occurrences — the UI expands them (below).
-- `total` is the size of the returned page, not the overall count. Page with `position`/`limit`.
-- `CalendarEvent/get` with no `ids` returns everything for the account — fine for small data sets, avoid on large ones.
+- `total` is the overall number of matching series. Page with `position`/`limit` (sorted by start, then id); a negative `limit` or an unparseable `after`/`before` returns `invalidArguments`.
+- `CalendarEvent/get` with no `ids` (or `ids: null`) returns everything for the account, up to 500 events (`requestTooLarge` beyond); `ids: []` returns nothing. Ids that don't exist or aren't UUIDs come back in `notFound`.
+- At most 500 ids per `/get` and 500 create+update+destroy per `/set` (`requestTooLarge`).
+- `/set` calls for one account run one at a time across all server instances (a Redis lock), so `ifInState` is reliable. If the account stays busy for 5 s the method returns `serverUnavailable` — retry after a short backoff.
 - Each response carries `state`. Store the latest one.
 
 ### Create
@@ -226,6 +228,8 @@ If your client does not resolve back-references, make two calls and pass `ids: [
   "title": "Design review",
   "start": "2026-11-20T10:00:00Z", "end": "2026-11-20T11:00:00Z",
   "timeZone": "America/New_York",            // always send it — see "Time zone" below
+                                             // start/end: RFC 3339, or LocalDateTime ("2026-11-20T10:00:00", read in timeZone).
+                                             // A missing or unparseable start → invalidProperties ["start"]
   "location": "Room 4", "description": "…",
   "calendarId": "<optional>",
   "participants": {

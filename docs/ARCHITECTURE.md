@@ -116,8 +116,11 @@ Event Created / Updated ─────────────┼────�
                                              ▼
                       ┌──────────────────────────────────────────────┐
                       │       HandleCalendarReminderJob              │
-                      │  1. Check caldev_reminder_deliveries (DEDUP) │
-                      │  2. Publish to Redis `calendar:push` channel │
+                      │  1. Re-read the event: skip if gone,         │
+                      │     cancelled, moved, or recipient declined  │
+                      │  2. Claim caldev_reminder_deliveries (DEDUP) │
+                      │  3. Publish to Redis `calendar:push` channel │
+                      │     (claim released on failure → retried)    │
                       └──────────────────────────────────────────────┘
 ```
 
@@ -136,7 +139,11 @@ Event Created / Updated ─────────────┼────�
 4. **Delivery Deduplication**:
    - Backed by PostgreSQL table `caldev_reminder_deliveries`:
      `UNIQUE (event_uid, recurrence_id, recipient_email, milestone_minutes, channel)`.
-   - Recurring series format their `recurrence_id` as the occurrence date (e.g., `20261115T150000Z`) so subsequent weekly instances do not block future deliveries.
+   - The stored `recurrence_id` is `<recurrence id>@<occurrence start>`, so a meeting moved to a new time gets reminders for the new time instead of being blocked by the old ones.
+   - Each delayed job has a deterministic id (tenant, calendar, UID, occurrence, start, recipient, milestone), so the hourly sweep and repeated saves replace a pending reminder instead of adding duplicates.
+5. **Who gets reminded**:
+   - The organizer's copy reminds the organizer and all non-declined attendees. An attendee's local copy of a meeting organised by a local user schedules nothing (no double reminders); a copy of a meeting from an external organizer reminds only its owner.
+   - All-day events get no minute-based countdown reminders.
 
 ---
 
@@ -172,9 +179,10 @@ via `calendar:push` channel.                                     │
    - Internal attendees automatically receive live push notifications and countdown alerts without needing an email.
 2. **External Attendees & Dispatch**:
    - CalDev creates an RFC 5545 iMIP payload (`REQUEST`, `REPLY`, or `CANCEL`) and records it in `caldev_scheduling_messages`.
-   - **Bring Your Own SMTP (BYO SMTP)**: When the event's calendar has an active custom SMTP configuration (`caldev_calendar_smtp`), the background worker delivers the invitation directly via the user's custom SMTP server with full SPF, DKIM, and DMARC alignment. Emails are delivered as RFC 5322 MIME multipart messages with human-readable text, styled HTML with 1-click RSVP buttons, and the `.ics` component.
+   - **Bring Your Own SMTP (BYO SMTP)**: When the event's calendar has an active custom SMTP configuration (`caldev_calendar_smtp`), the background worker delivers the invitation directly via the user's custom SMTP server with full SPF, DKIM, and DMARC alignment. Emails are delivered as RFC 5322 MIME multipart messages (quoted-printable text and HTML, RFC 2047-encoded headers, optional `Reply-To`) with RSVP buttons on invitations (`REQUEST` only), and the `.ics` component. Each connection has a 60 s deadline.
+   - **Retries**: a failed send leaves the message `pending` (error recorded) and the job is retried; it is marked `failed` only after the last attempt. Connection or authentication failures mark the calendar's SMTP config `failing`, after which messages use the managed fallback until it is re-tested.
    - **Managed Fallback**: If no BYO SMTP is configured and managed fallback is active, payloads are published to Redis channel `calendar:mail` for pickup by the centralized mail service.
-   - **1-Click Web RSVP**: External recipients clicking Accept/Decline in their email land on a public HMAC-signed endpoint (`/api/scheduling/rsvp`) that records their status and pushes updates in real-time.
+   - **Web RSVP**: The email buttons open a public HMAC-signed page (`/api/public/rsvp`). Opening it only shows the choice; the recipient confirms with a button (POST), so link-scanning email security tools can't answer on their behalf. The answer updates the organizer's copy and other local attendees' copies and is pushed in real time.
 3. **Attendee Capacity & Limits**:
    - CalDev enforces an explicit limit of **3,000 attendees / recipients** per event (`MaxAttendeesPerEvent = 3000`).
    - Any JMAP `CalendarEvent/set` or CalDAV `PUT` containing more than 3,000 attendees is rejected with a `400 Bad Request` (`invalidProperties`).
@@ -184,12 +192,12 @@ via `calendar:push` channel.                                     │
 
 ## 5. Database Schema & Tables
 
-All CalDev entities reside in the `caldev` PostgreSQL schema, co-located with `public.mail_accounts`:
+All CalDev tables live in the `public` schema with a `caldev_` prefix, next to `public.mail_accounts` (`DB_SCHEMA` is not applied):
 
 - **`caldev_calendars`**: Calendar containers, color, timezone, default calendar flags, and access control.
 - **`caldev_events`**: Stores master events and individual `RECURRENCE-ID` overrides. Indexed on `(calendar_id, uid, recurrence_id)`.
 - **`caldev_reminder_deliveries`**: Deduplication log ensuring a reminder milestone is delivered at most once per user per instance.
 - **`caldev_scheduling_messages`**: Outbox for meeting invitations, replies, and cancellation payloads.
-- **`caldev_changes`**: Sync tokens and changelog for CalDAV delta synchronization.
+- **`caldev_sync_changes`**: Change log behind CalDAV sync-collection and JMAP `/changes`. Written by triggers on `caldev_events` under a per-tenant advisory lock, so ids commit in order and the JMAP state (`MAX(id)`) never skips a change. Moving an event logs `deleted` in the old calendar and `created` in the new one; deleting a calendar logs nothing (migration `006`).
 - **`caldev_subscriptions`**: External read-only calendars imported from Google Calendar, Outlook, or ICS URLs.
 - **`caldev_calendar_smtp`**: Outbound BYO SMTP credentials (AES-256-GCM encrypted passwords) per calendar collection.

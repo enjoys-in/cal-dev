@@ -25,13 +25,15 @@ All authenticated requests set `user_id`, `tenant_id`, and `email` in the reques
 
 ## 2. CORS
 
-All endpoints return CORS headers:
+CORS headers (with credentials) are returned only for allowed origins: `https://airsend.in`, `https://calender.airsend.in`, a fixed list of local dev ports, anything in `CORS_ALLOWED_ORIGINS`, and — only in dev (no `CALDEV_PUBLIC_URL`, or a localhost one) — any `http(s)://localhost:<port>` / `127.0.0.1:<port>`.
 ```
-Access-Control-Allow-Origin: *
+Access-Control-Allow-Origin: <the request's Origin>
+Access-Control-Allow-Credentials: true
 Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS, PROPFIND, PROPPATCH, REPORT, MKCALENDAR, MOVE, COPY, LOCK, UNLOCK
-Access-Control-Allow-Headers: Authorization, Content-Type, Depth, If-Match, If-None-Match, Lock-Token, Destination, Overwrite, Prefer, Brief
 Access-Control-Expose-Headers: ETag, DAV, Allow, Lock-Token
 ```
+
+Request bodies are limited to 10 MB, also after decompression. `Content-Encoding: gzip` and `deflate` are accepted; other encodings get `415`.
 
 ---
 
@@ -146,14 +148,16 @@ Create a new subscription. Automatically creates a read-only calendar and trigge
 
 | Field | Required | Default | Description |
 |---|---|---|---|
-| `source_url` | **Yes** | — | The ICS feed URL |
+| `source_url` | **Yes** | — | The ICS feed URL. `webcal://` is stored as `https://`. URLs that resolve to loopback, private, link-local or unspecified addresses are rejected (also checked on update and at every fetch) |
 | `display_name` | No | `"Imported Calendar"` | Calendar display name |
 | `color` | No | `"#6B7280"` | Hex color for UI |
 | `source_type` | No | `"ics_url"` | Auto-detects `"google"` or `"outlook"` from URL |
 | `auth_type` | No | `"none"` | `"none"`, `"basic"`, `"bearer"`, `"api_key"` |
 | `auth_credentials` | No | `""` | Credentials for authenticated feeds |
 | `sync_interval` | No | `3600` | Sync interval in seconds (minimum 300) |
-| `calendar_id` | No | `""` | Link to existing calendar (if empty, auto-creates one) |
+| `calendar_id` | No | `""` | If empty, a new calendar is created. A given id must already be the calendar of one of your subscriptions (`403` otherwise): every sync replaces all events in that calendar, so it must never be a normal calendar |
+
+Each sync applies the feed to the calendar in one transaction, and overlapping syncs of the same calendar run one after another. Events keep their ids across syncs: unchanged events are not rewritten, changed ones are updated in place (reported as modified), and events no longer in the feed are deleted.
 
 **Response (201):**
 ```json
@@ -304,6 +308,10 @@ Get current SMTP configuration (password is never exposed).
 ### `PUT /api/calendars/:id/smtp`
 Create or update SMTP configuration. Passwords are encrypted with AES-256-GCM.
 
+- `encryption` must be `none`, `ssl` or `starttls` (empty: decided by port — `465` → `ssl`, otherwise `starttls`). `port` must be 1–65535 (default `587`). Otherwise `400`.
+- `password` may be omitted to keep the saved one, but only when `host`, `port` and `username` are unchanged; changing any of them requires the password again (`400`).
+- `reply_to` (optional) is sent as the `Reply-To` header of invitation emails.
+
 **Request:**
 ```json
 {
@@ -318,7 +326,9 @@ Create or update SMTP configuration. Passwords are encrypted with AES-256-GCM.
 ```
 
 ### `POST /api/calendars/:id/smtp/test`
-Verify SMTP server connectivity, handshake, and authentication.
+Verify SMTP server connectivity, handshake, and authentication (60 s limit). The authentication mechanism (PLAIN or LOGIN) is chosen from what the server advertises; credentials are never sent over an unencrypted connection to a non-localhost host.
+
+With no body the saved configuration is tested, and its `status` / `last_tested_at` / `last_error` are updated. With a body, the unsaved values are tested and the saved status is left alone; the saved password is reused only if `host`, `port` and `username` match the saved ones (otherwise send `password`). A failure returns `400` with a generic message; details are in the server log.
 
 **Request (Optional payload to test unsaved values):**
 ```json
@@ -346,14 +356,17 @@ Remove SMTP configuration for the calendar.
 
 ---
 
-## 8. Public 1-Click Web RSVP — `/api/scheduling/rsvp`
+## 8. Public Web RSVP — `/api/public/rsvp`
 
-Auth: **None (Protected by signed HMAC token)**
+Auth: **None (protected by a signed HMAC token)**. No app headers needed.
 
-Allows external email recipients (e.g. Gmail Web, Yahoo) to RSVP directly from email buttons.
+Lets email recipients (e.g. Gmail Web, Yahoo) answer an invitation from the buttons in a BYO SMTP invitation email. The token is signed with a key derived from `AUTH_JWT_SECRET`, names the event and the attendee, and is valid for 30 days or until a day after the event ends, whichever is later.
 
-### `GET /api/scheduling/rsvp?token=...&action=ACCEPTED|DECLINED|TENTATIVE`
-Renders a responsive RSVP confirmation landing page and dispatches realtime updates to the organizer.
+### `GET /api/public/rsvp?token=...[&action=ACCEPTED|DECLINED|TENTATIVE]`
+Only shows a page — it never records anything, so email security scanners that open links can't answer for the recipient. Without `action` the page offers Accept / Tentative / Decline; with `action` it asks to confirm that choice.
+
+### `POST /api/public/rsvp` (form fields `token`, `action`)
+Records the answer (sent by the page's buttons), updates the organizer's copy and other local attendees' copies, and shows a confirmation page. Invalid or expired token: `400`; unknown event or attendee: `404`.
 
 ---
 
@@ -598,7 +611,8 @@ All JSON field names match these models exactly.
 | `PUT` | `/api/calendars/:id/smtp` | Basic/JWT | Upsert calendar SMTP configuration |
 | `POST` | `/api/calendars/:id/smtp/test` | Basic/JWT | Test calendar SMTP connectivity |
 | `DELETE` | `/api/calendars/:id/smtp` | Basic/JWT | Delete calendar SMTP configuration |
-| `GET` | `/api/scheduling/rsvp` | None | Public 1-click web RSVP landing |
+| `GET` | `/api/public/rsvp` | Signed token | Public web RSVP page (shows choices / asks to confirm) |
+| `POST` | `/api/public/rsvp` | Signed token | Public web RSVP: records the answer |
 | `POST` | `/api/scheduling/rsvp` | Basic/JWT | In-app user RSVP endpoint |
 | `POST` | `/api/scheduling/incoming` | Basic/JWT | Inbound iMIP webhook (mail server) |
 
