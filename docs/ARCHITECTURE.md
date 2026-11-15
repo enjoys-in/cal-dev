@@ -35,12 +35,12 @@ CalDev is a high-performance, RFC-compliant calendar server written in Go (using
 ┌───────────────────────────────┐               ┌─────────────────────────────────┐
 │     PostgreSQL 16+ Store      │               │    Valkey / Redis (Port 6379)   │
 ├───────────────────────────────┤               ├─────────────────────────────────┤
-│ caldev.caldev_calendars       │               │ Job Queue (LPUSH / BRPOP):      │
-│ caldev.caldev_events          │               │  - Delayed Countdown Reminders  │
-│ caldev.caldev_changes         │               │  - Periodic 1h Window Sweeps    │
-│ caldev.caldev_reminder_deliv. │               │  - Scheduling Email Generation  │
-│ caldev.caldev_scheduling_msgs │               ├─────────────────────────────────┤
-│ caldev.caldev_subscriptions   │               │ Pub/Sub Channels:               │
+│ caldev_calendars              │               │ Job Queue (LPUSH / BRPOP):      │
+│ caldev_events                 │               │  - Delayed Countdown Reminders  │
+│ caldev_sync_changes           │               │  - Periodic 1h Window Sweeps    │
+│ caldev_reminder_deliv.        │               │  - Scheduling Email Generation  │
+│ caldev_scheduling_msgs        │               ├─────────────────────────────────┤
+│ caldev_subscriptions          │               │ Pub/Sub Channels:               │
 │ public.mail_accounts (shared) │               │  - `calendar:push` (Realtime)   │
 └───────────────────────────────┘               │  - `calendar:mail` (SMTP Relay) │
                                                 └────────────────┬────────────────┘

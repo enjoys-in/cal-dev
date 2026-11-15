@@ -8,18 +8,18 @@ This document provides complete endpoint specifications, authentication rules, J
 
 ## 1. Authentication
 
-Two methods are supported on all endpoints:
+| Method | Send | Accepted on | Used by |
+|---|---|---|---|
+| **JWT** | `Authorization: Bearer <jwt>` header or `access_token` cookie | every authenticated route | Frontend apps, JMAP clients |
+| **Basic Auth** | `Authorization: Basic base64(email:app-password)` | `/dav/*`, `/feeds/*`, `/.well-known/caldav` only | CalDAV clients, ICS feeds |
 
-| Method | Header | Used By |
-|---|---|---|
-| **JWT Bearer** | `Authorization: Bearer <jwt-token>` | Frontend apps, JMAP clients |
-| **Basic Auth** | `Authorization: Basic base64(email:app-password)` | CalDAV clients, ICS feeds |
+`/api/*` and `/jmap/*` accept only the JWT. A token in the URL (`?access_token=`) is accepted only on `/jmap/eventsource`. Onboarding and the admin routes have their own rules (§9).
 
-JWT tokens are validated using a shared `AUTH_JWT_SECRET` + `AUTH_JWT_ISSUER` (same as your mail/auth system). The JWT payload should contain `sub` (user UUID), `email`, and `mid` (the `mail_accounts.id` UUID used as tenant ID). The `mid` claim takes priority over `tenant_id` when both are present.
+JWT tokens are validated using a shared `AUTH_JWT_SECRET` + `AUTH_JWT_ISSUER` (same as your mail/auth system). The token's `email` identifies the user in `mail_accounts`; if a token has an email that isn't there it is refused, and the numeric `user_id`/`sub` is used only for tokens without an email. The `mid` and `tenant_id` claims are not used.
 
-Basic Auth requires an **app password** (not the login password). App passwords are managed via the `/api/app-passwords/` endpoints.
+Basic Auth requires an **app password** (not the login password). App passwords are managed via the `/api/app-passwords/` endpoints. 10 failed logins for one email within 15 minutes lock Basic Auth for that email for 15 minutes (`429` with `Retry-After`).
 
-All authenticated requests set `user_id`, `tenant_id`, and `email` in the request context. The `tenant_id` is the `mail_accounts.id` UUID, resolved via the X-Tenant-ID header, access_token cookie, or JWT `mid` claim. All data is scoped by `tenant_id` + `user_id`.
+All authenticated requests set `user_id`, `tenant_id`, and `email` in the request context, always from the authenticated account: `tenant_id == user_id ==` the integer `mail_accounts.id`. Headers such as `X-Tenant-ID` are ignored. All data is scoped by `tenant_id` + `user_id`.
 
 ---
 
@@ -55,7 +55,7 @@ No authentication required.
 
 ## 4. App Passwords — `/api/app-passwords/`
 
-Auth: **JWT Bearer** or **Basic Auth**
+Auth: **JWT** (`Authorization: Bearer` header or `access_token` cookie)
 
 ### `POST /api/app-passwords/`
 Create an app password for CalDAV/ICS Basic Auth.
@@ -89,7 +89,7 @@ Delete an app password.
 
 ## 5. Calendar Subscriptions — `/api/subscriptions/`
 
-Auth: **JWT Bearer** or **Basic Auth**
+Auth: **JWT** (`Authorization: Bearer` header or `access_token` cookie)
 
 Subscribe to external ICS feeds (Google Calendar, Outlook, any public `.ics` URL). Events are synced into a local read-only calendar.
 
@@ -233,7 +233,7 @@ Trigger an immediate sync. Runs synchronously and returns the updated subscripti
 
 ## 6. ICS Feeds — `/feeds/`
 
-Auth: **Basic Auth** (email + app password)
+Auth: **Basic Auth** (email + app password) or **JWT**
 
 Read-only ICS feeds for subscribing from Outlook, Google Calendar, Apple Calendar.
 
@@ -272,7 +272,7 @@ Merged ICS of all user's calendars. Supports `ETag` + `If-None-Match`.
 
 ## 7. Calendar BYO SMTP — `/api/calendars/:id/smtp`
 
-Auth: **JWT Bearer** or **Basic Auth**
+Auth: **JWT** (`Authorization: Bearer` header or `access_token` cookie)
 
 Manages Bring Your Own SMTP credentials per calendar collection.
 
@@ -370,7 +370,7 @@ Records the answer (sent by the page's buttons), updates the organizer's copy an
 
 ---
 
-## 8b. User Onboarding & API Keys
+## 9. User Onboarding & API Keys
 
 ### `POST /api/users/onboard` (same as `POST /api/calendar/onboard`)
 Creates the user's account if it doesn't exist yet and makes sure they have a default calendar. No app headers needed. Two ways to authenticate:
@@ -412,9 +412,9 @@ POST   /api/admin/users      {"email": "…", "name": "…"}   → onboard any e
 
 ---
 
-## 7. JMAP API — `/jmap/`
+## 10. JMAP API — `/jmap/`
 
-Auth: **JWT Bearer** or **Basic Auth**
+Auth: **JWT** (`Authorization: Bearer` header or `access_token` cookie)
 
 ### `GET /jmap/session`
 JMAP Session resource (RFC 8620 §2). Returns capabilities, accounts, API URLs.
@@ -484,7 +484,7 @@ JMAP API endpoint (RFC 8620 §3). Accepts batched method calls.
 
 ---
 
-## 8. CalDAV — `/dav/`
+## 11. CalDAV — `/dav/`
 
 Auth: **Basic Auth** (email + app password) or **JWT Bearer**
 
@@ -512,7 +512,7 @@ Full RFC 4791/4918 WebDAV/CalDAV implementation. Path structure:
 
 ---
 
-## 9. Data Models
+## 12. Data Models
 
 All JSON field names match these models exactly.
 
@@ -629,34 +629,34 @@ All JSON field names match these models exactly.
 
 ---
 
-## 10. Route Summary Table
+## 13. Route Summary Table
 
 | Method | Path | Auth | Description |
 |---|---|---|---|
 | `GET` | `/health` | None | Health check |
 | `ALL` | `/.well-known/caldav` | Basic/JWT | CalDAV discovery redirect |
 | `*` | `/dav/{tenant}/{user}/...` | Basic/JWT | CalDAV (WebDAV methods) |
-| `GET` | `/jmap/session` | Basic/JWT | JMAP session resource |
-| `POST` | `/jmap/api` | Basic/JWT | JMAP method calls |
+| `GET` | `/jmap/session` | JWT | JMAP session resource |
+| `POST` | `/jmap/api` | JWT | JMAP method calls |
 | `GET` | `/feeds/{tenant}/{user}/` | Basic/JWT | ICS feed index (JSON) |
 | `GET` | `/feeds/{tenant}/{user}/{cal}.ics` | Basic/JWT | Single calendar ICS feed |
 | `GET` | `/feeds/{tenant}/{user}/all.ics` | Basic/JWT | Merged ICS feed |
-| `POST` | `/api/app-passwords/` | Basic/JWT | Create app password |
-| `DELETE` | `/api/app-passwords/:id` | Basic/JWT | Delete app password |
-| `GET` | `/api/subscriptions/` | Basic/JWT | List subscriptions |
-| `POST` | `/api/subscriptions/` | Basic/JWT | Create subscription |
-| `GET` | `/api/subscriptions/:id` | Basic/JWT | Get subscription |
-| `PUT` | `/api/subscriptions/:id` | Basic/JWT | Update subscription |
-| `DELETE` | `/api/subscriptions/:id` | Basic/JWT | Delete subscription |
-| `POST` | `/api/subscriptions/:id/sync` | Basic/JWT | Trigger manual sync |
-| `GET` | `/api/calendars/:id/smtp` | Basic/JWT | Get calendar SMTP configuration |
-| `PUT` | `/api/calendars/:id/smtp` | Basic/JWT | Upsert calendar SMTP configuration |
-| `POST` | `/api/calendars/:id/smtp/test` | Basic/JWT | Test calendar SMTP connectivity |
-| `DELETE` | `/api/calendars/:id/smtp` | Basic/JWT | Delete calendar SMTP configuration |
+| `POST` | `/api/app-passwords/` | JWT | Create app password |
+| `DELETE` | `/api/app-passwords/:id` | JWT | Delete app password |
+| `GET` | `/api/subscriptions/` | JWT | List subscriptions |
+| `POST` | `/api/subscriptions/` | JWT | Create subscription |
+| `GET` | `/api/subscriptions/:id` | JWT | Get subscription |
+| `PUT` | `/api/subscriptions/:id` | JWT | Update subscription |
+| `DELETE` | `/api/subscriptions/:id` | JWT | Delete subscription |
+| `POST` | `/api/subscriptions/:id/sync` | JWT | Trigger manual sync |
+| `GET` | `/api/calendars/:id/smtp` | JWT | Get calendar SMTP configuration |
+| `PUT` | `/api/calendars/:id/smtp` | JWT | Upsert calendar SMTP configuration |
+| `POST` | `/api/calendars/:id/smtp/test` | JWT | Test calendar SMTP connectivity |
+| `DELETE` | `/api/calendars/:id/smtp` | JWT | Delete calendar SMTP configuration |
 | `GET` | `/api/public/rsvp` | Signed token | Public web RSVP page (shows choices / asks to confirm) |
 | `POST` | `/api/public/rsvp` | Signed token | Public web RSVP: records the answer |
-| `POST` | `/api/scheduling/rsvp` | Basic/JWT | In-app user RSVP endpoint |
-| `POST` | `/api/scheduling/incoming` | Basic/JWT | Inbound iMIP webhook (mail server) |
+| `POST` | `/api/scheduling/rsvp` | JWT | In-app user RSVP endpoint |
+| `POST` | `/api/scheduling/incoming` | JWT | Inbound iMIP webhook (mail server) |
 | `POST` | `/api/users/onboard`, `/api/calendar/onboard` | JWT (own email) or `X-API-Key` (key's domain) | Create account + default calendar |
 | `GET` | `/api/api-keys` | JWT | List your onboarding API keys |
 | `POST` | `/api/api-keys` | JWT | Create an onboarding API key (shown once) |
@@ -668,7 +668,7 @@ All JSON field names match these models exactly.
 
 ---
 
-## 11. Error Responses
+## 14. Error Responses
 
 All REST API errors follow this format:
 ```json
@@ -692,6 +692,11 @@ Common HTTP status codes:
 - `304` — Not Modified (ETag match on feeds)
 - `400` — Bad Request (validation error)
 - `401` — Unauthorized (missing or invalid credentials)
+- `403` — Forbidden (e.g. onboarding outside your scope, read-only calendar, suspended account)
 - `404` — Not Found
-- `429` — Too Many Requests (rate limited)
+- `409` — Conflict (e.g. too many API keys)
+- `412` — Precondition Failed (CalDAV `If-Match` / `If-None-Match`)
+- `413` — Request body too large (10 MB, also after decompression)
+- `415` — Unsupported `Content-Encoding`
+- `429` — Too Many Requests (rate limited, or Basic Auth locked after failed logins)
 - `500` — Internal Server Error

@@ -35,12 +35,12 @@ Supports Apple Calendar, Thunderbird, Google Calendar interop, and modern JMAP c
 ┌───────────────────────────────┐               ┌─────────────────────────────────┐
 │     PostgreSQL 16+ Store      │               │    Valkey / Redis (Port 6379)   │
 ├───────────────────────────────┤               ├─────────────────────────────────┤
-│ caldev.caldev_calendars       │               │ Job Queue (LPUSH / BRPOP):      │
-│ caldev.caldev_events          │               │  - Delayed Countdown Reminders  │
-│ caldev.caldev_changes         │               │  - Periodic 1h Window Sweeps    │
-│ caldev.caldev_reminder_deliv. │               │  - Scheduling Email Generation  │
-│ caldev.caldev_scheduling_msgs │               ├─────────────────────────────────┤
-│ caldev.caldev_subscriptions   │               │ Pub/Sub Channels:               │
+│ caldev_calendars              │               │ Job Queue (LPUSH / BRPOP):      │
+│ caldev_events                 │               │  - Delayed Countdown Reminders  │
+│ caldev_sync_changes           │               │  - Periodic 1h Window Sweeps    │
+│ caldev_reminder_deliv.        │               │  - Scheduling Email Generation  │
+│ caldev_scheduling_msgs        │               ├─────────────────────────────────┤
+│ caldev_subscriptions          │               │ Pub/Sub Channels:               │
 │ public.mail_accounts (shared) │               │  - `calendar:push` (Realtime)   │
 └───────────────────────────────┘               │  - `calendar:mail` (SMTP Relay) │
                                                 └────────────────┬────────────────┘
@@ -134,7 +134,7 @@ cal-dev/
 
 ## Prerequisites
 
-- Go 1.22+
+- Go 1.24+
 - PostgreSQL 16+
 - Valkey 8+ (or Redis 7+ — wire-compatible)
 - Your existing `public.mail_accounts` table with columns: `id (INTEGER PK)`, `email`, `name`
@@ -256,7 +256,7 @@ POST /api/users/onboard   (alias: /api/calendar/onboard)   {"email": "...", "nam
   Authorization: Bearer <jwt>  → AirSend apps: onboards only the token's own email
   X-API-Key: cdk_...           → external services: onboards users of the key's email domain
 ```
-Creates the account if needed and its default calendar. Every onboarding sets `tenant_name` to the email's domain, also for an existing account (overwriting any previous value). Suspended accounts are not reactivated (`403`). Keys are created once-visible and stored hashed: by an admin via `POST /api/admin/api-keys` (any owner email) or by a signed-in user via `POST /api/api-keys` (their own domain; not for public webmail domains). See [API Reference §8b](docs/API_REFERENCE.md).
+Creates the account if needed and its default calendar. Every onboarding sets `tenant_name` to the email's domain, also for an existing account (overwriting any previous value). Suspended accounts are not reactivated (`403`). Keys are created once-visible and stored hashed: by an admin via `POST /api/admin/api-keys` (any owner email) or by a signed-in user via `POST /api/api-keys` (their own domain; not for public webmail domains). See [API Reference §9](docs/API_REFERENCE.md).
 
 ### ICS Feeds (Outlook, Google, Apple subscription)
 ```
@@ -423,9 +423,7 @@ Outlook does **not** support CalDAV natively. Use the ICS feed subscription:
 > **Note:** This is **read-only** — Outlook will poll for changes but cannot create/edit events through this method. For full read-write CalDAV sync, use the [CalDav Synchronizer](https://caldavsynchronizer.org/) Outlook plugin.
 
 ### Google Calendar (ICS Feed)
-1. Click **+** next to "Other calendars" → **From URL**
-2. Paste: `http://user:password@yourserver:8443/feeds/{tenant}/{user}/{calendar}.ics`
-3. Click **Add calendar**
+Not supported at the moment: feeds require authentication, and Google Calendar's **From URL** can't send credentials (it fetches anonymously from Google's servers), so the subscription fails. Use a CalDAV-capable client instead.
 
 ## Background Jobs (Valkey)
 
