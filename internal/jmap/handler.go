@@ -70,7 +70,7 @@ func (h *Handler) Session(c *fiber.Ctx) error {
 				"supportsAvailability": h.avail != nil,
 				"supportsScheduling":   true,
 				"maxCalendarsPerEvent": 1,
-				"maxAttendeesPerEvent": 1000,
+				"maxAttendeesPerEvent": models.MaxAttendeesPerEvent,
 			},
 		},
 		Accounts: map[string]interface{}{
@@ -283,6 +283,18 @@ func (h *Handler) calendarEventSet(c *fiber.Ctx, tenantID, userID int, call *JMA
 	// Handle creates
 	for tempID, props := range args.Create {
 		evt := jmapToEvent(props, tenantID, userID)
+
+		// Enforce maximum attendees per event limit
+		var createAtts []models.Attendee
+		if len(evt.Attendees) > 0 {
+			if err := json.Unmarshal(evt.Attendees, &createAtts); err == nil && len(createAtts) > models.MaxAttendeesPerEvent {
+				notCreated[tempID] = map[string]string{
+					"type":        "invalidProperties",
+					"description": fmt.Sprintf("Event exceeds maximum limit of %d attendees", models.MaxAttendeesPerEvent),
+				}
+				continue
+			}
+		}
 		// An event with attendees needs an organizer or scheduling is skipped entirely and nobody is
 		// invited. The creator is the organizer; never trust an organizer sent by the client.
 		evt.Organizer = ""
@@ -414,6 +426,18 @@ func (h *Handler) calendarEventSet(c *fiber.Ctx, tenantID, userID int, call *JMA
 		// applyJMAPUpdates reassigns fields rather than mutating shared slices).
 		oldEvt := *evt
 		applyJMAPUpdates(evt, props)
+
+		// Enforce maximum attendees per event limit
+		var updateAtts []models.Attendee
+		if len(evt.Attendees) > 0 {
+			if err := json.Unmarshal(evt.Attendees, &updateAtts); err == nil && len(updateAtts) > models.MaxAttendeesPerEvent {
+				notUpdated[id] = map[string]string{
+					"type":        "invalidProperties",
+					"description": fmt.Sprintf("Event exceeds maximum limit of %d attendees", models.MaxAttendeesPerEvent),
+				}
+				continue
+			}
+		}
 
 		// Zone: an explicit timeZone always applies; the calendar-zone fallback only applies when
 		// this update actually changes the recurrence rule, never on an unrelated edit (or a save
@@ -1149,7 +1173,7 @@ func parseJMAPParticipants(props map[string]interface{}) (json.RawMessage, bool)
 				if expectReply, ok := pMap["expectReply"].(bool); ok {
 					a.RSVP = expectReply
 				}
-				if a.Email != "" {
+				if a.Email != "" && len(attendees) < models.MaxAttendeesPerEvent {
 					attendees = append(attendees, a)
 				}
 			}

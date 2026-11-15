@@ -278,7 +278,12 @@ JMAP Session resource (RFC 8620 §2). Returns capabilities, accounts, API URLs.
 {
   "capabilities": {
     "urn:ietf:params:jmap:core": { ... },
-    "urn:ietf:params:jmap:calendars": { ... }
+    "urn:ietf:params:jmap:calendars": {
+      "supportsScheduling": true,
+      "supportsAvailability": true,
+      "maxCalendarsPerEvent": 1,
+      "maxAttendeesPerEvent": 3000
+    }
   },
   "accounts": {
     "{tenant}:{user}": {
@@ -316,7 +321,7 @@ JMAP API endpoint (RFC 8620 §3). Accepts batched method calls.
 - `Calendar/get` — Get calendars
 - `Calendar/set` — Create/update/delete calendars
 - `CalendarEvent/get` — Get events by ID
-- `CalendarEvent/set` — Create/update/delete events
+- `CalendarEvent/set` — Create/update/delete events (maximum 3,000 attendees per event; requests exceeding 3,000 return `invalidProperties`)
 - `CalendarEvent/query` — Query events with filters
 - `CalendarEvent/changes` — Get changes since a sync state
 

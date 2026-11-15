@@ -174,6 +174,10 @@ via `calendar:push` channel.                                     │
    - CalDev creates an RFC 5545 iMIP payload (`REQUEST`, `REPLY`, or `CANCEL`).
    - Recorded in `caldev_scheduling_messages` with status `pending`.
    - Published to Redis Pub/Sub channel `calendar:mail` for pickup by the SMTP delivery service.
+3. **Attendee Capacity & Limits**:
+   - CalDev enforces an explicit limit of **3,000 attendees / recipients** per event (`MaxAttendeesPerEvent = 3000`).
+   - Any JMAP `CalendarEvent/set` or CalDAV `PUT` containing more than 3,000 attendees is rejected with a `400 Bad Request` (`invalidProperties`).
+   - The reminder daemon and fan-out scheduler protect worker queues by strictly bounding recipient fan-out to 3,000 participants.
 
 ---
 

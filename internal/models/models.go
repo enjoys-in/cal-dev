@@ -173,6 +173,9 @@ type EventFilter struct {
 	Offset         int
 }
 
+// MaxAttendeesPerEvent defines the maximum supported attendees/recipients per calendar event.
+const MaxAttendeesPerEvent = 3000
+
 // Attendee represents a calendar event attendee.
 type Attendee struct {
 	Email       string `json:"email"`

@@ -42,6 +42,10 @@ func (svc *Service) ProcessEvent(ctx context.Context, event *models.Event, metho
 		return nil
 	}
 
+	if len(attendees) > models.MaxAttendeesPerEvent {
+		attendees = attendees[:models.MaxAttendeesPerEvent]
+	}
+
 	// Verify organizer matches the authenticated event owner to prevent organizer spoofing
 	if event.UserID != 0 {
 		user, err := svc.store.GetUserByID(ctx, event.UserID)

@@ -604,6 +604,7 @@ Important details:
 
 | Topic | Behaviour |
 |---|---|
+| Attendees per event | ≤ 3,000 attendees / recipients per event; rejected with `400 invalidProperties` if exceeded |
 | Streams | 10 per account; closed after 30 min; one `retry:` hint of 5 s |
 | Availability | ≤ 62 days per query, ≤ 50 emails; recurring series expanded up to 1000 occurrences per event |
 | Shared calendar events | ≤ 366 days, ≤ 2000 events per call |

@@ -454,6 +454,16 @@ func (h *Handler) Put(c *fiber.Ctx) error {
 		return c.Status(400).SendString("Failed to parse ICS: " + err.Error())
 	}
 
+	// Enforce maximum attendees limit
+	for _, comp := range components {
+		var atts []models.Attendee
+		if len(comp.Attendees) > 0 {
+			if err := json.Unmarshal(comp.Attendees, &atts); err == nil && len(atts) > models.MaxAttendeesPerEvent {
+				return c.Status(400).SendString(fmt.Sprintf("Event exceeds maximum limit of %d attendees", models.MaxAttendeesPerEvent))
+			}
+		}
+	}
+
 	// Override UID from path if provided
 	if uid != "" {
 		for _, comp := range components {

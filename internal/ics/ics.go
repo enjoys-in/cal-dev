@@ -278,8 +278,10 @@ func parseComponent(lines []string, kind string, tenantID, userID int, calendarI
 		case "ORGANIZER":
 			e.Organizer = extractCalAddress(value)
 		case "ATTENDEE":
-			attendee := parseAttendee(value, params)
-			attendees = append(attendees, attendee)
+			if len(attendees) < models.MaxAttendeesPerEvent {
+				attendee := parseAttendee(value, params)
+				attendees = append(attendees, attendee)
+			}
 		case "CATEGORIES":
 			e.Categories = strings.Split(value, ",")
 		case "PRIORITY":
@@ -915,6 +917,9 @@ func ValidateICS(raw string) error {
 	}
 	if !strings.Contains(raw, "BEGIN:VEVENT") && !strings.Contains(raw, "BEGIN:VTODO") && !strings.Contains(raw, "BEGIN:VJOURNAL") {
 		return fmt.Errorf("no calendar component found (VEVENT/VTODO/VJOURNAL)")
+	}
+	if strings.Count(raw, "\nATTENDEE") > models.MaxAttendeesPerEvent {
+		return fmt.Errorf("event exceeds maximum limit of %d attendees", models.MaxAttendeesPerEvent)
 	}
 	return nil
 }

@@ -83,6 +83,9 @@ func (svc *Service) resolveRecipients(ctx context.Context, event *models.Event) 
 
 	out := make([]ReminderRecipient, 0, len(recipients))
 	for _, r := range recipients {
+		if len(out) >= models.MaxAttendeesPerEvent {
+			break
+		}
 		out = append(out, r)
 	}
 	return out
