@@ -497,6 +497,7 @@ func (h *Handler) Put(c *fiber.Ctx) error {
 	// Scheduling: invite/update/cancel attendees (organizer edit) or reply to the organizer (attendee edit)
 	if h.scheduling != nil {
 		go func() {
+			_ = h.scheduling.ScheduleEventReminders(context.Background(), event)
 			if err := h.scheduling.ProcessUpdate(context.Background(), event, existing); err != nil {
 				log.Printf("caldav: scheduling ProcessUpdate error: %v", err)
 			}

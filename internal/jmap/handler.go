@@ -350,10 +350,11 @@ func (h *Handler) calendarEventSet(c *fiber.Ctx, tenantID, userID int, call *JMA
 			"etag": evt.ETag,
 		}
 
-		// Send invitation emails to attendees
+		// Send invitation emails to attendees and schedule reminders on-demand
 		if h.scheduling != nil {
 			evtCopy := evt
 			go func() {
+				_ = h.scheduling.ScheduleEventReminders(context.Background(), evtCopy)
 				if err := h.scheduling.ProcessEvent(context.Background(), evtCopy, "REQUEST"); err != nil {
 					log.Printf("jmap: scheduling ProcessEvent error: %v", err)
 				}
@@ -445,11 +446,12 @@ func (h *Handler) calendarEventSet(c *fiber.Ctx, tenantID, userID int, call *JMA
 		}
 		updated[id] = nil
 
-		// Send update notification to attendees
+		// Send update notification to attendees and reschedule reminders on-demand
 		if h.scheduling != nil {
 			evtCopy := evt
 			oldCopy := oldEvt
 			go func() {
+				_ = h.scheduling.ScheduleEventReminders(context.Background(), evtCopy)
 				if err := h.scheduling.ProcessUpdate(context.Background(), evtCopy, &oldCopy); err != nil {
 					log.Printf("jmap: scheduling ProcessUpdate error: %v", err)
 				}

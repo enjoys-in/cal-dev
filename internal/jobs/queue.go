@@ -19,6 +19,8 @@ const (
 	JobCleanupLocks        = "cleanup_locks"
 	JobCleanupJobHistory   = "cleanup_job_history"
 	JobSyncNotification    = "sync_notification"
+	JobCalendarReminder    = "calendar_reminder"
+	JobSweepReminders      = "sweep_reminders"
 )
 
 // Job represents a unit of work dispatched to Valkey.

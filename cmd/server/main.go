@@ -75,6 +75,7 @@ func main() {
 		"migrations/001_init.sql",
 		"migrations/002_sharing_realtime.sql",
 		"migrations/003_recurrence_overrides.sql",
+		"migrations/004_reminders.sql",
 	}
 	for _, mf := range migrationFiles {
 		sqlBytes, err := os.ReadFile(mf)
@@ -125,6 +126,8 @@ func main() {
 
 	// Register job handlers
 	worker.Register(jobs.JobSendSchedulingEmail, schedulingSvc.HandleSendEmailJob)
+	worker.Register(jobs.JobCalendarReminder, schedulingSvc.HandleCalendarReminderJob)
+	worker.Register(jobs.JobSweepReminders, schedulingSvc.HandleSweepRemindersJob)
 	worker.Register(jobs.JobCleanupLocks, func(ctx context.Context, job *jobs.Job) error {
 		return db.CleanupExpiredLocks(ctx)
 	})

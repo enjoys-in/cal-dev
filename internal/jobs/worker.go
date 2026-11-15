@@ -184,10 +184,28 @@ func (w *Worker) maintenanceLoop(ctx context.Context) {
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
 
+	// 1-hour ticker for rolling 24-hour reminder sweep [NOW(), NOW() + 24h]
+	hourlyTicker := time.NewTicker(1 * time.Hour)
+	defer hourlyTicker.Stop()
+
+	// Initial sweep on startup
+	if _, ok := w.handlers[JobSweepReminders]; ok {
+		if _, err := w.queue.Enqueue(ctx, JobSweepReminders, nil); err != nil {
+			log.Printf("worker: failed to enqueue initial reminder sweep: %v", err)
+		}
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case <-hourlyTicker.C:
+			// Enqueue 1-hour sweep for calendar reminders
+			if _, ok := w.handlers[JobSweepReminders]; ok {
+				if _, err := w.queue.Enqueue(ctx, JobSweepReminders, nil); err != nil {
+					log.Printf("worker: failed to enqueue hourly reminder sweep: %v", err)
+				}
+			}
 		case <-ticker.C:
 			// Cleanup expired locks
 			if _, ok := w.handlers[JobCleanupLocks]; ok {
