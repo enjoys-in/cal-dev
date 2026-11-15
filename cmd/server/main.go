@@ -80,6 +80,7 @@ func main() {
 		"migrations/005_calendar_byo_smtp.sql",
 		"migrations/006_change_log_fixes.sql",
 		"migrations/007_onboarding_api_keys.sql",
+		"migrations/008_mail_accounts_email_lower.sql",
 	}
 	// A missing or failed migration stops startup: running on a partial schema breaks later features.
 	for _, mf := range migrationFiles {

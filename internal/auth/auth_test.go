@@ -141,3 +141,24 @@ func TestTooManyAttemptsError(t *testing.T) {
 		t.Fatal("errors.Is must match ErrTooManyAttempts")
 	}
 }
+
+func TestUserCache(t *testing.T) {
+	s := &Service{}
+	if _, ok := s.cachedUser("bob@x.com"); ok {
+		t.Fatal("empty cache returned a hit")
+	}
+	s.rememberUser("bob@x.com", ResolvedAuth{UserID: 7, TenantID: 7, Email: "bob@x.com"})
+	r, ok := s.cachedUser("bob@x.com")
+	if !ok || r.UserID != 7 || r.TenantID != 7 {
+		t.Fatalf("cached = %+v, %v", r, ok)
+	}
+	// An expired entry is not returned.
+	s.userMu.Lock()
+	e := s.userCache["bob@x.com"]
+	e.expires = time.Now().Add(-time.Second)
+	s.userCache["bob@x.com"] = e
+	s.userMu.Unlock()
+	if _, ok := s.cachedUser("bob@x.com"); ok {
+		t.Fatal("expired entry returned")
+	}
+}

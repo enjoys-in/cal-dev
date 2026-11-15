@@ -124,7 +124,10 @@ cal-dev/
 │   ├── 004_reminders.sql            # Reminder deliveries deduplication table
 │   ├── 005_calendar_byo_smtp.sql    # Per-calendar BYO SMTP settings
 │   ├── 006_change_log_fixes.sql     # Change log: calendar delete/move, ordered ids
-│   └── 007_onboarding_api_keys.sql  # Onboarding API keys (hashed, domain-scoped)
+│   ├── 007_onboarding_api_keys.sql  # Onboarding API keys (hashed, domain-scoped)
+│   └── 008_mail_accounts_email_lower.sql # Index for case-insensitive account lookups
+├── schema/
+│   └── full_init.sql            # The whole schema (migrations 001-008) in one file, for new databases
 ├── build.sh                     # Automated build, stop-old, run-new deployment
 ├── run.sh                       # Quick run script
 ├── docker-compose.yml           # PostgreSQL + Valkey + CalDev
@@ -181,6 +184,14 @@ cp .env.example .env
 # and startup stops if one is missing or fails)
 ./caldev
 ```
+
+**Optional — new empty database in one step.** Instead of letting the server run the migrations one by one, load the whole schema first. It records migrations 001–008 as applied, so the server then runs only newer ones:
+
+```bash
+psql -U caldev -d caldev -v ON_ERROR_STOP=1 -f schema/full_init.sql
+```
+
+`schema/full_init.sql` is checked against the migrations (the schema it creates is identical to running 001–008 in order) and is safe to run again. When you add a migration, update it too and add the new filename to its `caldev_migrations` list. It also fixes one gap for standalone setups: it creates `mail_accounts` with the `password` column that onboarding writes (the table migration 001 creates lacks it; your real mail system's table has it).
 
 ### 3. Demo Mode (no external dependencies)
 

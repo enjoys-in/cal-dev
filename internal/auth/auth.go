@@ -30,7 +30,24 @@ type Service struct {
 	basicCache map[[32]byte]basicEntry // recent successful Basic logins, keyed by sha256(email, password)
 	touched    map[string]time.Time    // app password id -> last last_used_at update
 	fails      map[string]failEntry    // lower-cased email -> recent failed Basic logins
+
+	userMu    sync.Mutex
+	userCache map[string]userEntry // lower-cased, trimmed email -> active account (JWT logins)
 }
+
+// userEntry is a cached JWT account lookup.
+type userEntry struct {
+	resolved ResolvedAuth
+	expires  time.Time
+}
+
+const (
+	// JWT logins look up mail_accounts by email on every request; this in-process cache skips that
+	// query. Only active accounts are cached, so a suspended or deleted account is refused at most
+	// this long after the change.
+	userCacheTTL = 60 * time.Second
+	userCacheMax = 10000 // entries; the cache is reset beyond this
+)
 
 // failEntry counts failed Basic logins for one email.
 type failEntry struct {
@@ -443,10 +460,14 @@ type ResolvedAuth struct {
 func (s *Service) ResolveUserFromToken(ctx context.Context, claims *Claims) (*ResolvedAuth, error) {
 	var user *models.User
 	var err error
+	email := strings.ToLower(strings.TrimSpace(claims.Email))
 
-	// 1. Try by email first (most common identifier in tokens)
-	if claims.Email != "" {
-		user, err = s.store.GetUserByEmail(ctx, claims.Email)
+	// 1. Try by email first (most common identifier in tokens), from the cache when possible
+	if email != "" {
+		if r, ok := s.cachedUser(email); ok {
+			return &r, nil
+		}
+		user, err = s.store.GetUserByEmail(ctx, email)
 		if err != nil {
 			return nil, fmt.Errorf("auth: user resolve by email error: %w", err)
 		}
@@ -454,7 +475,7 @@ func (s *Service) ResolveUserFromToken(ctx context.Context, claims *Claims) (*Re
 
 	// 2. Fall back to user ID / subject, only for tokens without an email: an unknown email must
 	// not be mapped onto whatever local account happens to have the same numeric id.
-	if user == nil && claims.Email == "" && claims.UserID != "" {
+	if user == nil && email == "" && claims.UserID != "" {
 		uid, parseErr := strconv.Atoi(claims.UserID)
 		if parseErr == nil {
 			user, err = s.store.GetUserByID(ctx, uid)
@@ -473,11 +494,36 @@ func (s *Service) ResolveUserFromToken(ctx context.Context, claims *Claims) (*Re
 
 	// Always use canonical values from mail_accounts
 	// tenant_id == user.ID (mail_accounts has no tenant_id)
-	return &ResolvedAuth{
+	resolved := ResolvedAuth{
 		UserID:   user.ID,
 		TenantID: user.ID,
 		Email:    user.Email,
-	}, nil
+	}
+	if email != "" {
+		s.rememberUser(email, resolved)
+	}
+	return &resolved, nil
+}
+
+// cachedUser returns a still-valid cached JWT account lookup for a normalized email.
+func (s *Service) cachedUser(email string) (ResolvedAuth, bool) {
+	s.userMu.Lock()
+	defer s.userMu.Unlock()
+	e, ok := s.userCache[email]
+	if !ok || time.Now().After(e.expires) {
+		return ResolvedAuth{}, false
+	}
+	return e.resolved, true
+}
+
+// rememberUser caches an active account for userCacheTTL.
+func (s *Service) rememberUser(email string, r ResolvedAuth) {
+	s.userMu.Lock()
+	defer s.userMu.Unlock()
+	if s.userCache == nil || len(s.userCache) >= userCacheMax {
+		s.userCache = make(map[string]userEntry)
+	}
+	s.userCache[email] = userEntry{resolved: r, expires: time.Now().Add(userCacheTTL)}
 }
 
 // ConstantTimeCompare performs constant-time string comparison.

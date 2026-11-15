@@ -84,6 +84,9 @@ func (s *Store) RecordMigration(filename string) error {
 // ============================================================
 
 func (s *Store) GetUserByEmail(ctx context.Context, email string) (*models.User, error) {
+	// Emails are stored lower-case in practice, so the normalized address usually matches on the
+	// unique email index in one query.
+	email = strings.ToLower(strings.TrimSpace(email))
 	u := &models.User{}
 	query := `SELECT id, COALESCE(name, '') as name, email, COALESCE(tenant_name, '') as tenant_name,
 		COALESCE(status, 'ACTIVE') as status, COALESCE(type, 'USER') as type, created_at, updated_at
@@ -91,9 +94,9 @@ func (s *Store) GetUserByEmail(ctx context.Context, email string) (*models.User,
 	err := s.db.QueryRowContext(ctx, query, email).
 		Scan(&u.ID, &u.Name, &u.Email, &u.TenantName, &u.Status, &u.Type, &u.CreatedAt, &u.UpdatedAt)
 	if err == sql.ErrNoRows {
-		// Emails are case-insensitive in practice: retry ignoring case (the exact match above stays index-friendly).
-		ciQuery := strings.Replace(query, "WHERE email = $1", "WHERE lower(email) = lower($1)", 1) + " ORDER BY id LIMIT 1"
-		err = s.db.QueryRowContext(ctx, ciQuery, strings.TrimSpace(email)).
+		// A row stored with capitals: retry ignoring case (uses idx_mail_accounts_email_lower, migration 008).
+		ciQuery := strings.Replace(query, "WHERE email = $1", "WHERE lower(email) = $1", 1) + " ORDER BY id LIMIT 1"
+		err = s.db.QueryRowContext(ctx, ciQuery, email).
 			Scan(&u.ID, &u.Name, &u.Email, &u.TenantName, &u.Status, &u.Type, &u.CreatedAt, &u.UpdatedAt)
 		if err == sql.ErrNoRows {
 			return nil, nil
