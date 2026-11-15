@@ -41,14 +41,6 @@ func (h *Handler) CalendarFeed(c *fiber.Ctx) error {
 		return c.Status(404).SendString("Calendar not found")
 	}
 
-	// Get all events in the calendar
-	events, err := h.store.GetResourcesByCalendar(c.UserContext(), tenantID, calendarID)
-	if err != nil {
-		return c.Status(500).SendString("Internal server error")
-	}
-
-	ics := buildCalendarICS(cal, events)
-
 	// Caching headers — Outlook polls every few hours
 	etag := computeFeedETag(cal.CTag)
 	c.Set("Content-Type", "text/calendar; charset=utf-8")
@@ -58,14 +50,21 @@ func (h *Handler) CalendarFeed(c *fiber.Ctx) error {
 	c.Set("X-WR-CALNAME", cal.Name)
 	c.Set("X-WR-CALDESC", cal.Description)
 
-	// Conditional GET support — if client sends If-None-Match
+	// Conditional GET support — if client sends If-None-Match. The ETag only depends on the
+	// ctag, so answer before loading and serialising every event.
 	if match := c.Get("If-None-Match"); match != "" {
 		if strings.Trim(match, `"`) == etag {
 			return c.SendStatus(304)
 		}
 	}
 
-	return c.SendString(ics)
+	// Get all events in the calendar
+	events, err := h.store.GetResourcesByCalendar(c.UserContext(), tenantID, calendarID)
+	if err != nil {
+		return c.Status(500).SendString("Internal server error")
+	}
+
+	return c.SendString(buildCalendarICS(cal, events))
 }
 
 // AllCalendarsFeed returns a merged .ics feed of ALL calendars for a user.
@@ -78,6 +77,18 @@ func (h *Handler) AllCalendarsFeed(c *fiber.Ctx) error {
 	calendars, err := h.store.GetCalendarsByUser(c.UserContext(), tenantID, userID)
 	if err != nil {
 		return c.Status(500).SendString("Internal server error")
+	}
+
+	// The ETag only depends on the ctags: answer If-None-Match before loading any event.
+	allCtags := make([]string, 0, len(calendars))
+	for _, cal := range calendars {
+		allCtags = append(allCtags, cal.CTag)
+	}
+	if match := c.Get("If-None-Match"); match != "" {
+		if etag := computeFeedETag(strings.Join(allCtags, ":")); strings.Trim(match, `"`) == etag {
+			c.Set("ETag", fmt.Sprintf(`"%s"`, etag))
+			return c.SendStatus(304)
+		}
 	}
 
 	// Collect all events across calendars

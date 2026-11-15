@@ -1,8 +1,14 @@
 package middleware
 
 import (
+	"bytes"
+	"compress/flate"
+	"compress/gzip"
+	"crypto/subtle"
 	"errors"
+	"io"
 	"log"
+	"math"
 	"os"
 	"strconv"
 	"strings"
@@ -48,11 +54,21 @@ func RateLimiter(maxRequests int, window time.Duration) fiber.Handler {
 	}
 	clients := make(map[string]*client)
 	var mu sync.Mutex
+	lastPrune := time.Now()
 
 	return func(c *fiber.Ctx) error {
 		ip := c.IP()
 
 		mu.Lock()
+		// Drop idle clients once per window so the map doesn't grow with every IP ever seen.
+		if time.Since(lastPrune) > window {
+			for k, v := range clients {
+				if time.Since(v.lastSeen) > window {
+					delete(clients, k)
+				}
+			}
+			lastPrune = time.Now()
+		}
 		cl, exists := clients[ip]
 		if !exists {
 			clients[ip] = &client{count: 1, lastSeen: time.Now()}
@@ -134,6 +150,9 @@ func DAVAuth(authSvc *auth.Service, s *store.Store) fiber.Handler {
 
 		// Try Basic Auth (email + app-password)
 		if strings.HasPrefix(authHeader, "Basic ") {
+			if !authSvc.BasicAuthEnabled() { // AUTH_BASIC_ENABLED=false turns app-password login off
+				return c.Status(401).SendString("Basic authentication is disabled")
+			}
 			result, err := auth.ParseBasicAuth(authHeader)
 			if err != nil || !result.Valid {
 				c.Set("WWW-Authenticate", `Basic realm="CalDAV Server"`)
@@ -141,6 +160,11 @@ func DAVAuth(authSvc *auth.Service, s *store.Store) fiber.Handler {
 			}
 
 			userID, tenantID, err := authSvc.AuthenticateBasic(c.UserContext(), result.Email, result.Password)
+			var locked *auth.TooManyAttemptsError
+			if errors.As(err, &locked) { // too many failed logins for this email
+				c.Set("Retry-After", strconv.Itoa(int(math.Ceil(locked.RetryAfter.Seconds()))))
+				return c.Status(fiber.StatusTooManyRequests).SendString("Too many failed login attempts")
+			}
 			if err != nil {
 				c.Set("WWW-Authenticate", `Basic realm="CalDAV Server"`)
 				return c.Status(401).SendString("Invalid credentials")
@@ -176,8 +200,9 @@ func JMAPAuth(authSvc *auth.Service, s *store.Store) fiber.Handler {
 			token = c.Cookies("access_token")
 		}
 
-		// 3. Fall back to query parameter (for browser EventSource / SSE)
-		if token == "" {
+		// 3. Fall back to query parameter, only for the browser EventSource stream (it can't set
+		// headers). Elsewhere a token in the URL would end up in proxy and access logs.
+		if token == "" && c.Path() == "/jmap/eventsource" {
 			token = c.Query("access_token")
 			if token == "" {
 				token = c.Query("token")
@@ -224,12 +249,43 @@ func rejectBearer(c *fiber.Ctx, stage string, err error, email string) (code, ms
 	return code, msg
 }
 
-// XMLSizeLimit limits XML request body size.
+// XMLSizeLimit limits request body size, including after decompression. c.Body() would inflate a
+// compressed body with no limit (a small gzip "bomb" can expand to gigabytes), so gzip/deflate
+// bodies are decoded here with a cap and replaced by the plain bytes; other encodings are refused.
 func XMLSizeLimit(maxSize int) fiber.Handler {
 	return func(c *fiber.Ctx) error {
-		if len(c.Body()) > maxSize {
+		enc := strings.ToLower(strings.TrimSpace(c.Get(fiber.HeaderContentEncoding)))
+		raw := c.Request().Body()
+		if enc == "" || enc == "identity" {
+			if len(raw) > maxSize {
+				return c.Status(413).SendString("Request body too large")
+			}
+			return c.Next()
+		}
+
+		var r io.ReadCloser
+		var err error
+		switch enc {
+		case "gzip", "x-gzip":
+			r, err = gzip.NewReader(bytes.NewReader(raw))
+		case "deflate":
+			r = flate.NewReader(bytes.NewReader(raw))
+		default:
+			return c.Status(415).SendString("Unsupported Content-Encoding")
+		}
+		if err != nil {
+			return c.Status(400).SendString("Invalid compressed body")
+		}
+		defer r.Close()
+		plain, err := io.ReadAll(io.LimitReader(r, int64(maxSize)+1))
+		if err != nil {
+			return c.Status(400).SendString("Invalid compressed body")
+		}
+		if len(plain) > maxSize {
 			return c.Status(413).SendString("Request body too large")
 		}
+		c.Request().SetBody(plain)
+		c.Request().Header.Del(fiber.HeaderContentEncoding)
 		return c.Next()
 	}
 }
@@ -289,7 +345,7 @@ func APIKeyAuth(apiKey string) fiber.Handler {
 		if key == "" {
 			return c.Status(401).JSON(fiber.Map{"error": "API key required"})
 		}
-		if key != apiKey {
+		if !secretEqual(key, apiKey) {
 			return c.Status(403).JSON(fiber.Map{"error": "Invalid API key"})
 		}
 		return c.Next()
@@ -309,6 +365,7 @@ func AppHeaders(appCfg *config.AppConfig) fiber.Handler {
 		if path == "/health" || strings.HasPrefix(path, "/.well-known/") ||
 			strings.HasPrefix(path, "/dav/") || strings.HasPrefix(path, "/feeds/") ||
 			path == "/jmap/eventsource" ||
+			path == "/api/public/rsvp" || // opened from an email by people outside the app
 			strings.HasPrefix(path, "/api/calendar/onboard") ||
 			strings.HasPrefix(path, "/api/users/onboard") {
 			return c.Next()
@@ -316,7 +373,7 @@ func AppHeaders(appCfg *config.AppConfig) fiber.Handler {
 
 		// Validate x-api-key
 		if appCfg.APIKey != "" {
-			if key := c.Get("x-api-key"); key != appCfg.APIKey {
+			if key := c.Get("x-api-key"); !secretEqual(key, appCfg.APIKey) {
 				return c.Status(401).JSON(fiber.Map{"error": "Invalid or missing x-api-key"})
 			}
 		}
@@ -337,7 +394,7 @@ func AppHeaders(appCfg *config.AppConfig) fiber.Handler {
 
 		// Validate x-signature
 		if appCfg.Signature != "" {
-			if sig := c.Get("x-signature"); sig != appCfg.Signature {
+			if sig := c.Get("x-signature"); !secretEqual(sig, appCfg.Signature) {
 				return c.Status(401).JSON(fiber.Map{"error": "Invalid or missing x-signature"})
 			}
 		}
@@ -376,24 +433,37 @@ func isAllowedOrigin(origin string) bool {
 		return true
 	}
 
-	// Allow any localhost and 127.0.0.1 port in dev
-	if strings.HasPrefix(origin, "http://localhost:") ||
+	// Allow any localhost and 127.0.0.1 port in dev only (no public URL configured, or a localhost
+	// one). In production any page on the visitor's machine could otherwise make credentialed calls.
+	if isDevServer() && (strings.HasPrefix(origin, "http://localhost:") ||
 		strings.HasPrefix(origin, "https://localhost:") ||
 		strings.HasPrefix(origin, "http://127.0.0.1:") ||
-		strings.HasPrefix(origin, "https://127.0.0.1:") {
+		strings.HasPrefix(origin, "https://127.0.0.1:")) {
 		return true
 	}
 
-	// Custom allowed origins from environment variable
-	if custom := os.Getenv("CORS_ALLOWED_ORIGINS"); custom != "" {
-		for _, o := range strings.Split(custom, ",") {
-			if strings.TrimSpace(o) == origin {
-				return true
-			}
+	// Custom allowed origins from environment variable (parsed once)
+	return customOrigins()[origin]
+}
+
+var customOrigins = sync.OnceValue(func() map[string]bool {
+	m := map[string]bool{}
+	for _, o := range strings.Split(os.Getenv("CORS_ALLOWED_ORIGINS"), ",") {
+		if o = strings.TrimSpace(o); o != "" {
+			m[o] = true
 		}
 	}
+	return m
+})
 
-	return false
+var isDevServer = sync.OnceValue(func() bool {
+	u := os.Getenv("CALDEV_PUBLIC_URL")
+	return u == "" || strings.Contains(u, "://localhost") || strings.Contains(u, "://127.0.0.1")
+})
+
+// secretEqual compares a supplied secret with the expected one in constant time.
+func secretEqual(got, want string) bool {
+	return subtle.ConstantTimeCompare([]byte(got), []byte(want)) == 1
 }
 
 // CORSHeaders adds CORS headers for JMAP endpoints.

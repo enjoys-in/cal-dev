@@ -3,11 +3,13 @@ package ics
 import (
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"regexp"
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/enjoys-in/cal-dev/internal/models"
 	"github.com/google/uuid"
@@ -95,10 +97,15 @@ func ParseICSAll(rawICS string, tenantID, userID int, calendarID string) ([]*mod
 	var items []parsed
 	if len(blocks) == 0 {
 		// No component at all: keep the historic lenient behaviour (one default event).
-		items = append(items, parsed{e: parseComponent(nil, "VEVENT", tenantID, userID, calendarID)})
+		e, _ := parseComponent(nil, "VEVENT", tenantID, userID, calendarID)
+		items = append(items, parsed{e: e})
 	}
 	for _, blk := range blocks {
-		items = append(items, parsed{e: parseComponent(blk.lines, blk.kind, tenantID, userID, calendarID), blk: blk})
+		e, err := parseComponent(blk.lines, blk.kind, tenantID, userID, calendarID)
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, parsed{e: e, blk: blk})
 	}
 
 	// Every component of a resource must carry the same UID (RFC 4791 §4.1).
@@ -160,7 +167,8 @@ func normalizeRecurrenceID(value string, params map[string]string) string {
 }
 
 // parseComponent parses the property lines of one VEVENT/VTODO (without its BEGIN/END).
-func parseComponent(lines []string, kind string, tenantID, userID int, calendarID string) *models.Event {
+// It fails when DTSTART or DTEND holds a value that is not a valid date or date-time.
+func parseComponent(lines []string, kind string, tenantID, userID int, calendarID string) (*models.Event, error) {
 	e := &models.Event{
 		ID:             uuid.New().String(),
 		TenantID:       tenantID,
@@ -181,6 +189,7 @@ func parseComponent(lines []string, kind string, tenantID, userID int, calendarI
 	var alarms []Alarm
 	var currentAlarm Alarm
 	var exdates []string
+	var exdateLocs []*time.Location // TZID of each EXDATE value, nil when it has none
 	var rdates []string
 	var tzidName string
 
@@ -229,6 +238,9 @@ func parseComponent(lines []string, kind string, tenantID, userID int, calendarI
 			e.Location = unescapeICS(value)
 		case "DTSTART":
 			dt, allDay := parseDateTime(value, params)
+			if dt.IsZero() {
+				return nil, fmt.Errorf("invalid DTSTART value %q", value)
+			}
 			e.DTStart = dt
 			e.AllDay = allDay
 			if tz, ok := params["TZID"]; ok {
@@ -238,24 +250,23 @@ func parseComponent(lines []string, kind string, tenantID, userID int, calendarI
 			}
 		case "DTEND":
 			dt, _ := parseDateTime(value, params)
+			if dt.IsZero() {
+				return nil, fmt.Errorf("invalid DTEND value %q", value)
+			}
 			e.DTEnd = &dt
 		case "DURATION":
-			e.Duration = value
-			if e.DTEnd == nil && !e.DTStart.IsZero() {
-				if d := parseDurationString(value); d > 0 {
-					dt := e.DTStart.Add(d)
-					e.DTEnd = &dt
-				}
-			}
+			e.Duration = value // DTEND is derived from it after all properties are read
 		case "RRULE":
 			e.RecurrenceRule = value
 		case "RECURRENCE-ID":
 			e.RecurrenceID = normalizeRecurrenceID(value, params)
 		case "EXDATE":
+			loc, _ := ResolveTZID(params["TZID"])
 			for _, ed := range strings.Split(value, ",") {
 				ed = strings.TrimSpace(ed)
 				if ed != "" {
 					exdates = append(exdates, ed)
+					exdateLocs = append(exdateLocs, loc)
 				}
 			}
 		case "RDATE":
@@ -283,7 +294,7 @@ func parseComponent(lines []string, kind string, tenantID, userID int, calendarI
 				attendees = append(attendees, attendee)
 			}
 		case "CATEGORIES":
-			e.Categories = strings.Split(value, ",")
+			e.Categories = splitTextList(value)
 		case "PRIORITY":
 			if n := parseInt(value); n >= 0 {
 				e.Priority = n
@@ -300,6 +311,23 @@ func parseComponent(lines []string, kind string, tenantID, userID int, calendarI
 
 	if e.DTStamp.IsZero() {
 		e.DTStamp = time.Now().UTC()
+	}
+
+	// Stored EXDATEs carry no TZID and local values are read in the series' zone, so a local value
+	// in another zone than DTSTART's is pinned to UTC.
+	for i, loc := range exdateLocs {
+		if loc != nil && loc.String() != tzidName {
+			if t, err := time.ParseInLocation(ICSDateTimeLocal, exdates[i], loc); err == nil {
+				exdates[i] = t.UTC().Format(ICSDateTimeUTC)
+			}
+		}
+	}
+
+	if e.Duration != "" && e.DTEnd == nil && !e.DTStart.IsZero() {
+		if d := parseDurationString(e.Duration); d > 0 {
+			dt := e.DTStart.Add(d)
+			e.DTEnd = &dt
+		}
 	}
 
 	if len(attendees) > 0 {
@@ -325,7 +353,7 @@ func parseComponent(lines []string, kind string, tenantID, userID int, calendarI
 			e.Properties = json.RawMessage(b)
 		}
 	}
-	return e
+	return e, nil
 }
 
 // GenerateICS generates a valid ICS string from an Event.
@@ -401,7 +429,10 @@ func FinalizeResource(events []*models.Event) []*models.Event {
 }
 
 // writeComponent writes one VEVENT/VTODO (without the VCALENDAR wrapper).
-func writeComponent(b *strings.Builder, e *models.Event) {
+func writeComponent(out *strings.Builder, e *models.Event) {
+	b := &strings.Builder{}
+	defer func() { out.WriteString(foldLines(b.String())) }()
+
 	compType := e.ComponentType
 	if compType == "" {
 		compType = "VEVENT"
@@ -470,7 +501,7 @@ func writeComponent(b *strings.Builder, e *models.Event) {
 		if !strings.HasPrefix(strings.ToLower(org), "mailto:") {
 			org = "mailto:" + org
 		}
-		b.WriteString(fmt.Sprintf("ORGANIZER:%s\r\n", org))
+		b.WriteString(fmt.Sprintf("ORGANIZER:%s\r\n", stripLineBreaks(org)))
 	}
 	if e.Sequence > 0 {
 		b.WriteString(fmt.Sprintf("SEQUENCE:%d\r\n", e.Sequence))
@@ -479,13 +510,17 @@ func writeComponent(b *strings.Builder, e *models.Event) {
 		b.WriteString(fmt.Sprintf("PRIORITY:%d\r\n", e.Priority))
 	}
 	if e.URL != "" {
-		b.WriteString(fmt.Sprintf("URL:%s\r\n", e.URL))
+		b.WriteString(fmt.Sprintf("URL:%s\r\n", stripLineBreaks(e.URL)))
 	}
 	if e.Geo != "" {
 		b.WriteString(fmt.Sprintf("GEO:%s\r\n", e.Geo))
 	}
 	if len(e.Categories) > 0 {
-		b.WriteString(fmt.Sprintf("CATEGORIES:%s\r\n", strings.Join(e.Categories, ",")))
+		cats := make([]string, len(e.Categories))
+		for i, c := range e.Categories {
+			cats[i] = escapeICS(c)
+		}
+		b.WriteString(fmt.Sprintf("CATEGORIES:%s\r\n", strings.Join(cats, ",")))
 	}
 
 	// Write attendees
@@ -581,7 +616,7 @@ func GenerateSchedulingICS(e *models.Event, method string) string {
 		if !strings.HasPrefix(strings.ToLower(org), "mailto:") {
 			org = "mailto:" + org
 		}
-		b.WriteString(fmt.Sprintf("ORGANIZER:%s\r\n", org))
+		b.WriteString(fmt.Sprintf("ORGANIZER:%s\r\n", stripLineBreaks(org)))
 	}
 	b.WriteString(fmt.Sprintf("SEQUENCE:%d\r\n", e.Sequence))
 	status := e.Status
@@ -602,7 +637,7 @@ func GenerateSchedulingICS(e *models.Event, method string) string {
 	b.WriteString("END:VEVENT\r\n")
 	b.WriteString("END:VCALENDAR\r\n")
 
-	return b.String()
+	return foldLines(b.String())
 }
 
 // generateETag creates a stable ETag from ICS content.
@@ -750,20 +785,104 @@ func parseDurationString(durStr string) time.Duration {
 
 // windowsTZ maps common Windows time zone names to IANA names.
 var windowsTZ = map[string]string{
-	"India Standard Time":       "Asia/Kolkata",
-	"Eastern Standard Time":     "America/New_York",
-	"Central Standard Time":     "America/Chicago",
-	"Pacific Standard Time":     "America/Los_Angeles",
-	"Mountain Standard Time":    "America/Denver",
-	"GMT Standard Time":         "Europe/London",
-	"W. Europe Standard Time":   "Europe/Berlin",
-	"Romance Standard Time":     "Europe/Paris",
-	"China Standard Time":       "Asia/Shanghai",
-	"Tokyo Standard Time":       "Asia/Tokyo",
-	"AUS Eastern Standard Time": "Australia/Sydney",
+	"Dateline Standard Time":          "Etc/GMT+12",
+	"UTC-11":                          "Etc/GMT+11",
+	"Hawaiian Standard Time":          "Pacific/Honolulu",
+	"Alaskan Standard Time":           "America/Anchorage",
+	"Pacific Standard Time (Mexico)":  "America/Tijuana",
+	"Pacific Standard Time":           "America/Los_Angeles",
+	"US Mountain Standard Time":       "America/Phoenix",
+	"Mountain Standard Time (Mexico)": "America/Mazatlan",
+	"Mountain Standard Time":          "America/Denver",
+	"Central America Standard Time":   "America/Guatemala",
+	"Central Standard Time":           "America/Chicago",
+	"Central Standard Time (Mexico)":  "America/Mexico_City",
+	"Canada Central Standard Time":    "America/Regina",
+	"SA Pacific Standard Time":        "America/Bogota",
+	"Eastern Standard Time":           "America/New_York",
+	"US Eastern Standard Time":        "America/Indiana/Indianapolis",
+	"Venezuela Standard Time":         "America/Caracas",
+	"Atlantic Standard Time":          "America/Halifax",
+	"SA Western Standard Time":        "America/La_Paz",
+	"Pacific SA Standard Time":        "America/Santiago",
+	"Newfoundland Standard Time":      "America/St_Johns",
+	"E. South America Standard Time":  "America/Sao_Paulo",
+	"Argentina Standard Time":         "America/Argentina/Buenos_Aires",
+	"SA Eastern Standard Time":        "America/Cayenne",
+	"Montevideo Standard Time":        "America/Montevideo",
+	"Paraguay Standard Time":          "America/Asuncion",
+	"UTC-02":                          "Etc/GMT+2",
+	"Azores Standard Time":            "Atlantic/Azores",
+	"Cape Verde Standard Time":        "Atlantic/Cape_Verde",
+	"GMT Standard Time":               "Europe/London",
+	"Greenwich Standard Time":         "Atlantic/Reykjavik",
+	"Morocco Standard Time":           "Africa/Casablanca",
+	"W. Europe Standard Time":         "Europe/Berlin",
+	"Central Europe Standard Time":    "Europe/Budapest",
+	"Romance Standard Time":           "Europe/Paris",
+	"Central European Standard Time":  "Europe/Warsaw",
+	"W. Central Africa Standard Time": "Africa/Lagos",
+	"Namibia Standard Time":           "Africa/Windhoek",
+	"GTB Standard Time":               "Europe/Bucharest",
+	"E. Europe Standard Time":         "Europe/Chisinau",
+	"FLE Standard Time":               "Europe/Kiev",
+	"Middle East Standard Time":       "Asia/Beirut",
+	"Egypt Standard Time":             "Africa/Cairo",
+	"South Africa Standard Time":      "Africa/Johannesburg",
+	"Israel Standard Time":            "Asia/Jerusalem",
+	"Kaliningrad Standard Time":       "Europe/Kaliningrad",
+	"Jordan Standard Time":            "Asia/Amman",
+	"Turkey Standard Time":            "Europe/Istanbul",
+	"Arab Standard Time":              "Asia/Riyadh",
+	"Arabic Standard Time":            "Asia/Baghdad",
+	"Belarus Standard Time":           "Europe/Minsk",
+	"Russian Standard Time":           "Europe/Moscow",
+	"E. Africa Standard Time":         "Africa/Nairobi",
+	"Iran Standard Time":              "Asia/Tehran",
+	"Arabian Standard Time":           "Asia/Dubai",
+	"Azerbaijan Standard Time":        "Asia/Baku",
+	"Georgian Standard Time":          "Asia/Tbilisi",
+	"Caucasus Standard Time":          "Asia/Yerevan",
+	"Afghanistan Standard Time":       "Asia/Kabul",
+	"West Asia Standard Time":         "Asia/Tashkent",
+	"Ekaterinburg Standard Time":      "Asia/Yekaterinburg",
+	"Pakistan Standard Time":          "Asia/Karachi",
+	"India Standard Time":             "Asia/Kolkata",
+	"Sri Lanka Standard Time":         "Asia/Colombo",
+	"Nepal Standard Time":             "Asia/Kathmandu",
+	"Central Asia Standard Time":      "Asia/Almaty",
+	"Bangladesh Standard Time":        "Asia/Dhaka",
+	"Myanmar Standard Time":           "Asia/Yangon",
+	"SE Asia Standard Time":           "Asia/Bangkok",
+	"N. Central Asia Standard Time":   "Asia/Novosibirsk",
+	"North Asia Standard Time":        "Asia/Krasnoyarsk",
+	"China Standard Time":             "Asia/Shanghai",
+	"North Asia East Standard Time":   "Asia/Irkutsk",
+	"Singapore Standard Time":         "Asia/Singapore",
+	"W. Australia Standard Time":      "Australia/Perth",
+	"Taipei Standard Time":            "Asia/Taipei",
+	"Ulaanbaatar Standard Time":       "Asia/Ulaanbaatar",
+	"Tokyo Standard Time":             "Asia/Tokyo",
+	"Korea Standard Time":             "Asia/Seoul",
+	"Yakutsk Standard Time":           "Asia/Yakutsk",
+	"Cen. Australia Standard Time":    "Australia/Adelaide",
+	"AUS Central Standard Time":       "Australia/Darwin",
+	"E. Australia Standard Time":      "Australia/Brisbane",
+	"AUS Eastern Standard Time":       "Australia/Sydney",
+	"West Pacific Standard Time":      "Pacific/Port_Moresby",
+	"Tasmania Standard Time":          "Australia/Hobart",
+	"Vladivostok Standard Time":       "Asia/Vladivostok",
+	"UTC+12":                          "Etc/GMT-12",
+	"New Zealand Standard Time":       "Pacific/Auckland",
+	"Fiji Standard Time":              "Pacific/Fiji",
+	"Tonga Standard Time":             "Pacific/Tongatapu",
+	"Samoa Standard Time":             "Pacific/Apia",
+	"Line Islands Standard Time":      "Pacific/Kiritimati",
 }
 
 // ResolveTZID resolves an iCalendar TZID value (IANA or common Windows name) to a location.
+// Vendor-prefixed names such as "/mozilla.org/20050126_1/America/New_York" resolve to their
+// trailing IANA name.
 func ResolveTZID(tzid string) (*time.Location, bool) {
 	tzid = strings.Trim(strings.TrimSpace(tzid), "\"")
 	tzid = strings.TrimPrefix(tzid, "/")
@@ -774,10 +893,18 @@ func ResolveTZID(tzid string) (*time.Location, bool) {
 		tzid = mapped
 	}
 	loc, err := time.LoadLocation(tzid)
-	if err != nil {
-		return nil, false
+	if err == nil {
+		return loc, true
 	}
-	return loc, true
+	// Try ever shorter "/"-separated suffixes, longest first.
+	for i := strings.Index(tzid, "/"); i >= 0; {
+		tzid = tzid[i+1:]
+		if loc, err := time.LoadLocation(tzid); err == nil && strings.Contains(tzid, "/") {
+			return loc, true
+		}
+		i = strings.Index(tzid, "/")
+	}
+	return nil, false
 }
 
 // parseDateTime parses ICS date/datetime values.
@@ -816,7 +943,7 @@ func parseDateTime(value string, params map[string]string) (time.Time, bool) {
 		return t, true
 	}
 
-	return time.Now().UTC(), false
+	return time.Time{}, false // not a date or date-time: callers treat the zero time as invalid
 }
 
 // parseInt parses a string to int, returning -1 on error.
@@ -873,7 +1000,14 @@ func parseAttendee(value string, params map[string]string) models.Attendee {
 func formatAttendee(a models.Attendee) string {
 	var parts []string
 	if a.DisplayName != "" {
-		parts = append(parts, fmt.Sprintf("CN=\"%s\"", a.DisplayName))
+		// A quoted parameter value may not contain DQUOTE, CR or LF (RFC 5545 §3.1).
+		cn := strings.Map(func(r rune) rune {
+			if r == '"' || r == '\r' || r == '\n' {
+				return -1
+			}
+			return r
+		}, a.DisplayName)
+		parts = append(parts, fmt.Sprintf("CN=\"%s\"", cn))
 	}
 	parts = append(parts, fmt.Sprintf("ROLE=%s", a.Role))
 	parts = append(parts, fmt.Sprintf("PARTSTAT=%s", a.Status))
@@ -885,27 +1019,97 @@ func formatAttendee(a models.Attendee) string {
 	}
 
 	paramStr := strings.Join(parts, ";")
-	return fmt.Sprintf("ATTENDEE;%s:mailto:%s\r\n", paramStr, a.Email)
+	return fmt.Sprintf("ATTENDEE;%s:mailto:%s\r\n", paramStr, stripLineBreaks(a.Email))
+}
+
+// stripLineBreaks removes CR and LF from a non-TEXT value (a URI or cal-address) so it cannot
+// break out of its content line.
+func stripLineBreaks(s string) string {
+	return strings.NewReplacer("\r", "", "\n", "").Replace(s)
+}
+
+// foldLines folds every CRLF-terminated content line longer than 75 octets (RFC 5545 §3.1),
+// never splitting a UTF-8 sequence.
+func foldLines(s string) string {
+	var b strings.Builder
+	for _, line := range strings.SplitAfter(s, "\r\n") {
+		body := strings.TrimSuffix(line, "\r\n")
+		eol := line[len(body):]
+		limit := 75
+		for len(body) > limit {
+			cut := limit
+			for cut > 0 && !utf8.RuneStart(body[cut]) {
+				cut--
+			}
+			b.WriteString(body[:cut])
+			b.WriteString("\r\n ")
+			body = body[cut:]
+			limit = 74 // continuation lines start with a space
+		}
+		b.WriteString(body)
+		b.WriteString(eol)
+	}
+	return b.String()
 }
 
 // escapeICS escapes special characters for ICS text.
 func escapeICS(s string) string {
 	s = strings.ReplaceAll(s, "\\", "\\\\")
+	s = strings.ReplaceAll(s, "\r\n", "\n")
+	s = strings.ReplaceAll(s, "\r", "\n")
 	s = strings.ReplaceAll(s, "\n", "\\n")
 	s = strings.ReplaceAll(s, ";", "\\;")
 	s = strings.ReplaceAll(s, ",", "\\,")
 	return s
 }
 
-// unescapeICS reverses ICS escaping.
+// unescapeICS reverses ICS escaping in a single left-to-right pass, so "\\n" is a backslash
+// followed by "n", not a newline.
 func unescapeICS(s string) string {
-	s = strings.ReplaceAll(s, "\\n", "\n")
-	s = strings.ReplaceAll(s, "\\N", "\n")
-	s = strings.ReplaceAll(s, "\\;", ";")
-	s = strings.ReplaceAll(s, "\\,", ",")
-	s = strings.ReplaceAll(s, "\\\\", "\\")
-	return s
+	if !strings.Contains(s, "\\") {
+		return s
+	}
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		if s[i] != '\\' || i+1 == len(s) {
+			b.WriteByte(s[i])
+			continue
+		}
+		i++
+		switch s[i] {
+		case 'n', 'N':
+			b.WriteByte('\n')
+		case '\\', ';', ',':
+			b.WriteByte(s[i])
+		default:
+			b.WriteByte('\\')
+			b.WriteByte(s[i])
+		}
+	}
+	return b.String()
 }
+
+// splitTextList splits a multi-valued TEXT property (e.g. CATEGORIES) on unescaped commas and
+// unescapes each value.
+func splitTextList(s string) []string {
+	var out []string
+	start := 0
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\\' {
+			i++
+			continue
+		}
+		if s[i] == ',' {
+			out = append(out, unescapeICS(s[start:i]))
+			start = i + 1
+		}
+	}
+	return append(out, unescapeICS(s[start:]))
+}
+
+// ErrUnsupportedComponent is returned by ValidateICS for a calendar object whose component type
+// is not stored (VJOURNAL): CalDAV answers it with the supported-calendar-component precondition.
+var ErrUnsupportedComponent = errors.New("unsupported calendar component (only VEVENT and VTODO are supported)")
 
 // ValidateICS performs basic validation of an ICS string.
 func ValidateICS(raw string) error {
@@ -915,8 +1119,11 @@ func ValidateICS(raw string) error {
 	if !strings.Contains(raw, "END:VCALENDAR") {
 		return fmt.Errorf("missing END:VCALENDAR")
 	}
-	if !strings.Contains(raw, "BEGIN:VEVENT") && !strings.Contains(raw, "BEGIN:VTODO") && !strings.Contains(raw, "BEGIN:VJOURNAL") {
-		return fmt.Errorf("no calendar component found (VEVENT/VTODO/VJOURNAL)")
+	if strings.Contains(raw, "BEGIN:VJOURNAL") {
+		return ErrUnsupportedComponent
+	}
+	if !strings.Contains(raw, "BEGIN:VEVENT") && !strings.Contains(raw, "BEGIN:VTODO") {
+		return fmt.Errorf("no calendar component found (VEVENT/VTODO)")
 	}
 	if strings.Count(raw, "\nATTENDEE") > models.MaxAttendeesPerEvent {
 		return fmt.Errorf("event exceeds maximum limit of %d attendees", models.MaxAttendeesPerEvent)

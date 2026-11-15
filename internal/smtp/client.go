@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/smtp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -21,6 +22,13 @@ type Config struct {
 	ReplyTo    string
 	Encryption string // "none", "ssl", "starttls"
 }
+
+// ErrConnect wraps SendMessage failures to connect, start TLS or authenticate,
+// i.e. problems with the SMTP configuration rather than with one message.
+var ErrConnect = errors.New("smtp connect/auth failed")
+
+// connDeadline bounds the whole SMTP conversation (greeting, TLS, auth, data).
+const connDeadline = 60 * time.Second
 
 // loginAuth implements smtp.Auth for the LOGIN SASL mechanism.
 type loginAuth struct {
@@ -59,8 +67,17 @@ func Dial(cfg *Config) (*smtp.Client, error) {
 	if port <= 0 {
 		port = 587
 	}
-	addr := fmt.Sprintf("%s:%d", cfg.Host, port)
+	addr := net.JoinHostPort(cfg.Host, strconv.Itoa(port))
 	enc := strings.ToLower(cfg.Encryption)
+	// Port-based defaults only apply when no encryption was chosen explicitly.
+	if enc == "" {
+		switch port {
+		case 465:
+			enc = "ssl"
+		case 587:
+			enc = "starttls"
+		}
+	}
 
 	var (
 		c   *smtp.Client
@@ -68,7 +85,7 @@ func Dial(cfg *Config) (*smtp.Client, error) {
 	)
 
 	// Implicit SSL/TLS (typically port 465)
-	if enc == "ssl" || port == 465 {
+	if enc == "ssl" {
 		tlsConfig := &tls.Config{
 			ServerName: cfg.Host,
 		}
@@ -76,6 +93,8 @@ func Dial(cfg *Config) (*smtp.Client, error) {
 		if dialErr != nil {
 			return nil, fmt.Errorf("tls.Dial to %s: %w", addr, dialErr)
 		}
+		// Overall deadline so a server that never answers cannot hang the caller.
+		_ = conn.SetDeadline(time.Now().Add(connDeadline))
 		c, err = smtp.NewClient(conn, cfg.Host)
 		if err != nil {
 			conn.Close()
@@ -87,6 +106,8 @@ func Dial(cfg *Config) (*smtp.Client, error) {
 		if dialErr != nil {
 			return nil, fmt.Errorf("net.Dial to %s: %w", addr, dialErr)
 		}
+		// Overall deadline so a server that never answers cannot hang the caller.
+		_ = conn.SetDeadline(time.Now().Add(connDeadline))
 		c, err = smtp.NewClient(conn, cfg.Host)
 		if err != nil {
 			conn.Close()
@@ -94,7 +115,7 @@ func Dial(cfg *Config) (*smtp.Client, error) {
 		}
 
 		// Upgrade to TLS via STARTTLS if supported/configured
-		if enc == "starttls" || port == 587 {
+		if enc == "starttls" {
 			if ok, _ := c.Extension("STARTTLS"); ok {
 				tlsConfig := &tls.Config{
 					ServerName: cfg.Host,
@@ -112,18 +133,45 @@ func Dial(cfg *Config) (*smtp.Client, error) {
 
 	// Authenticate if credentials are provided
 	if cfg.Username != "" && cfg.Password != "" {
-		auth := smtp.PlainAuth("", cfg.Username, cfg.Password, cfg.Host)
-		if err := c.Auth(auth); err != nil {
-			// Fall back to LOGIN authentication if PLAIN fails
-			login := LoginAuth(cfg.Username, cfg.Password)
-			if loginErr := c.Auth(login); loginErr != nil {
+		// Pick the mechanism from the server's advertised AUTH list. (net/smtp's Client.Auth
+		// closes the connection on failure, so a retry with another mechanism is not possible.)
+		_, mechs := c.Extension("AUTH")
+		mechList := strings.Fields(strings.ToUpper(mechs))
+		var auth smtp.Auth
+		switch {
+		case hasMech(mechList, "PLAIN"):
+			auth = smtp.PlainAuth("", cfg.Username, cfg.Password, cfg.Host)
+		case hasMech(mechList, "LOGIN"):
+			// Same rule as smtp.PlainAuth: never send credentials in clear text to a remote host.
+			if _, isTLS := c.TLSConnectionState(); !isTLS && !isLocalhost(cfg.Host) {
 				c.Close()
-				return nil, fmt.Errorf("smtp authentication failed: %w (fallback: %v)", err, loginErr)
+				return nil, errors.New("smtp: refusing LOGIN authentication over an unencrypted connection")
 			}
+			auth = LoginAuth(cfg.Username, cfg.Password)
+		default:
+			c.Close()
+			return nil, fmt.Errorf("smtp: server does not advertise a supported AUTH mechanism (PLAIN or LOGIN)")
+		}
+		if err := c.Auth(auth); err != nil {
+			c.Close()
+			return nil, fmt.Errorf("smtp authentication failed: %w", err)
 		}
 	}
 
 	return c, nil
+}
+
+func hasMech(mechs []string, name string) bool {
+	for _, m := range mechs {
+		if m == name {
+			return true
+		}
+	}
+	return false
+}
+
+func isLocalhost(host string) bool {
+	return host == "localhost" || host == "127.0.0.1" || host == "::1"
 }
 
 // TestConnection attempts to connect, perform TLS handshake, and authenticate against the SMTP server.
@@ -140,7 +188,7 @@ func TestConnection(cfg *Config) error {
 func SendMessage(cfg *Config, to string, rawMIME []byte) error {
 	client, err := Dial(cfg)
 	if err != nil {
-		return fmt.Errorf("dial: %w", err)
+		return fmt.Errorf("%w: %w", ErrConnect, err)
 	}
 	defer client.Close()
 
@@ -170,5 +218,7 @@ func SendMessage(cfg *Config, to string, rawMIME []byte) error {
 		return fmt.Errorf("data close: %w", err)
 	}
 
-	return client.Quit()
+	// The message was accepted; a failing QUIT must not trigger a duplicate resend.
+	_ = client.Quit()
+	return nil
 }

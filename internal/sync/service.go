@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/enjoys-in/cal-dev/internal/ics"
@@ -59,22 +60,53 @@ func ValidateSubscriptionURL(rawURL string) error {
 	}
 
 	ips, err := net.LookupIP(hostname)
-	if err == nil {
-		for _, ip := range ips {
-			if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified() {
-				return fmt.Errorf("access to internal address %s is forbidden", ip.String())
-			}
+	if err != nil {
+		return fmt.Errorf("cannot resolve %s: %w", hostname, err)
+	}
+	for _, ip := range ips {
+		if isInternalIP(ip) {
+			return fmt.Errorf("access to internal address %s is forbidden", ip.String())
 		}
 	}
 	return nil
 }
 
+func isInternalIP(ip net.IP) bool {
+	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified()
+}
+
+// NormalizeSubscriptionURL rewrites webcal:// (which net/http cannot fetch) to https://.
+func NormalizeSubscriptionURL(rawURL string) string {
+	rawURL = strings.TrimSpace(rawURL)
+	if len(rawURL) >= 9 && strings.EqualFold(rawURL[:9], "webcal://") {
+		return "https://" + rawURL[9:]
+	}
+	return rawURL
+}
+
+// safeDialControl runs on the address actually being dialed (after DNS resolution), so a host
+// that resolves to an internal address at fetch time is refused even if it passed validation
+// earlier (DNS rebinding).
+func safeDialControl(network, address string, _ syscall.RawConn) error {
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		return err
+	}
+	if ip := net.ParseIP(host); ip == nil || isInternalIP(ip) {
+		return fmt.Errorf("access to internal address %s is forbidden", host)
+	}
+	return nil
+}
+
 func NewService(s *store.Store, q *jobs.Queue) *Service {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.DialContext = (&net.Dialer{Timeout: FetchTimeout, Control: safeDialControl}).DialContext
 	return &Service{
 		store: s,
 		queue: q,
 		client: &http.Client{
-			Timeout: FetchTimeout,
+			Timeout:   FetchTimeout,
+			Transport: transport,
 			CheckRedirect: func(req *http.Request, via []*http.Request) error {
 				if len(via) > 5 {
 					return fmt.Errorf("too many redirects")
@@ -138,10 +170,14 @@ func (s *Service) SyncSubscription(ctx context.Context, sub *models.CalendarSubs
 		return err
 	}
 
-	// Replace all events: delete old ones, insert new ones
-	// This is the simplest and most reliable approach for external subscriptions
-	if err := s.store.DeleteEventsByCalendar(ctx, sub.TenantID, sub.CalendarID); err != nil {
-		syncErr := fmt.Sprintf("delete old events: %v", err)
+	// Replace all events in one transaction: readers never see the calendar empty, and
+	// overlapping syncs of the same calendar (scheduler, SyncNow, first sync) run one at a time.
+	skipped := make(map[*models.Event]bool)
+	if err := s.store.ReplaceCalendarEvents(ctx, sub.TenantID, sub.CalendarID, events, func(e *models.Event, err error) {
+		log.Printf("sync: failed to import event %s: %v", e.UID, err)
+		skipped[e] = true
+	}); err != nil {
+		syncErr := fmt.Sprintf("replace events: %v", err)
 		_ = s.store.UpdateSubscriptionSyncState(ctx, sub.ID, sub.LastETag, sub.EventsCount, syncErr)
 		return err
 	}
@@ -149,8 +185,7 @@ func (s *Service) SyncSubscription(ctx context.Context, sub *models.CalendarSubs
 	imported := 0
 	seen := make(map[string]bool)
 	for _, event := range events {
-		if err := s.store.CreateEvent(ctx, event); err != nil {
-			log.Printf("sync: failed to import event %s: %v", event.UID, err)
+		if skipped[event] {
 			continue
 		}
 		if !seen[event.UID] { // count resources (events), not their override rows
@@ -214,7 +249,11 @@ const (
 // ── Feed Fetching ────────────────────────────────────────────
 
 func (s *Service) fetchFeed(ctx context.Context, sub *models.CalendarSubscription) (string, string, error) {
-	req, err := http.NewRequestWithContext(ctx, "GET", sub.SourceURL, nil)
+	sourceURL := NormalizeSubscriptionURL(sub.SourceURL)
+	if err := ValidateSubscriptionURL(sourceURL); err != nil {
+		return "", "", err
+	}
+	req, err := http.NewRequestWithContext(ctx, "GET", sourceURL, nil)
 	if err != nil {
 		return "", "", fmt.Errorf("build request: %w", err)
 	}

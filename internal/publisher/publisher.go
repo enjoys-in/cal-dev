@@ -117,8 +117,13 @@ func (p *Publisher) PublishPushEvent(ctx context.Context, evt *PushEvent) error 
 		return fmt.Errorf("publisher: marshal push event: %w", err)
 	}
 
-	if err := p.client.Publish(ctx, ChannelCalendarPush, data).Err(); err != nil {
+	receivers, err := p.client.Publish(ctx, ChannelCalendarPush, data).Result()
+	if err != nil {
 		return fmt.Errorf("publisher: publish to %s: %w", ChannelCalendarPush, err)
+	}
+	if receivers == 0 {
+		// Pub/Sub does not buffer: with no subscriber the reminder would be lost.
+		return fmt.Errorf("publisher: no subscriber on %s, reminder not delivered", ChannelCalendarPush)
 	}
 
 	log.Printf("publisher: published reminder push for %s (event=%s, milestone=%dm)",

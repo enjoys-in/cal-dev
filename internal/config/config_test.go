@@ -38,3 +38,15 @@ func TestWarnsAboutShippedAdminKey(t *testing.T) {
 		t.Fatal("default admin key should produce a warning")
 	}
 }
+
+func TestDSNQuotesValues(t *testing.T) {
+	if got, want := dsnQuote(`p w'd\x`), `'p w\'d\\x'`; got != want {
+		t.Fatalf("dsnQuote = %s, want %s", got, want)
+	}
+	d := DatabaseConfig{Host: "h", Port: 5432, User: "u", Password: "a b sslmode=disable", DBName: "db", SSLMode: "require", Schema: "caldev"}
+	// Schema is not applied to the DSN (see DatabaseConfig.DSN).
+	want := `host='h' port=5432 user='u' password='a b sslmode=disable' dbname='db' sslmode='require'`
+	if got := d.DSN(); got != want {
+		t.Fatalf("DSN = %s", got)
+	}
+}

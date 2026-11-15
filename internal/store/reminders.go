@@ -34,49 +34,88 @@ func (s *Store) RecordReminderDelivery(ctx context.Context, tenantID int, eventU
 	return true, nil
 }
 
-// QueryUpcomingEventsForReminders finds events starting within [from, to] (strictly enforced),
-// as well as recurring series that have at least one occurrence in that window.
-func (s *Store) QueryUpcomingEventsForReminders(ctx context.Context, from, to time.Time) ([]*models.Event, error) {
-	query := `SELECT id, tenant_id, user_id, calendar_id, uid, summary, description, location,
+// reminderColumns is eventColumns without raw_ics, which the reminder sweep never needs.
+const reminderColumns = `id, tenant_id, user_id, calendar_id, uid, summary, description, location,
 		dtstart, dtend, duration, all_day, recurrence_rule, recurrence_id, sequence,
 		status, transparency, classification, organizer, attendees, categories,
-		priority, url, geo, dtstamp, etag, raw_ics, size_bytes, component_type, properties,
-		created_at, updated_at
+		priority, url, geo, dtstamp, etag, '' AS raw_ics, size_bytes, component_type, properties,
+		created_at, updated_at`
+
+// QueryUpcomingEventsForReminders finds events starting within [from, to] (strictly enforced),
+// as well as recurring series that have at least one occurrence in that window. For every such
+// series all override rows are returned too, whatever their status or time, so expansion can drop
+// occurrences that were cancelled or moved away.
+func (s *Store) QueryUpcomingEventsForReminders(ctx context.Context, from, to time.Time) ([]*models.Event, error) {
+	// Recurring masters: skip series that start after the window or whose UNTIL date has passed
+	// (UNTIL's date part is compared one day early so a local-time UNTIL is never cut short).
+	query := `SELECT ` + reminderColumns + `
 		FROM caldev_events
 		WHERE status != 'CANCELLED'
-		  AND ((dtstart >= $1 AND dtstart <= $2) OR (recurrence_rule != ''))
+		  AND ((dtstart >= $1 AND dtstart <= $2)
+		    OR (recurrence_rule != '' AND recurrence_id = '' AND dtstart <= $2
+		        AND COALESCE(substring(recurrence_rule from 'UNTIL=([0-9]{8})'), '99999999') >= $3))
 		ORDER BY dtstart ASC`
 
-	rows, err := s.db.QueryContext(ctx, query, from, to)
+	rows, err := s.db.QueryContext(ctx, query, from, to, from.UTC().AddDate(0, 0, -1).Format("20060102"))
 	if err != nil {
 		return nil, fmt.Errorf("store: query upcoming events for reminders: %w", err)
 	}
-	defer rows.Close()
+	all, err := scanEventRows(rows)
+	if err != nil {
+		return nil, err
+	}
 
 	var events []*models.Event
-	for rows.Next() {
-		e := &models.Event{}
-		if err := rows.Scan(&e.ID, &e.TenantID, &e.UserID, &e.CalendarID, &e.UID,
-			&e.Summary, &e.Description, &e.Location,
-			&e.DTStart, &e.DTEnd, &e.Duration, &e.AllDay,
-			&e.RecurrenceRule, &e.RecurrenceID, &e.Sequence,
-			&e.Status, &e.Transparency, &e.Classification,
-			&e.Organizer, &e.Attendees, pq.Array(&e.Categories),
-			&e.Priority, &e.URL, &e.Geo, &e.DTStamp,
-			&e.ETag, &e.RawICS, &e.SizeBytes, &e.ComponentType, &e.Properties,
-			&e.CreatedAt, &e.UpdatedAt); err != nil {
-			return nil, err
-		}
-
+	var masterIDs []string
+	seen := make(map[string]bool, len(all))
+	for _, e := range all {
 		// Filter recurring events: only keep if they actually have an occurrence in [from, to)
 		if e.RecurrenceRule != "" {
 			if !recurrence.HasOccurrenceIn(e, from, to) {
 				continue
 			}
+			if e.RecurrenceID == "" {
+				masterIDs = append(masterIDs, e.ID)
+			}
 		}
-
+		seen[e.ID] = true
 		events = append(events, e)
 	}
+	if len(masterIDs) == 0 {
+		return events, nil
+	}
 
-	return events, rows.Err()
+	rows, err = s.db.QueryContext(ctx, `SELECT `+reminderColumns+`
+		FROM caldev_events
+		WHERE recurrence_id != '' AND (calendar_id, uid) IN (
+		  SELECT calendar_id, uid FROM caldev_events WHERE id = ANY($1::uuid[]))`, pq.Array(masterIDs))
+	if err != nil {
+		return nil, fmt.Errorf("store: query overrides for reminders: %w", err)
+	}
+	overrides, err := scanEventRows(rows)
+	if err != nil {
+		return nil, err
+	}
+	for _, o := range overrides {
+		if !seen[o.ID] {
+			seen[o.ID] = true
+			events = append(events, o)
+		}
+	}
+	return events, nil
+}
+
+// ReleaseReminderDelivery deletes a delivery row recorded by RecordReminderDelivery, so a reminder
+// whose publish failed can be delivered by the job's retry.
+func (s *Store) ReleaseReminderDelivery(ctx context.Context, eventUID, recurrenceID, recipientEmail string, milestoneMinutes int, channel string) error {
+	if channel == "" {
+		channel = "push"
+	}
+	_, err := s.db.ExecContext(ctx, `DELETE FROM caldev_reminder_deliveries
+		WHERE event_uid = $1 AND recurrence_id = $2 AND recipient_email = $3 AND milestone_minutes = $4 AND channel = $5`,
+		eventUID, recurrenceID, recipientEmail, milestoneMinutes, channel)
+	if err != nil {
+		return fmt.Errorf("store: release reminder delivery: %w", err)
+	}
+	return nil
 }

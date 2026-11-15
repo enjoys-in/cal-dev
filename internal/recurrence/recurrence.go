@@ -27,6 +27,10 @@ type Occurrence struct {
 // DefaultLimit caps the occurrences returned for a single event.
 const DefaultLimit = 1000
 
+// maxRuleIterations caps the candidate starts read from one RRULE per expansion (including the
+// ones before the window), so old or pathological series cannot iterate for ever.
+const maxRuleIterations = 100000
+
 type eventProps struct {
 	ExDates []string `json:"exdates"`
 	RDates  []string `json:"rdates"`
@@ -224,9 +228,11 @@ func ruleStarts(e *models.Event, rule string, loc *time.Location, after, before 
 		// Unparseable rule: fall back to the master instance only.
 		return []time.Time{e.DTStart}
 	}
-	switch opt.Freq {
-	case rrule.SECONDLY, rrule.MINUTELY:
-		// Refuse sub-hourly recurrence: expansion cost is unbounded for old series.
+	switch {
+	case opt.Freq == rrule.SECONDLY, opt.Freq == rrule.MINUTELY,
+		opt.Freq == rrule.HOURLY && len(opt.Byminute) > 1, len(opt.Bysecond) > 1:
+		// Refuse sub-hourly recurrence (also via BYMINUTE/BYSECOND lists): expansion cost is
+		// unbounded for old series.
 		return []time.Time{e.DTStart}
 	}
 	dtstart := e.DTStart.In(loc)
@@ -234,13 +240,16 @@ func ruleStarts(e *models.Event, rule string, loc *time.Location, after, before 
 		dtstart = time.Date(e.DTStart.Year(), e.DTStart.Month(), e.DTStart.Day(), 0, 0, 0, 0, time.UTC)
 	}
 	opt.Dtstart = dtstart
+	if neverMatches(*opt) {
+		return nil
+	}
 	r, err := rrule.NewRRule(*opt)
 	if err != nil {
 		return []time.Time{e.DTStart}
 	}
 	var out []time.Time
 	next := r.Iterator()
-	for len(out) < max {
+	for i := 0; len(out) < max && i < maxRuleIterations; i++ {
 		t, ok := next()
 		if !ok || t.After(before) {
 			break
@@ -251,6 +260,32 @@ func ruleStarts(e *models.Event, rule string, loc *time.Location, after, before 
 		out = append(out, t)
 	}
 	return out
+}
+
+// neverMatches reports whether the rule, ignoring COUNT and UNTIL, has no occurrence at all (e.g.
+// FREQ=DAILY;BYMONTH=2;BYMONTHDAY=30). rrule-go looks for the next match up to the year 9999
+// before giving up, and UNTIL does not stop that search (it is only compared with candidates
+// that matched), so such a rule cost ~200ms per expansion. The Gregorian calendar repeats every
+// 400 years, so the rule's pattern repeats every 400*INTERVAL years: a probe moved forward by a
+// multiple of that period, to within two periods of 9999, searches at most two periods.
+func neverMatches(opt rrule.ROption) bool {
+	if len(opt.Byeaster) > 0 {
+		return false // Easter does not follow the 400-year cycle
+	}
+	period := 400 * max(opt.Interval, 1)
+	shift := (rrule.MAXYEAR - period - opt.Dtstart.Year()) / period * period
+	if shift <= 0 {
+		return false // the real search is already within about one period of its end
+	}
+	opt.Dtstart = opt.Dtstart.AddDate(shift, 0, 0)
+	opt.Count = 0
+	opt.Until = time.Time{}
+	r, err := rrule.NewRRule(opt)
+	if err != nil {
+		return false
+	}
+	_, ok := r.Iterator()()
+	return !ok
 }
 
 func overlaps(start time.Time, dur time.Duration, from, to time.Time) bool {

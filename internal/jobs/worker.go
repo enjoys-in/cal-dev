@@ -23,6 +23,7 @@ type Worker struct {
 	store       *store.Store
 	handlers    map[string]HandlerFunc
 	concurrency int
+	stopTimeout time.Duration
 	wg          sync.WaitGroup
 	cancel      context.CancelFunc
 	stopOnce    sync.Once
@@ -35,7 +36,14 @@ func NewWorker(q *Queue, s *store.Store, cfg *config.WorkerConfig) *Worker {
 		store:       s,
 		handlers:    make(map[string]HandlerFunc),
 		concurrency: cfg.Concurrency,
+		stopTimeout: cfg.ShutdownTimeout,
 	}
+}
+
+// bookkeepingCtx is used for retry/dead-letter/history writes after a handler ran: the worker
+// context may already be cancelled by Stop, and those writes must still happen.
+func bookkeepingCtx() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), 5*time.Second)
 }
 
 // Register adds a handler for a job type.
@@ -83,7 +91,18 @@ func (w *Worker) Stop() {
 		if w.cancel != nil {
 			w.cancel()
 		}
-		w.wg.Wait()
+		done := make(chan struct{})
+		go func() { w.wg.Wait(); close(done) }()
+		if w.stopTimeout > 0 {
+			select {
+			case <-done:
+			case <-time.After(w.stopTimeout):
+				log.Printf("worker: shutdown timed out after %s, abandoning running jobs", w.stopTimeout)
+				return
+			}
+		} else {
+			<-done
+		}
 		log.Println("worker: shutdown complete")
 	})
 }
@@ -92,14 +111,20 @@ func (w *Worker) Stop() {
 func (w *Worker) processLoop(ctx context.Context, workerID int, jobTypes []string) {
 	defer w.wg.Done()
 
-	for {
+	// Dequeue serves keys in the given order, so rotate it every poll: a flooded queue must not
+	// starve the others.
+	order := make([]string, len(jobTypes))
+	for n := workerID; ; n++ {
 		select {
 		case <-ctx.Done():
 			return
 		default:
 		}
 
-		job, err := w.queue.Dequeue(ctx, 2*time.Second, jobTypes...)
+		for i := range jobTypes {
+			order[i] = jobTypes[(n+i)%len(jobTypes)]
+		}
+		job, err := w.queue.Dequeue(ctx, 2*time.Second, order...)
 		if err != nil {
 			if ctx.Err() != nil {
 				return // context cancelled
@@ -121,7 +146,14 @@ func (w *Worker) processLoop(ctx context.Context, workerID int, jobTypes []strin
 func (w *Worker) handleJob(ctx context.Context, workerID int, job *Job) {
 	handler, ok := w.handlers[job.Type]
 	if !ok {
-		log.Printf("worker[%d]: no handler for job type %q (id=%s)", workerID, job.Type, job.ID)
+		log.Printf("ERROR worker[%d]: no handler for job type %q (id=%s), moved to dead-letter: %s", workerID, job.Type, job.ID, job.Payload)
+		dctx, dcancel := bookkeepingCtx()
+		defer dcancel()
+		if err := w.queue.sendToDeadLetter(dctx, job); err != nil {
+			log.Printf("ERROR worker[%d]: dead-letter push failed: %v", workerID, err)
+			return // not acked: the reaper re-queues it
+		}
+		w.ack(dctx, workerID, job)
 		return
 	}
 
@@ -136,6 +168,9 @@ func (w *Worker) handleJob(ctx context.Context, workerID int, job *Job) {
 		DurationMs: int(duration.Milliseconds()),
 	}
 
+	bctx, bcancel := bookkeepingCtx()
+	defer bcancel()
+
 	if err != nil {
 		log.Printf("worker[%d]: job %s/%s failed (attempt %d): %v",
 			workerID, job.Type, job.ID, job.Retries+1, err)
@@ -143,22 +178,34 @@ func (w *Worker) handleJob(ctx context.Context, workerID int, job *Job) {
 		result.Status = "failed"
 		result.ErrorMessage = err.Error()
 
-		// Retry if possible
-		if retryErr := w.queue.Retry(ctx, job); retryErr != nil {
+		// Retry if possible. If even that fails the job is not acked, so the reaper re-queues it.
+		if retryErr := w.queue.Retry(bctx, job); retryErr != nil {
 			log.Printf("worker[%d]: retry enqueue failed: %v", workerID, retryErr)
 			result.Status = "dead"
+		} else {
+			w.ack(bctx, workerID, job)
 		}
 	} else {
 		result.Status = "completed"
+		w.ack(bctx, workerID, job)
 	}
 
 	// Record in job_history (best-effort)
-	if recordErr := w.store.RecordJobResult(ctx, result); recordErr != nil {
+	if recordErr := w.store.RecordJobResult(bctx, result); recordErr != nil {
 		log.Printf("worker[%d]: failed to record job result: %v", workerID, recordErr)
 	}
 }
 
-// promoterLoop periodically moves scheduled/delayed jobs into their queues.
+// ack removes a finished job from the processing set. A failed ack only means the job may run
+// once more after the visibility timeout.
+func (w *Worker) ack(ctx context.Context, workerID int, job *Job) {
+	if err := w.queue.Ack(ctx, job); err != nil {
+		log.Printf("worker[%d]: ack of job %s/%s failed: %v", workerID, job.Type, job.ID, err)
+	}
+}
+
+// promoterLoop periodically moves scheduled/delayed jobs into their queues and re-queues jobs
+// whose worker died before acking them.
 func (w *Worker) promoterLoop(ctx context.Context) {
 	defer w.wg.Done()
 	ticker := time.NewTicker(time.Second)

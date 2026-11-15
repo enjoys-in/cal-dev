@@ -351,7 +351,10 @@ func WriteLockResponse(w io.Writer, lockToken, owner, scope, lockType, depth str
 	fmt.Fprint(w, `<D:activelock>`)
 	fmt.Fprintf(w, `<D:locktype><D:%s/></D:locktype>`, lockType)
 	fmt.Fprintf(w, `<D:lockscope><D:%s/></D:lockscope>`, scope)
-	fmt.Fprintf(w, `<D:depth>%s</D:depth>`, depth)
+	if !strings.EqualFold(depth, "infinity") {
+		depth = "0" // the only other Depth a LOCK may have
+	}
+	fmt.Fprintf(w, `<D:depth>%s</D:depth>`, strings.ToLower(depth))
 	if owner != "" {
 		fmt.Fprintf(w, `<D:owner><D:href>%s</D:href></D:owner>`, xmlEscape(owner))
 	}
@@ -400,6 +403,8 @@ func statusText(code int) string {
 		return "No Content"
 	case 207:
 		return "Multi-Status"
+	case 400:
+		return "Bad Request"
 	case 403:
 		return "Forbidden"
 	case 404:
@@ -414,6 +419,8 @@ func statusText(code int) string {
 		return "Locked"
 	case 424:
 		return "Failed Dependency"
+	case 500:
+		return "Internal Server Error"
 	case 507:
 		return "Insufficient Storage"
 	default:

@@ -35,6 +35,9 @@ const (
 	MaxStreamsPerUser = 10
 )
 
+// statusCallTimeout bounds each per-owner status query in the periodic tick.
+const statusCallTimeout = 5 * time.Second
+
 // ErrTooManyStreams is returned when a user exceeds MaxStreamsPerUser.
 var ErrTooManyStreams = errors.New("realtime: too many open streams for this account")
 
@@ -92,6 +95,8 @@ type Hub struct {
 
 	userMu sync.Mutex
 	users  map[int]cachedUser
+
+	done chan struct{} // closed when the hub's context ends (server shutdown)
 }
 
 // NewHub creates a hub. Call Start to begin listening.
@@ -104,8 +109,13 @@ func NewHub(s *store.Store, a *availability.Service) *Hub {
 		pending:    make(map[int]*pendingOwner),
 		lastStatus: make(map[int]string),
 		users:      make(map[int]cachedUser),
+		done:       make(chan struct{}),
 	}
 }
+
+// Done is closed when the hub stops (its Start context is cancelled, i.e. server shutdown).
+// SSE handlers should select on it and end their stream.
+func (h *Hub) Done() <-chan struct{} { return h.done }
 
 // Start launches the LISTEN loop and the status ticker; both stop when ctx is cancelled.
 func (h *Hub) Start(ctx context.Context, dsn string) {
@@ -140,6 +150,10 @@ func (h *Hub) Start(ctx context.Context, dsn string) {
 	}()
 
 	go h.statusLoop(ctx)
+	go func() {
+		<-ctx.Done()
+		close(h.done)
+	}()
 }
 
 // Subscribe registers a new stream for user and computes who they can watch.
@@ -366,16 +380,29 @@ func (h *Hub) tickStatuses(ctx context.Context) {
 	}
 	h.statusMu.Unlock()
 
+	// Evict expired cached users so the cache cannot grow without bound.
+	h.userMu.Lock()
+	for id, c := range h.users {
+		if time.Since(c.at) >= userCacheTTL {
+			delete(h.users, id)
+		}
+	}
+	h.userMu.Unlock()
+
 	now := time.Now()
 	for id := range owners {
 		if ctx.Err() != nil {
 			return
 		}
-		u := h.user(ctx, id)
+		// One slow query must not stall the whole tick.
+		cctx, cancel := context.WithTimeout(ctx, statusCallTimeout)
+		u := h.user(cctx, id)
 		if u == nil {
+			cancel()
 			continue
 		}
-		cur, err := h.avail.CurrentStatus(ctx, u, now)
+		cur, err := h.avail.CurrentStatus(cctx, u, now)
+		cancel()
 		if err != nil {
 			continue
 		}

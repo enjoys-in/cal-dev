@@ -44,3 +44,20 @@ func TestRSVPTokenTampered(t *testing.T) {
 		t.Fatal("Expected error for tampered token, but got nil")
 	}
 }
+
+func TestRSVPTokenSeparatorInFields(t *testing.T) {
+	secret := "test-hmac-secret-xyz"
+	token := GenerateRSVPToken(7, "uid|with|pipes.and.dots", "a|b@example.com", secret, time.Hour)
+
+	payload, err := ParseRSVPToken(token, secret)
+	if err != nil {
+		t.Fatalf("ParseRSVPToken failed: %v", err)
+	}
+	if payload.EventUID != "uid|with|pipes.and.dots" || payload.AttendeeEmail != "a|b@example.com" || payload.TenantID != 7 {
+		t.Errorf("unexpected payload: %+v", payload)
+	}
+
+	if _, err := ParseRSVPToken(token, "other-secret"); err == nil {
+		t.Fatal("Expected error for wrong secret, but got nil")
+	}
+}

@@ -91,8 +91,10 @@ func (h *Handler) Lookup(c *fiber.Ctx) error {
 	}
 
 	var emails []string
+	seen := map[string]bool{}
 	for _, e := range strings.Split(c.Query("emails"), ",") {
-		if e = strings.TrimSpace(e); e != "" {
+		if e = strings.TrimSpace(e); e != "" && !seen[strings.ToLower(e)] {
+			seen[strings.ToLower(e)] = true
 			emails = append(emails, e)
 		}
 	}

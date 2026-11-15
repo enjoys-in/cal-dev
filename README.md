@@ -118,10 +118,12 @@ cal-dev/
 │   ├── sync/                    # Sync engine for external calendar feeds
 │   └── xmlutil/xmlutil.go       # WebDAV XML parsing & response generation
 ├── migrations/
-│   ├── 001_init.sql             # Full CalDev schema
-│   ├── 002_user_status.sql      # User status enum
-│   ├── 003_realtime_sharing.sql # Availability & calendar shares
-│   └── 004_reminders.sql         # Reminder deliveries deduplication table
+│   ├── 001_init.sql                 # Full CalDev schema
+│   ├── 002_sharing_realtime.sql     # Availability & calendar shares, LISTEN/NOTIFY
+│   ├── 003_recurrence_overrides.sql # One row per RECURRENCE-ID override
+│   ├── 004_reminders.sql            # Reminder deliveries deduplication table
+│   ├── 005_calendar_byo_smtp.sql    # Per-calendar BYO SMTP settings
+│   └── 006_change_log_fixes.sql     # Change log: calendar delete/move, ordered ids
 ├── build.sh                     # Automated build, stop-old, run-new deployment
 ├── run.sh                       # Quick run script
 ├── docker-compose.yml           # PostgreSQL + Valkey + CalDev
@@ -153,13 +155,15 @@ cp .env.example .env
 ### 2. Docker Compose (Full Stack with local Valkey)
 
 ```bash
-# Set your shared JWT secret
-export AUTH_JWT_SECRET="your-shared-secret"
-export AUTH_JWT_ISSUER="your-issuer"
+# Put the shared JWT secret in .env (compose refuses to start without it; never hard-code it in
+# docker-compose.yml — it is shared with the mail services)
+echo 'AUTH_JWT_SECRET=your-shared-secret' >> .env
 
 # Start everything
 docker-compose up --build -d
 ```
+
+Valkey is published on `127.0.0.1:6382` only: it has no password, and Docker's published ports bypass host firewalls such as ufw.
 
 ### 3. Manual Setup
 
@@ -172,10 +176,8 @@ go build -o caldev ./cmd/server
 # Configure (copy and edit)
 cp .env.example .env
 
-# Run migrations
-psql -U caldev -d caldev -f migrations/001_init.sql
-
-# Start
+# Start (run from the repo root: migrations in ./migrations are applied automatically at startup,
+# and startup stops if one is missing or fails)
 ./caldev
 ```
 
@@ -195,7 +197,12 @@ All configuration via environment variables. See `.env.example` for the full lis
 |---|---|---|
 | `SERVER_PORT` | `8443` | HTTP listen port |
 | `DB_HOST` | `localhost` | PostgreSQL host |
-| `DB_SCHEMA` | `caldev` | PostgreSQL schema name |
+| `DB_SCHEMA` | — | Read but **not applied**: tables live in `public` (switching `search_path` could silently point the app at other tables) |
+| `CALDEV_PUBLIC_URL` | `http://localhost:PORT` | **Set in production.** Public base URL used for RSVP links in emails and the JMAP session URLs. While unset (or localhost) the server treats itself as dev and allows CORS from any localhost port |
+| `CALDEV_SMTP_ENCRYPTION_KEY` | — | Key for encrypting BYO SMTP passwords. When unset, a key derived from `AUTH_JWT_SECRET` is used (rotating that secret then makes saved SMTP passwords unreadable). Passwords saved before the key was set still decrypt |
+| `CORS_ALLOWED_ORIGINS` | — | Extra allowed browser origins, comma-separated |
+| `TRUSTED_PROXIES` | loopback + private ranges | IPs/CIDRs of reverse proxies whose client-IP header is trusted (rate limiting, logs) |
+| `PROXY_HEADER` | `X-Forwarded-For` | Header the reverse proxy puts the client IP in |
 | `REDIS_HOST` | `localhost` | Valkey/Redis host |
 | `AUTH_JWT_SECRET` | — | **Required.** Same secret as your mail/auth services. The server refuses to start if it is empty or a known placeholder (`change-me-in-production`, `test`, …) unless `ALLOW_INSECURE_DEFAULTS=true` |
 | `AUTH_JWT_ISSUER` | — | JWT issuer to enforce (shared with other services). Strongly recommended |
@@ -203,9 +210,12 @@ All configuration via environment variables. See `.env.example` for the full lis
 | `ALLOW_INSECURE_DEFAULTS` | `false` | Local development only: turn the startup security errors into warnings |
 | `AVAILABILITY_ORG_VISIBLE` | `false` | Let users with the same non-empty `mail_accounts.tenant_name` see each other's free/busy without an explicit share. Only enable if `tenant_name` really identifies an organisation |
 | `SSE_HEARTBEAT_SECONDS` | `20` | Keep-alive interval for `/jmap/eventsource` |
-| `AUTH_BASIC_ENABLED` | `true` | Enable Basic Auth (email + app password) |
-| `WORKER_CONCURRENCY` | `4` | Background job worker threads |
+| `AUTH_BASIC_ENABLED` | `true` | Enable Basic Auth (email + app password); `false` makes `/dav` and `/feeds` refuse Basic credentials |
+| `WORKER_CONCURRENCY` | `4` | Background job worker threads (values below 1 become 1) |
 | `WORKER_RETRY_MAX` | `3` | Max retry attempts for failed jobs |
+| `WORKER_SHUTDOWN_TIMEOUT` | `10s` | How long shutdown waits for running jobs |
+
+Values that fail to parse (for example `SERVER_READ_TIMEOUT=30` without a unit) are logged as warnings and the default is used.
 
 ## API Endpoints
 
@@ -224,6 +234,8 @@ GET /health
 ```
 
 Supported methods: `OPTIONS`, `PROPFIND`, `PROPPATCH`, `REPORT`, `GET`, `PUT`, `DELETE`, `MKCALENDAR`, `MOVE`, `COPY`, `LOCK`, `UNLOCK`
+
+Resources are addressed by UID: a `PUT` to `{uid}.ics` must carry that same `UID` in its body (otherwise `400`). `VJOURNAL` is not supported (`403 supported-calendar-component`).
 
 ### JMAP (RFC 8620)
 ```
@@ -312,7 +324,7 @@ Standards-based equivalents for native clients: JMAP `Principal/getAvailability`
 
 **Invitations.** When an organizer invites a user that exists on this server, the event is added straight to that user's default calendar (and a normal iMIP email is still queued). RSVPs update the organizer's copy and the other local invitees' copies; removing an attendee or cancelling removes their copy. An invitation can never overwrite an event the invitee already owns under the same UID unless it comes from the same organizer. Inbound iMIP `REQUEST`/`CANCEL` posted to `/api/scheduling/incoming` is applied to the authenticated user's own calendar under the same rules.
 
-**Live stream** — `GET /jmap/eventsource?access_token=<jwt>` (browsers can't set headers on `EventSource`). One long-lived SSE connection per client; max 10 per account; the server closes it after 30 minutes and the browser reconnects.
+**Live stream** — `GET /jmap/eventsource?access_token=<jwt>` (browsers can't set headers on `EventSource`; this is the only route that accepts a token in the URL). One long-lived SSE connection per client; max 10 per account; the server closes it after 30 minutes and the browser reconnects.
 
 | SSE `event:` | When | Data |
 |---|---|---|
@@ -328,7 +340,7 @@ Changes are detected with PostgreSQL `LISTEN/NOTIFY` (migration `002`), so every
 ### JWT (Bearer)
 Tokens issued by your existing auth system work automatically — CalDev validates with the same `AUTH_JWT_SECRET` and `AUTH_JWT_ISSUER`.
 
-The JWT payload should include the `mid` claim (the `mail_accounts.id` UUID), which is used as the tenant ID.
+The JWT payload should include the `email` claim. If a token has an email that isn't in `mail_accounts`, it is refused; the numeric `user_id`/`sub` is used only for tokens without an email.
 
 ```
 Authorization: Bearer <jwt-token>
@@ -358,6 +370,8 @@ curl -X POST http://localhost:8443/api/app-passwords/ \
   -H "Content-Type: application/json" \
   -d '{"label": "MacBook Calendar", "password": "my-app-password"}'
 ```
+
+After 10 failed logins for one email within 15 minutes, Basic auth for that email is refused for 15 minutes with `429` and `Retry-After` (counted per server instance; a client whose password was verified in the last 5 minutes keeps working). Successful logins are cached for 5 minutes, so a revoked app password can keep working for up to 5 minutes.
 
 Then configure the CalDAV client:
 - **Server:** `http://localhost:8443/dav/{tenant}/{user}/calendars/`
@@ -417,6 +431,8 @@ CPU-intensive tasks run in background workers:
 | `enqueue_due_syncs` | Periodic | Checks for subscriptions due for sync and enqueues them |
 
 Jobs support automatic retry (configurable max + exponential backoff) and dead-letter queuing.
+
+Delivery is **at-least-once**: taking a job moves it into a `<prefix>:processing` set with a 5-minute deadline in one atomic step, and it is removed only after its result (success, retry scheduled, or dead-lettered) is stored. If a worker crashes or is cut off at shutdown, the job goes back on its queue when the deadline passes. Handlers tolerate a re-run (invitation emails send only while `pending`; reminders are deduplicated). Jobs of unknown type and unparseable payloads go to the dead-letter list.
 
 ## Database Schema
 

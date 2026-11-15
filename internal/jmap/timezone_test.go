@@ -5,7 +5,17 @@ import (
 	"testing"
 
 	"github.com/enjoys-in/cal-dev/internal/ics"
+	"github.com/enjoys-in/cal-dev/internal/models"
 )
+
+func mustEvent(t *testing.T, props map[string]interface{}) *models.Event {
+	t.Helper()
+	evt, err := jmapToEvent(props, 1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return evt
+}
 
 func TestTimeZoneIsValidatedBeforeAnythingHappens(t *testing.T) {
 	for _, bad := range []interface{}{"Mars/Olympus_Mons", 42, true} {
@@ -24,12 +34,12 @@ func TestTimeZoneIsValidatedBeforeAnythingHappens(t *testing.T) {
 }
 
 func TestCreateWithTimeZoneWritesTZIDAndReportsIt(t *testing.T) {
-	evt := jmapToEvent(map[string]interface{}{
+	evt := mustEvent(t, map[string]interface{}{
 		"title":           "Standup",
 		"start":           "2027-03-01T09:00:00-05:00",
 		"end":             "2027-03-01T10:00:00-05:00",
 		"recurrenceRules": []interface{}{map[string]interface{}{"rule": "FREQ=WEEKLY"}},
-	}, 1, 1)
+	})
 	if err := applyTimeZone(evt, map[string]interface{}{"timeZone": "America/New_York"}, true, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -52,7 +62,7 @@ func TestRecurringEventWithoutTimeZoneUsesCalendarZone(t *testing.T) {
 	calls := 0
 	zone := func() string { calls++; return "America/New_York" }
 
-	evt := jmapToEvent(recurring(), 1, 1)
+	evt := mustEvent(t, recurring())
 	_ = applyTimeZone(evt, recurring(), true, zone)
 	if ics.EventTZID(evt) != "America/New_York" {
 		t.Fatalf("a recurring event with no timeZone should take its calendar's zone, got %q", ics.EventTZID(evt))
@@ -60,35 +70,35 @@ func TestRecurringEventWithoutTimeZoneUsesCalendarZone(t *testing.T) {
 
 	// not recurring: the calendar is not even consulted
 	calls = 0
-	single := jmapToEvent(map[string]interface{}{"start": "2027-03-01T14:00:00Z"}, 1, 1)
+	single := mustEvent(t, map[string]interface{}{"start": "2027-03-01T14:00:00Z"})
 	_ = applyTimeZone(single, map[string]interface{}{}, true, zone)
 	if ics.EventTZID(single) != "" || calls != 0 {
 		t.Fatalf("a single event stays UTC without looking up the calendar (zone=%q calls=%d)", ics.EventTZID(single), calls)
 	}
 
 	// an unrelated edit of an existing series must not re-anchor it
-	existing := jmapToEvent(recurring(), 1, 1)
+	existing := mustEvent(t, recurring())
 	_ = applyTimeZone(existing, map[string]interface{}{"title": "renamed"}, false, zone)
 	if ics.EventTZID(existing) != "" {
 		t.Fatal("an edit that does not set the recurrence must not change the zone")
 	}
 
 	// an explicit UTC wins over the calendar's zone
-	explicit := jmapToEvent(recurring(), 1, 1)
+	explicit := mustEvent(t, recurring())
 	_ = applyTimeZone(explicit, map[string]interface{}{"timeZone": "Etc/UTC"}, true, zone)
 	if ics.EventTZID(explicit) != "" {
 		t.Fatal("an explicit UTC timeZone must not be replaced by the calendar's zone")
 	}
 
 	// an unknown calendar zone is ignored rather than failing the request
-	bad := jmapToEvent(recurring(), 1, 1)
+	bad := mustEvent(t, recurring())
 	if err := applyTimeZone(bad, recurring(), true, func() string { return "Not/AZone" }); err != nil || ics.EventTZID(bad) != "" {
 		t.Fatalf("unknown calendar zone: err=%v zone=%q", err, ics.EventTZID(bad))
 	}
 }
 
 func TestTimeZoneNullClearsAndAllDayHasNone(t *testing.T) {
-	evt := jmapToEvent(map[string]interface{}{"start": "2027-03-01T14:00:00Z"}, 1, 1)
+	evt := mustEvent(t, map[string]interface{}{"start": "2027-03-01T14:00:00Z"})
 	_ = applyTimeZone(evt, map[string]interface{}{"timeZone": "Asia/Kolkata"}, false, nil)
 	if tz, _ := timeZoneJMAP(evt); tz != "Asia/Kolkata" {
 		t.Fatalf("timeZone = %q", tz)
@@ -98,7 +108,7 @@ func TestTimeZoneNullClearsAndAllDayHasNone(t *testing.T) {
 		t.Fatalf("null must clear the zone back to UTC, got %q", tz)
 	}
 
-	allDay := jmapToEvent(map[string]interface{}{"start": "2027-03-01T00:00:00Z", "isAllDay": true}, 1, 1)
+	allDay := mustEvent(t, map[string]interface{}{"start": "2027-03-01T00:00:00Z", "isAllDay": true})
 	if _, ok := timeZoneJMAP(allDay); ok {
 		t.Fatal("an all-day event has no timeZone")
 	}
