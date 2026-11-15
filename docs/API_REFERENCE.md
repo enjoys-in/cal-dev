@@ -388,7 +388,7 @@ Creates the user's account if it doesn't exist yet and makes sure they have a de
   "calendar_id": "uuid", "calendars": [ … ] }
 ```
 
-- New accounts are created `ACTIVE` with `tenant_name` = the email's domain (that decides org visibility).
+- New accounts are created `ACTIVE`. Every onboarding sets `tenant_name` to the email's domain (that decides org visibility), also for an existing account — any previous value is overwritten.
 - An existing account keeps its status: a suspended account is **not** reactivated, and onboarding it returns `403 account is not active`.
 - No credentials → `401`; invalid or revoked key → `401`.
 

@@ -168,12 +168,14 @@ func (s *Store) EnsureUserByEmail(ctx context.Context, email, name string) (*mod
 		name = email
 	}
 	u := &models.User{}
-	// New accounts belong to the org of their email domain (tenant_name drives org visibility).
-	// An existing account keeps its status: onboarding must never un-suspend a blocked user.
+	// Every onboarded account belongs to the org of its email domain (tenant_name drives org
+	// visibility), new or existing. An existing account keeps its status: onboarding must never
+	// un-suspend a blocked user.
 	query := `INSERT INTO mail_accounts (email, name, tenant_name, password, status, type)
 		VALUES ($1, $2, $3, '', 'ACTIVE', 'USER')
 		ON CONFLICT (email) DO UPDATE SET
-			name = CASE WHEN mail_accounts.name = '' THEN EXCLUDED.name ELSE mail_accounts.name END
+			name = CASE WHEN mail_accounts.name = '' THEN EXCLUDED.name ELSE mail_accounts.name END,
+			tenant_name = EXCLUDED.tenant_name
 		RETURNING id, COALESCE(name, '') as name, email, COALESCE(tenant_name, '') as tenant_name,
 			COALESCE(status, 'ACTIVE') as status, COALESCE(type, 'USER') as type, created_at, updated_at`
 	err := s.db.QueryRowContext(ctx, query, email, name, EmailDomain(email)).
