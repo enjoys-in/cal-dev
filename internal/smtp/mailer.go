@@ -3,7 +3,12 @@ package smtp
 import (
 	"bytes"
 	"fmt"
+	"html"
+	"io"
+	"mime"
 	"mime/multipart"
+	"mime/quotedprintable"
+	"net/mail"
 	"net/textproto"
 	"strings"
 	"time"
@@ -16,6 +21,7 @@ type InvitationData struct {
 	SenderEmail    string
 	SenderName     string
 	RecipientEmail string
+	ReplyTo        string
 	Subject        string
 	Method         string // "REQUEST", "CANCEL", "REPLY"
 	Summary        string
@@ -36,16 +42,20 @@ func BuildInvitationMIME(data *InvitationData) ([]byte, error) {
 	var buf bytes.Buffer
 
 	// Headers
-	fromHeader := data.SenderEmail
+	// Header values must never contain CR/LF (header injection); non-ASCII is RFC 2047 encoded.
+	fromHeader := stripCRLF(data.SenderEmail)
 	if data.SenderName != "" {
-		fromHeader = fmt.Sprintf("%q <%s>", data.SenderName, data.SenderEmail)
+		fromHeader = (&mail.Address{Name: stripCRLF(data.SenderName), Address: fromHeader}).String()
 	}
 	messageID := fmt.Sprintf("<%s@caldev>", uuid.New().String())
 	dateHeader := time.Now().UTC().Format(time.RFC1123Z)
 
 	buf.WriteString(fmt.Sprintf("From: %s\r\n", fromHeader))
-	buf.WriteString(fmt.Sprintf("To: <%s>\r\n", data.RecipientEmail))
-	buf.WriteString(fmt.Sprintf("Subject: %s\r\n", data.Subject))
+	buf.WriteString(fmt.Sprintf("To: <%s>\r\n", stripCRLF(data.RecipientEmail)))
+	if replyTo := stripCRLF(data.ReplyTo); replyTo != "" {
+		buf.WriteString(fmt.Sprintf("Reply-To: %s\r\n", replyTo))
+	}
+	buf.WriteString(fmt.Sprintf("Subject: %s\r\n", mime.QEncoding.Encode("utf-8", stripCRLF(data.Subject))))
 	buf.WriteString(fmt.Sprintf("Date: %s\r\n", dateHeader))
 	buf.WriteString(fmt.Sprintf("Message-ID: %s\r\n", messageID))
 	buf.WriteString("MIME-Version: 1.0\r\n")
@@ -56,27 +66,25 @@ func BuildInvitationMIME(data *InvitationData) ([]byte, error) {
 
 	// 1. Text Plain Part
 	textHeader := make(textproto.MIMEHeader)
-	textHeader.Set("Content-Type", "text/plain; charset=UTF-8; format=flowed")
-	textHeader.Set("Content-Transfer-Encoding", "7bit")
+	textHeader.Set("Content-Type", "text/plain; charset=UTF-8")
+	textHeader.Set("Content-Transfer-Encoding", "quoted-printable")
 	textPart, err := writer.CreatePart(textHeader)
 	if err != nil {
 		return nil, err
 	}
-	textBody := generatePlainTextBody(data)
-	if _, err := textPart.Write([]byte(textBody)); err != nil {
+	if err := writeQuotedPrintable(textPart, generatePlainTextBody(data)); err != nil {
 		return nil, err
 	}
 
 	// 2. HTML Part
 	htmlHeader := make(textproto.MIMEHeader)
 	htmlHeader.Set("Content-Type", "text/html; charset=UTF-8")
-	htmlHeader.Set("Content-Transfer-Encoding", "7bit")
+	htmlHeader.Set("Content-Transfer-Encoding", "quoted-printable")
 	htmlPart, err := writer.CreatePart(htmlHeader)
 	if err != nil {
 		return nil, err
 	}
-	htmlBody := generateHTMLBody(data)
-	if _, err := htmlPart.Write([]byte(htmlBody)); err != nil {
+	if err := writeQuotedPrintable(htmlPart, generateHTMLBody(data)); err != nil {
 		return nil, err
 	}
 
@@ -138,7 +146,7 @@ func generatePlainTextBody(d *InvitationData) string {
 		sb.WriteString(fmt.Sprintf("\nDetails:\n%s\n", d.Description))
 	}
 
-	if d.Method != "CANCEL" && d.RSVPAcceptURL != "" {
+	if d.Method == "REQUEST" && d.RSVPAcceptURL != "" {
 		sb.WriteString("\nRSVP via web:\n")
 		sb.WriteString(fmt.Sprintf("  Accept:    %s\n", d.RSVPAcceptURL))
 		if d.RSVPTentURL != "" {
@@ -156,6 +164,9 @@ func generateHTMLBody(d *InvitationData) string {
 	if d.Method == "CANCEL" {
 		title = "Event Canceled"
 		badgeColor = "#D13438"
+	} else if d.Method == "REPLY" {
+		title = "RSVP Update"
+		badgeColor = "#6B7280"
 	}
 
 	var sb strings.Builder
@@ -205,14 +216,14 @@ func generateHTMLBody(d *InvitationData) string {
 	}
 	sb.WriteString("</div>")
 
-	if d.Method != "CANCEL" && d.RSVPAcceptURL != "" {
+	if d.Method == "REQUEST" && d.RSVPAcceptURL != "" {
 		sb.WriteString("<div class=\"rsvp-section\">")
 		sb.WriteString("<div class=\"rsvp-title\">Going? Respond to this invitation:</div>")
-		sb.WriteString(fmt.Sprintf("<a href=\"%s\" class=\"btn btn-accept\">Accept</a>", d.RSVPAcceptURL))
+		sb.WriteString(fmt.Sprintf("<a href=\"%s\" class=\"btn btn-accept\">Accept</a>", escapeHTML(d.RSVPAcceptURL)))
 		if d.RSVPTentURL != "" {
-			sb.WriteString(fmt.Sprintf("<a href=\"%s\" class=\"btn btn-tentative\">Tentative</a>", d.RSVPTentURL))
+			sb.WriteString(fmt.Sprintf("<a href=\"%s\" class=\"btn btn-tentative\">Tentative</a>", escapeHTML(d.RSVPTentURL)))
 		}
-		sb.WriteString(fmt.Sprintf("<a href=\"%s\" class=\"btn btn-decline\">Decline</a>", d.RSVPDeclURL))
+		sb.WriteString(fmt.Sprintf("<a href=\"%s\" class=\"btn btn-decline\">Decline</a>", escapeHTML(d.RSVPDeclURL)))
 		sb.WriteString("</div>")
 	}
 
@@ -220,13 +231,20 @@ func generateHTMLBody(d *InvitationData) string {
 	return sb.String()
 }
 
-func escapeHTML(s string) string {
-	r := strings.NewReplacer(
-		"&", "&amp;",
-		"<", "&lt;",
-		">", "&gt;",
-		"\"", "&quot;",
-		"'", "&#39;",
-	)
-	return r.Replace(s)
+var escapeHTML = html.EscapeString
+
+var crlfStripper = strings.NewReplacer("\r", "", "\n", "")
+
+// stripCRLF removes CR and LF so a value cannot start a new header line.
+func stripCRLF(s string) string {
+	return crlfStripper.Replace(s)
+}
+
+// writeQuotedPrintable writes body to w as quoted-printable (UTF-8 safe, lines wrapped at 76 chars).
+func writeQuotedPrintable(w io.Writer, body string) error {
+	qp := quotedprintable.NewWriter(w)
+	if _, err := qp.Write([]byte(body)); err != nil {
+		return err
+	}
+	return qp.Close()
 }

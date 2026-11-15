@@ -62,6 +62,48 @@ func (s *Store) GetResource(ctx context.Context, tenantID int, calendarID, uid s
 	return scanEventRows(rows)
 }
 
+// GetPrimaryEventsByUIDs is GetEvent for many UIDs of one calendar in a single query: each
+// existing resource's primary row (master, else earliest override) keyed by UID. UIDs with no
+// resource are absent from the map.
+func (s *Store) GetPrimaryEventsByUIDs(ctx context.Context, tenantID int, calendarID string, uids []string) (map[string]*models.Event, error) {
+	out := make(map[string]*models.Event, len(uids))
+	if len(uids) == 0 {
+		return out, nil
+	}
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT DISTINCT ON (uid) `+eventColumns+` FROM caldev_events
+		 WHERE tenant_id = $1 AND calendar_id = $2 AND uid = ANY($3)
+		 ORDER BY uid, recurrence_id ASC`, tenantID, calendarID, pq.Array(uids))
+	if err != nil {
+		return nil, err
+	}
+	events, err := scanEventRows(rows)
+	if err != nil {
+		return nil, err
+	}
+	for _, e := range events {
+		out[e.UID] = e
+	}
+	return out, nil
+}
+
+// GetResourcesByEventIDs loads, in one query, every row (master and overrides) of each resource
+// that one of the given event ids belongs to, ordered by calendar, UID and recurrence id.
+func (s *Store) GetResourcesByEventIDs(ctx context.Context, tenantID int, ids []string) ([]*models.Event, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT `+eventColumns+` FROM caldev_events
+		 WHERE tenant_id = $1 AND (calendar_id, uid) IN (
+		   SELECT calendar_id, uid FROM caldev_events WHERE tenant_id = $1 AND id = ANY($2))
+		 ORDER BY calendar_id, uid, recurrence_id ASC`, tenantID, pq.Array(ids))
+	if err != nil {
+		return nil, err
+	}
+	return scanEventRows(rows)
+}
+
 const upsertEventSQL = `INSERT INTO caldev_events
 	(id, tenant_id, user_id, calendar_id, uid, summary, description, location,
 	 dtstart, dtend, duration, all_day, recurrence_rule, recurrence_id, sequence,

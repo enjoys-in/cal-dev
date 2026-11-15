@@ -29,6 +29,21 @@ func DeriveKey(fallbackSecret string) []byte {
 	return hash[:]
 }
 
+// DecryptWithFallback decrypts with DeriveKey(fallbackSecret), i.e. the CALDEV_SMTP_ENCRYPTION_KEY
+// key when set. If that fails and the env key is set, it retries with the key derived from
+// fallbackSecret alone, so values encrypted before the env key was introduced keep working.
+func DecryptWithFallback(cipherB64, fallbackSecret string) (string, error) {
+	plaintext, err := Decrypt(cipherB64, DeriveKey(fallbackSecret))
+	if err == nil || os.Getenv("CALDEV_SMTP_ENCRYPTION_KEY") == "" {
+		return plaintext, err
+	}
+	legacy := sha256.Sum256([]byte(fallbackSecret))
+	if p, legacyErr := Decrypt(cipherB64, legacy[:]); legacyErr == nil {
+		return p, nil
+	}
+	return "", err
+}
+
 // Encrypt encrypts plaintext using AES-256-GCM with a 12-byte random nonce.
 // Returns base64-encoded [nonce + ciphertext + gcm_tag].
 func Encrypt(plaintext string, key []byte) (string, error) {

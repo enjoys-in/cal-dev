@@ -1,7 +1,7 @@
 package smtp
 
 import (
-	"fmt"
+	"log"
 	"strings"
 
 	"github.com/enjoys-in/cal-dev/internal/crypto"
@@ -37,7 +37,8 @@ func (h *Handler) GetSMTP(c *fiber.Ctx) error {
 
 	cfg, err := h.store.GetCalendarSMTP(c.UserContext(), tenantID, calendarID)
 	if err != nil {
-		return response.Error(c, 500, "failed to load SMTP config", err.Error())
+		log.Printf("smtp: load config for calendar %s: %v", calendarID, err)
+		return response.Error(c, 500, "failed to load SMTP config")
 	}
 
 	if cfg == nil {
@@ -109,11 +110,18 @@ func (h *Handler) UpsertSMTP(c *fiber.Ctx) error {
 	if req.FromEmail == "" {
 		return response.Error(c, 400, "from_email is required")
 	}
-	if req.Port <= 0 {
+	if req.Port == 0 {
 		req.Port = 587
 	}
+	if req.Port < 1 || req.Port > 65535 {
+		return response.Error(c, 400, "port must be between 1 and 65535")
+	}
+	req.Encryption = strings.ToLower(strings.TrimSpace(req.Encryption))
 	if req.Encryption == "" {
 		req.Encryption = "starttls"
+	}
+	if req.Encryption != "none" && req.Encryption != "ssl" && req.Encryption != "starttls" {
+		return response.Error(c, 400, "encryption must be one of: none, ssl, starttls")
 	}
 
 	key := crypto.DeriveKey(h.jwtSecret)
@@ -122,7 +130,8 @@ func (h *Handler) UpsertSMTP(c *fiber.Ctx) error {
 	if req.Password != "" {
 		encrypted, err := crypto.Encrypt(req.Password, key)
 		if err != nil {
-			return response.Error(c, 500, "failed to encrypt password", err.Error())
+			log.Printf("smtp: encrypt password for calendar %s: %v", calendarID, err)
+			return response.Error(c, 500, "failed to encrypt password")
 		}
 		passwordEncrypted = encrypted
 	} else {
@@ -130,6 +139,11 @@ func (h *Handler) UpsertSMTP(c *fiber.Ctx) error {
 		existing, _ := h.store.GetCalendarSMTP(c.UserContext(), tenantID, calendarID)
 		if existing == nil {
 			return response.Error(c, 400, "password is required for initial configuration")
+		}
+		// Keep the saved password only for the same server and account; otherwise the next send
+		// would hand it to whatever new host was entered.
+		if !strings.EqualFold(existing.Host, req.Host) || existing.Port != req.Port || existing.Username != req.Username {
+			return response.Error(c, 400, "password is required when host, port or username changes")
 		}
 		passwordEncrypted = existing.PasswordEncrypted
 	}
@@ -150,7 +164,8 @@ func (h *Handler) UpsertSMTP(c *fiber.Ctx) error {
 	}
 
 	if err := h.store.UpsertCalendarSMTP(c.UserContext(), cfg); err != nil {
-		return response.Error(c, 500, "failed to save SMTP settings", err.Error())
+		log.Printf("smtp: save config for calendar %s: %v", calendarID, err)
+		return response.Error(c, 500, "failed to save SMTP settings")
 	}
 
 	return response.Success(c, "SMTP configuration saved", fiber.Map{
@@ -184,9 +199,12 @@ func (h *Handler) TestSMTP(c *fiber.Ctx) error {
 
 	// Try to parse body if provided (testing unsaved values from modal)
 	_ = c.BodyParser(&req)
+	req.Host = strings.TrimSpace(req.Host)
+	req.Username = strings.TrimSpace(req.Username)
 
 	var clientCfg Config
-	key := crypto.DeriveKey(h.jwtSecret)
+	// Only a test of the saved configuration may update its stored status.
+	testingSaved := false
 
 	if req.Host != "" && req.Username != "" {
 		port := req.Port
@@ -201,26 +219,40 @@ func (h *Handler) TestSMTP(c *fiber.Ctx) error {
 			FromEmail:  req.FromEmail,
 			Encryption: req.Encryption,
 		}
-		// If password omitted in test request, try to load from DB
-		if clientCfg.Password == "" && calendarID != "" {
+		// If password omitted, reuse the saved one only for the same host/port/username,
+		// so the stored credential can never be sent to a different server.
+		if clientCfg.Password == "" {
 			existing, err := h.store.GetCalendarSMTP(c.UserContext(), tenantID, calendarID)
-			if err == nil && existing != nil {
-				decrypted, decErr := crypto.Decrypt(existing.PasswordEncrypted, key)
-				if decErr == nil {
-					clientCfg.Password = decrypted
-				}
+			if err != nil {
+				log.Printf("smtp: load config for calendar %s: %v", calendarID, err)
+				return response.Error(c, 500, "failed to load SMTP config")
 			}
+			if existing == nil || !strings.EqualFold(existing.Host, req.Host) || existing.Port != port || existing.Username != req.Username {
+				return response.Error(c, 400, "password is required to test settings that differ from the saved configuration")
+			}
+			decrypted, decErr := crypto.DecryptWithFallback(existing.PasswordEncrypted, h.jwtSecret)
+			if decErr != nil {
+				log.Printf("smtp: decrypt saved password for calendar %s: %v", calendarID, decErr)
+				return response.Error(c, 500, "failed to decrypt saved password")
+			}
+			clientCfg.Password = decrypted
+			testingSaved = strings.EqualFold(strings.TrimSpace(req.Encryption), existing.Encryption)
 		}
 	} else if calendarID != "" {
 		// Use saved configuration
 		saved, err := h.store.GetCalendarSMTP(c.UserContext(), tenantID, calendarID)
 		if err != nil || saved == nil {
+			if err != nil {
+				log.Printf("smtp: load config for calendar %s: %v", calendarID, err)
+			}
 			return response.Error(c, 404, "no saved SMTP configuration found to test")
 		}
-		decrypted, decErr := crypto.Decrypt(saved.PasswordEncrypted, key)
+		decrypted, decErr := crypto.DecryptWithFallback(saved.PasswordEncrypted, h.jwtSecret)
 		if decErr != nil {
-			return response.Error(c, 500, "failed to decrypt saved password", decErr.Error())
+			log.Printf("smtp: decrypt saved password for calendar %s: %v", calendarID, decErr)
+			return response.Error(c, 500, "failed to decrypt saved password")
 		}
+		testingSaved = true
 		clientCfg = Config{
 			Host:       saved.Host,
 			Port:       saved.Port,
@@ -236,14 +268,15 @@ func (h *Handler) TestSMTP(c *fiber.Ctx) error {
 	// Attempt connection & handshake
 	testErr := TestConnection(&clientCfg)
 	if testErr != nil {
-		if calendarID != "" {
-			_ = h.store.UpdateCalendarSMTPTestResult(c.UserContext(), calendarID, "failing", testErr.Error())
+		log.Printf("smtp: connection test for calendar %s failed: %v", calendarID, testErr)
+		if testingSaved {
+			_ = h.store.UpdateCalendarSMTPTestResult(c.UserContext(), tenantID, calendarID, "failing", testErr.Error())
 		}
-		return response.Error(c, 400, fmt.Sprintf("SMTP connection test failed: %v", testErr))
+		return response.Error(c, 400, "SMTP connection test failed. Check the host, port, encryption and credentials.")
 	}
 
-	if calendarID != "" {
-		_ = h.store.UpdateCalendarSMTPTestResult(c.UserContext(), calendarID, "active", "")
+	if testingSaved {
+		_ = h.store.UpdateCalendarSMTPTestResult(c.UserContext(), tenantID, calendarID, "active", "")
 	}
 
 	return response.Success(c, "SMTP connection verified successfully", fiber.Map{
@@ -264,7 +297,8 @@ func (h *Handler) DeleteSMTP(c *fiber.Ctx) error {
 	}
 
 	if err := h.store.DeleteCalendarSMTP(c.UserContext(), tenantID, calendarID); err != nil {
-		return response.Error(c, 500, "failed to delete SMTP settings", err.Error())
+		log.Printf("smtp: delete config for calendar %s: %v", calendarID, err)
+		return response.Error(c, 500, "failed to delete SMTP settings")
 	}
 
 	return c.SendStatus(fiber.StatusNoContent)

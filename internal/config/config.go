@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"strconv"
 	"strings"
@@ -54,6 +55,7 @@ type DatabaseConfig struct {
 	Password        string
 	DBName          string
 	SSLMode         string
+	Schema          string // DB_SCHEMA: read but not applied (see DSN)
 	MaxOpenConns    int
 	MaxIdleConns    int
 	ConnMaxLifetime time.Duration
@@ -93,12 +95,22 @@ type TLSConfig struct {
 	KeyFile  string
 }
 
-// DSN returns the PostgreSQL connection string.
+// DSN returns the PostgreSQL connection string. Values are quoted so spaces, quotes or
+// backslashes (e.g. in the password) cannot break the string or inject extra parameters.
 func (d *DatabaseConfig) DSN() string {
-	return fmt.Sprintf(
+	dsn := fmt.Sprintf(
 		"host=%s port=%d user=%s password=%s dbname=%s sslmode=%s",
-		d.Host, d.Port, d.User, d.Password, d.DBName, d.SSLMode,
+		dsnQuote(d.Host), d.Port, dsnQuote(d.User), dsnQuote(d.Password), dsnQuote(d.DBName), dsnQuote(d.SSLMode),
 	)
+	// d.Schema (DB_SCHEMA) is deliberately not applied as search_path: existing deployments keep
+	// their tables in public, and switching schemas silently could point the app at other tables.
+	return dsn
+}
+
+// dsnQuote quotes a key/value connection-string value per lib/pq: single quotes, with
+// backslash and single quote escaped by a backslash.
+func dsnQuote(v string) string {
+	return "'" + strings.NewReplacer(`\`, `\\`, `'`, `\'`).Replace(v) + "'"
 }
 
 // Addr returns the server listen address.
@@ -116,7 +128,7 @@ func (s *ServerConfig) PublicURL() string {
 
 // Load reads configuration from environment variables with sensible defaults.
 func Load() *Config {
-	return &Config{
+	c := &Config{
 		Server: ServerConfig{
 			Host:            envStr("SERVER_HOST", "0.0.0.0"),
 			Port:            envInt("SERVER_PORT", 8443),
@@ -133,6 +145,7 @@ func Load() *Config {
 			Password:        envStr("DB_PASSWORD", "caldev"),
 			DBName:          envStr("DB_NAME", "caldev"),
 			SSLMode:         envStr("DB_SSLMODE", "disable"),
+			Schema:          envStr("DB_SCHEMA", ""),
 			MaxOpenConns:    envInt("DB_MAX_OPEN_CONNS", 50),
 			MaxIdleConns:    envInt("DB_MAX_IDLE_CONNS", 10),
 			ConnMaxLifetime: envDuration("DB_CONN_MAX_LIFETIME", 30*time.Minute),
@@ -173,6 +186,11 @@ func Load() *Config {
 			ShutdownTimeout: envDuration("WORKER_SHUTDOWN_TIMEOUT", 10*time.Second),
 		},
 	}
+	if c.Worker.Concurrency <= 0 {
+		log.Printf("config: WARNING WORKER_CONCURRENCY=%d is not positive, using 1", c.Worker.Concurrency)
+		c.Worker.Concurrency = 1
+	}
+	return c
 }
 
 // weakSecrets are well-known placeholder values that must never sign production tokens.
@@ -211,6 +229,11 @@ func (c *Config) Validate() (fatal, warnings []string) {
 	if !c.Auth.RequireExp {
 		warnings = append(warnings, "AUTH_REQUIRE_EXP=false: tokens without an expiry are accepted forever")
 	}
+	if u := strings.ToLower(os.Getenv("CALDEV_PUBLIC_URL")); u == "" {
+		warnings = append(warnings, "CALDEV_PUBLIC_URL is not set: links in emails and feeds will point at http://localhost")
+	} else if strings.Contains(u, "://localhost") || strings.Contains(u, "://127.0.0.1") || strings.Contains(u, "://[::1]") {
+		warnings = append(warnings, "CALDEV_PUBLIC_URL points at localhost: links in emails and feeds will not work for other people")
+	}
 	if c.Auth.AdminAPIKey == defaultAdminKey {
 		warnings = append(warnings, "ADMIN_API_KEY is the default shipped in docker-compose.yml: anyone who has seen the repository knows it")
 	}
@@ -229,6 +252,7 @@ func envInt(key string, fallback int) int {
 		if n, err := strconv.Atoi(v); err == nil {
 			return n
 		}
+		warnInvalid(key, v, fallback)
 	}
 	return fallback
 }
@@ -238,6 +262,7 @@ func envBool(key string, fallback bool) bool {
 		if b, err := strconv.ParseBool(v); err == nil {
 			return b
 		}
+		warnInvalid(key, v, fallback)
 	}
 	return fallback
 }
@@ -247,6 +272,12 @@ func envDuration(key string, fallback time.Duration) time.Duration {
 		if d, err := time.ParseDuration(v); err == nil {
 			return d
 		}
+		warnInvalid(key, v, fallback)
 	}
 	return fallback
+}
+
+// warnInvalid logs an unparseable environment value instead of silently using the default.
+func warnInvalid(key, value string, fallback any) {
+	log.Printf("config: WARNING invalid value %q for %s, using default %v (durations need a unit, e.g. 30s)", value, key, fallback)
 }

@@ -40,6 +40,28 @@ func NormalizeTZID(name string) (string, bool) {
 	return loc.String(), true
 }
 
+// CalendarTimezoneName returns the zone name for a CalDAV calendar-timezone value, which is a
+// VCALENDAR holding one VTIMEZONE (RFC 4791 §5.2.2): the TZID of that VTIMEZONE resolved to its
+// IANA name. A bare zone name is accepted too. ok is false when no known zone is found.
+func CalendarTimezoneName(value string) (string, bool) {
+	value = strings.TrimSpace(value)
+	if strings.Contains(value, "BEGIN:VTIMEZONE") {
+		tzid := ""
+		for _, line := range unfoldICS(value) {
+			if name, _, v := parseLine(line); strings.EqualFold(name, "TZID") {
+				tzid = v
+				break
+			}
+		}
+		value = tzid
+	}
+	loc, ok := ResolveTZID(value)
+	if !ok {
+		return "", false
+	}
+	return loc.String(), true
+}
+
 // EventTZID returns the IANA zone the event is anchored to, or "" for UTC, floating and all-day events.
 func EventTZID(e *models.Event) string {
 	if e == nil || e.AllDay || len(e.Properties) == 0 {

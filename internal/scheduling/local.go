@@ -31,6 +31,31 @@ func (svc *Service) localUser(ctx context.Context, email string) *models.User {
 	return u
 }
 
+// localUsers is localUser for many addresses in one lookup: the active account of each local
+// address, keyed by normEmail. External addresses (and lookup errors) leave no entry.
+func (svc *Service) localUsers(ctx context.Context, emails []string) map[string]*models.User {
+	norm := make([]string, 0, len(emails))
+	for _, e := range emails {
+		if n := normEmail(e); n != "" {
+			norm = append(norm, n)
+		}
+	}
+	out := make(map[string]*models.User, len(norm))
+	if len(norm) == 0 {
+		return out
+	}
+	users, err := svc.store.GetUsersByEmails(ctx, norm)
+	if err != nil {
+		return out
+	}
+	for k, u := range users {
+		if strings.EqualFold(u.Status, "ACTIVE") {
+			out[k] = u
+		}
+	}
+	return out
+}
+
 // findCopy returns the user's primary row (master, else earliest override) of the resource with
 // this UID, or nil.
 func (svc *Service) findCopy(ctx context.Context, userID int, uid string) (*models.Event, error) {
@@ -75,7 +100,8 @@ func (svc *Service) invitationCalendar(ctx context.Context, user *models.User) (
 
 // deliverLocal puts (REQUEST) or removes (CANCEL) the event in a local attendee's own
 // calendar, so invitees on this server see the meeting without opening an email.
-func (svc *Service) deliverLocal(ctx context.Context, event *models.Event, attendee models.Attendee, method string) {
+// users comes from localUsers for the attendees being processed.
+func (svc *Service) deliverLocal(ctx context.Context, event *models.Event, attendee models.Attendee, method string, users map[string]*models.User) {
 	if t := strings.ToUpper(attendee.Type); t != "" && t != "INDIVIDUAL" {
 		return // rooms, resources and groups have no calendar here
 	}
@@ -83,7 +109,7 @@ func (svc *Service) deliverLocal(ctx context.Context, event *models.Event, atten
 	if org == "" || normEmail(attendee.Email) == org {
 		return
 	}
-	user := svc.localUser(ctx, attendee.Email)
+	user := users[normEmail(attendee.Email)]
 	if user == nil || user.ID == event.UserID {
 		return
 	}
@@ -228,15 +254,22 @@ func (svc *Service) cancelRemoved(ctx context.Context, event, old *models.Event)
 		still[normEmail(a.Email)] = true
 	}
 	org := normEmail(event.Organizer)
+	var removed []models.Attendee
+	var emails []string
 	for _, a := range oldAtts {
 		em := normEmail(a.Email)
 		if em == "" || em == org || still[em] {
 			continue
 		}
+		removed = append(removed, a)
+		emails = append(emails, em)
+	}
+	users := svc.localUsers(ctx, emails) // one lookup for all removed attendees
+	for _, a := range removed {
 		clone := *event
 		only, _ := json.Marshal([]models.Attendee{a})
 		clone.Attendees = only
-		svc.deliverLocal(ctx, &clone, a, "CANCEL")
+		svc.deliverLocal(ctx, &clone, a, "CANCEL", users)
 		svc.enqueueMessage(ctx, &clone, a, "CANCEL")
 	}
 }
@@ -255,14 +288,17 @@ func (svc *Service) propagateReply(ctx context.Context, event *models.Event, att
 	}
 	var atts []models.Attendee
 	_ = json.Unmarshal(event.Attendees, &atts)
+	var others []string
 	for _, a := range atts {
 		em := normEmail(a.Email)
 		if em == normEmail(attendeeEmail) || em == org {
 			continue
 		}
-		if u := svc.localUser(ctx, em); u != nil {
-			_, _ = svc.setAttendeeStatus(ctx, u.ID, event.UID, attendeeEmail, partstat)
-		}
+		others = append(others, em)
+	}
+	// One lookup for all other attendees instead of one per attendee.
+	for _, u := range svc.localUsers(ctx, others) {
+		_, _ = svc.setAttendeeStatus(ctx, u.ID, event.UID, attendeeEmail, partstat)
 	}
 	return true, nil
 }

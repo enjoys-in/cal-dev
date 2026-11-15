@@ -78,24 +78,24 @@ func main() {
 		"migrations/003_recurrence_overrides.sql",
 		"migrations/004_reminders.sql",
 		"migrations/005_calendar_byo_smtp.sql",
+		"migrations/006_change_log_fixes.sql",
 	}
+	// A missing or failed migration stops startup: running on a partial schema breaks later features.
 	for _, mf := range migrationFiles {
 		sqlBytes, err := os.ReadFile(mf)
 		if err != nil {
-			log.Printf("Migration file %s not found, skipping", mf)
-			continue
+			log.Fatalf("Migration file %s not readable (is the working directory the app root?): %v", mf, err)
 		}
 		applied, err := db.IsMigrationApplied(mf)
 		if err != nil {
-			applied = false
+			log.Fatalf("Checking migration %s failed: %v", mf, err)
 		}
 		if applied {
 			log.Printf("Migration %s already applied, skipping", mf)
 			continue
 		}
 		if err := db.RunMigration(string(sqlBytes)); err != nil {
-			log.Printf("Migration %s failed: %v", mf, err)
-			continue
+			log.Fatalf("Migration %s failed: %v", mf, err)
 		}
 		log.Printf("Migration %s applied successfully", mf)
 		if err := db.RecordMigration(mf); err != nil {
@@ -149,14 +149,16 @@ func main() {
 	// every write regardless of which API (CalDAV, JMAP, sync, scheduling) made it.
 	availSvc := availability.NewService(db, cfg.Sharing.OrgVisible)
 	rtHub := realtime.NewHub(db, availSvc)
-	rtHub.Start(ctx, cfg.Database.DSN())
+	hubCtx, stopHub := context.WithCancel(ctx) // stopped first at shutdown so SSE streams end
+	rtHub.Start(hubCtx, cfg.Database.DSN())
 
 	// Initialize handlers
 	caldavHandler := caldav.NewHandler(db, schedulingSvc)
 	caldavHandler.SetAvailability(availSvc)
-	baseURL := "https://localhost:" + fmt.Sprintf("%d", cfg.Server.Port)
-	if !cfg.TLS.Enabled {
-		baseURL = "http://localhost:" + fmt.Sprintf("%d", cfg.Server.Port)
+	// Advertised in the JMAP session (apiUrl, eventSourceUrl): must be the public URL in production.
+	baseURL := cfg.Server.PublicURL()
+	if os.Getenv("CALDEV_PUBLIC_URL") == "" && cfg.TLS.Enabled {
+		baseURL = "https://localhost:" + fmt.Sprintf("%d", cfg.Server.Port)
 	}
 	jmapHandler := jmap.NewHandler(db, baseURL, schedulingSvc)
 	jmapHandler.SetRealtime(rtHub)
@@ -171,6 +173,12 @@ func main() {
 		Prefork:               cfg.Server.Prefork,
 		DisableStartupMessage: false,
 		BodyLimit:             10 * 1024 * 1024, // 10MB
+		// Behind the reverse proxy, take the client IP from the proxy header (rate limiting, logs),
+		// but only when the request really comes from a trusted proxy.
+		ProxyHeader:             proxyHeader(),
+		EnableTrustedProxyCheck: true,
+		TrustedProxies:          trustedProxies(),
+		EnableIPValidation:      true,
 		RequestMethods: append(fiber.DefaultMethods,
 			"PROPFIND", "PROPPATCH", "MKCALENDAR", "REPORT",
 			"LOCK", "UNLOCK", "MOVE", "COPY",
@@ -309,9 +317,10 @@ func main() {
 	schedGroup.Post("/incoming", schedulingHandler.IncomingIMIP)
 	schedGroup.Post("/rsvp", schedulingHandler.RSVPRespond)
 
-	// Public 1-click Web RSVP (accessible by external recipients without login)
-	app.Get("/api/scheduling/rsvp", schedulingHandler.PublicWebRSVP)
-	app.Post("/api/scheduling/rsvp", schedulingHandler.PublicWebRSVP)
+	// Public web RSVP for email recipients (no login). It lives outside /api/scheduling because
+	// that group's auth middleware runs for every path under it. GET shows a page, POST records.
+	app.Get("/api/public/rsvp", rsvpPageHeaders, schedulingHandler.PublicWebRSVP)
+	app.Post("/api/public/rsvp", rsvpPageHeaders, schedulingHandler.PublicWebRSVP)
 
 	// ============================================================
 	// Calendar Subscriptions — Import from Google/Outlook/any ICS
@@ -341,15 +350,20 @@ func main() {
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 
+	// Listen returns as soon as the listener closes, so main waits on shutdownDone for in-flight
+	// requests to finish before the deferred db/queue Close calls run.
+	shutdownDone := make(chan struct{})
 	go func() {
 		<-quit
 		log.Println("Shutting down server...")
-		cancel()
-		worker.Stop()
-
+		// End the long-lived SSE streams, stop taking requests, then the background work.
+		stopHub()
 		if err := app.ShutdownWithTimeout(cfg.Server.ShutdownTimeout); err != nil {
 			log.Printf("Server forced shutdown: %v", err)
 		}
+		cancel()
+		worker.Stop()
+		close(shutdownDone)
 	}()
 
 	// Start server
@@ -365,6 +379,39 @@ func main() {
 			log.Fatalf("Server error: %v", err)
 		}
 	}
+	<-shutdownDone
+}
+
+// rsvpPageHeaders lets the public RSVP pages use their inline styles and post their form
+// (the global Content-Security-Policy is default-src 'self', which blocks inline CSS).
+func rsvpPageHeaders(c *fiber.Ctx) error {
+	c.Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'")
+	c.Set("Cache-Control", "no-store")
+	return c.Next()
+}
+
+// proxyHeader is the header carrying the client IP set by the reverse proxy (PROXY_HEADER,
+// default X-Forwarded-For).
+func proxyHeader() string {
+	if h := strings.TrimSpace(os.Getenv("PROXY_HEADER")); h != "" {
+		return h
+	}
+	return fiber.HeaderXForwardedFor
+}
+
+// trustedProxies lists the proxy IPs/CIDRs whose PROXY_HEADER is believed (TRUSTED_PROXIES,
+// comma-separated; default loopback and private ranges, which covers a Docker bridge).
+func trustedProxies() []string {
+	if v := strings.TrimSpace(os.Getenv("TRUSTED_PROXIES")); v != "" {
+		var out []string
+		for _, p := range strings.Split(v, ",") {
+			if p = strings.TrimSpace(p); p != "" {
+				out = append(out, p)
+			}
+		}
+		return out
+	}
+	return []string{"127.0.0.1", "::1", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7"}
 }
 
 // handleDAVMethod routes WebDAV methods to the correct handler.

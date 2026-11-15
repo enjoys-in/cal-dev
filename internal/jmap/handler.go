@@ -3,12 +3,16 @@ package jmap
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/enjoys-in/cal-dev/internal/availability"
@@ -45,11 +49,37 @@ func NewHandler(s *store.Store, baseURL string, sched *scheduling.Service) *Hand
 // JMAP Session Resource (RFC 8620 §2)
 // ============================================================
 
+// Limits advertised in the session and enforced by /get and /set.
+const (
+	maxObjectsInGet = 500
+	maxObjectsInSet = 500
+	// getAllRowCap bounds the rows (masters + overrides) a /get without ids may load.
+	getAllRowCap = 20 * maxObjectsInGet
+)
+
+// setLocks serialises /set calls per account inside this process, so ifInState is checked and
+// the writes happen without another /set of the same account in between.
+var setLocks sync.Map // tenantID -> *sync.Mutex
+
+func lockAccount(tenantID int) func() {
+	v, _ := setLocks.LoadOrStore(tenantID, &sync.Mutex{})
+	m := v.(*sync.Mutex)
+	m.Lock()
+	return m.Unlock
+}
+
 func (h *Handler) Session(c *fiber.Ctx) error {
 	tenantID := c.Locals("tenant_id").(int)
 	userID := c.Locals("user_id").(int)
 	email, _ := c.Locals("email").(string)
 
+	c.Set("Content-Type", "application/json")
+	return c.JSON(h.session(tenantID, userID, email))
+}
+
+// session builds the session object. Its state is a hash of the rest of the object, so it is
+// stable across calls and only changes when the session itself does (RFC 8620 §2).
+func (h *Handler) session(tenantID, userID int, email string) models.JMAPSession {
 	accountID := fmt.Sprintf("%d:%d", tenantID, userID)
 
 	session := models.JMAPSession{
@@ -60,8 +90,8 @@ func (h *Handler) Session(c *fiber.Ctx) error {
 				"maxSizeRequest":        10000000,
 				"maxConcurrentRequests": 8,
 				"maxCallsInRequest":     16,
-				"maxObjectsInGet":       500,
-				"maxObjectsInSet":       500,
+				"maxObjectsInGet":       maxObjectsInGet,
+				"maxObjectsInSet":       maxObjectsInSet,
 				"collationAlgorithms":   []string{"i;ascii-casemap", "i;ascii-numeric", "i;unicode-casemap"},
 			},
 			"urn:ietf:params:jmap:calendars": map[string]interface{}{
@@ -91,11 +121,11 @@ func (h *Handler) Session(c *fiber.Ctx) error {
 		DownloadURL:    h.baseURL + "/jmap/download/{accountId}/{blobId}/{name}",
 		UploadURL:      h.baseURL + "/jmap/upload/{accountId}/",
 		EventSourceURL: h.baseURL + "/jmap/eventsource",
-		State:          uuid.New().String()[:8],
 	}
-
-	c.Set("Content-Type", "application/json")
-	return c.JSON(session)
+	b, _ := json.Marshal(session) // map keys marshal sorted, so this is deterministic
+	sum := sha256.Sum256(b)
+	session.State = hex.EncodeToString(sum[:8])
+	return session
 }
 
 // ============================================================
@@ -131,18 +161,19 @@ func (h *Handler) API(c *fiber.Ctx) error {
 			continue
 		}
 
+		if err := resolveResultReferences(call, responses); err != nil {
+			responses = append(responses, jmapMethodError("invalidResultReference", err.Error(), call.CallID))
+			continue
+		}
+
 		result := h.dispatchMethod(c, tenantID, userID, call)
 		responses = append(responses, result)
 	}
 
-	state, _ := h.store.GetJMAPState(c.UserContext(), tenantID, userID, "CalendarEvent")
-	if state == "" {
-		state = uuid.New().String()[:8]
-	}
-
+	email, _ := c.Locals("email").(string)
 	resp := models.JMAPResponse{
 		MethodResponses: responses,
-		SessionState:    state,
+		SessionState:    h.session(tenantID, userID, email).State,
 	}
 
 	c.Set("Content-Type", "application/json")
@@ -190,23 +221,56 @@ func (h *Handler) calendarEventGet(c *fiber.Ctx, tenantID, userID int, call *JMA
 	}
 
 	var folded []foldedEvent
-	var notFound []string
+	notFound := []string{}
 
-	if len(args.IDs) == 0 {
-		// Return all events for user: one object per series, overrides folded into it
+	// State first: a change landing while the data is read then shows up in the next /changes.
+	state, _ := h.store.GetJMAPState(c.UserContext(), tenantID, userID, "CalendarEvent")
+
+	if args.IDs == nil {
+		// Return all events for user: one object per series, overrides folded into it.
+		// Bounded: past maxObjectsInGet the client must page with /query.
 		events, err := h.store.QueryResources(c.UserContext(), &models.EventFilter{
 			TenantID: tenantID,
 			UserID:   userID,
+			Limit:    getAllRowCap,
 		})
 		if err != nil {
 			return jmapMethodError("serverFail", err.Error(), call.CallID)
 		}
 		folded = foldResources(events)
+		if len(events) >= getAllRowCap || len(folded) > maxObjectsInGet {
+			return jmapMethodError("requestTooLarge", fmt.Sprintf("more than %d events; use CalendarEvent/query and pass ids", maxObjectsInGet), call.CallID)
+		}
 	} else {
+		if len(args.IDs) > maxObjectsInGet {
+			return jmapMethodError("requestTooLarge", fmt.Sprintf("at most %d ids per call", maxObjectsInGet), call.CallID)
+		}
+		// Ids that are not UUIDs cannot exist; keep them out of the query (Postgres would reject it).
+		valid := make([]string, 0, len(args.IDs))
 		for _, id := range args.IDs {
-			evt, err := h.store.GetEventByID(c.UserContext(), tenantID, id)
-			if err != nil {
-				return jmapMethodError("serverFail", err.Error(), call.CallID)
+			if u, err := uuid.Parse(id); err == nil {
+				valid = append(valid, u.String())
+			}
+		}
+		// One query for every requested id and its resource's rows, instead of two per id.
+		rows, err := h.store.GetResourcesByEventIDs(c.UserContext(), tenantID, valid)
+		if err != nil {
+			return jmapMethodError("serverFail", err.Error(), call.CallID)
+		}
+		type resKey struct{ cal, uid string }
+		byID := make(map[string]*models.Event, len(rows))
+		overrides := make(map[resKey][]*models.Event)
+		for _, r := range rows {
+			byID[r.ID] = r
+			if r.RecurrenceID != "" {
+				k := resKey{r.CalendarID, r.UID}
+				overrides[k] = append(overrides[k], r)
+			}
+		}
+		for _, id := range args.IDs {
+			var evt *models.Event
+			if u, err := uuid.Parse(id); err == nil {
+				evt = byID[u.String()]
 			}
 			if evt == nil {
 				notFound = append(notFound, id)
@@ -214,21 +278,11 @@ func (h *Handler) calendarEventGet(c *fiber.Ctx, tenantID, userID int, call *JMA
 			}
 			fe := foldedEvent{event: evt}
 			if evt.RecurrenceID == "" {
-				rows, err := h.store.GetResource(c.UserContext(), tenantID, evt.CalendarID, evt.UID)
-				if err != nil {
-					return jmapMethodError("serverFail", err.Error(), call.CallID)
-				}
-				for _, r := range rows {
-					if r.RecurrenceID != "" {
-						fe.overrides = append(fe.overrides, r)
-					}
-				}
+				fe.overrides = overrides[resKey{evt.CalendarID, evt.UID}]
 			}
 			folded = append(folded, fe)
 		}
 	}
-
-	state, _ := h.store.GetJMAPState(c.UserContext(), tenantID, userID, "CalendarEvent")
 
 	list := make([]map[string]interface{}, 0, len(folded))
 	for _, fe := range folded {
@@ -262,15 +316,17 @@ func (h *Handler) calendarEventSet(c *fiber.Ctx, tenantID, userID int, call *JMA
 	if err := json.Unmarshal(call.Args, &args); err != nil {
 		return jmapMethodError("invalidArguments", "Invalid arguments", call.CallID)
 	}
+	if len(args.Create)+len(args.Update)+len(args.Destroy) > maxObjectsInSet {
+		return jmapMethodError("requestTooLarge", fmt.Sprintf("at most %d objects per call", maxObjectsInSet), call.CallID)
+	}
 
-	if args.IfInState != "" {
-		currentState, _ := h.store.GetJMAPState(c.UserContext(), tenantID, userID, "CalendarEvent")
-		if args.IfInState != currentState {
-			return []interface{}{"error", map[string]string{
-				"type":        "stateMismatch",
-				"description": "State mismatch",
-			}, call.CallID}
-		}
+	defer lockAccount(tenantID)()
+	oldState, _ := h.store.GetJMAPState(c.UserContext(), tenantID, userID, "CalendarEvent")
+	if args.IfInState != "" && args.IfInState != oldState {
+		return []interface{}{"error", map[string]string{
+			"type":        "stateMismatch",
+			"description": "State mismatch",
+		}, call.CallID}
 	}
 
 	created := make(map[string]map[string]interface{})
@@ -282,7 +338,11 @@ func (h *Handler) calendarEventSet(c *fiber.Ctx, tenantID, userID int, call *JMA
 
 	// Handle creates
 	for tempID, props := range args.Create {
-		evt := jmapToEvent(props, tenantID, userID)
+		evt, err := jmapToEvent(props, tenantID, userID)
+		if err != nil {
+			notCreated[tempID] = invalidPropertiesError(err)
+			continue
+		}
 
 		// Enforce maximum attendees per event limit
 		var createAtts []models.Attendee
@@ -402,30 +462,42 @@ func (h *Handler) calendarEventSet(c *fiber.Ctx, tenantID, userID int, call *JMA
 			notUpdated[id] = map[string]string{"type": "forbidden", "description": "Calendar is read-only"}
 			continue
 		}
-		// Edit the loaded master row itself (the one FinalizeResource/ReplaceResource will write).
-		// An orphan override addressed by its own id is its own resource: rows[0] is then that override.
-		evt = rows[0]
+		// Edit the loaded row that was asked for (the one FinalizeResource/ReplaceResource will
+		// write): the master, or an orphan override addressed by its own id (it is its own event,
+		// even when other orphan overrides share its resource).
+		var target *models.Event
+		for _, r := range rows {
+			if r.ID == evt.ID {
+				target = r
+				break
+			}
+		}
+		if target == nil {
+			notUpdated[id] = map[string]string{"type": "serverFail", "description": "cannot load event"}
+			continue
+		}
+		evt = target
+		isSeries := evt.RecurrenceID == ""
 
 		// Moving to another calendar: only into one of the caller's own writable calendars.
+		// The move itself happens last, once every change has been validated.
+		oldCalendarID, moveTo := evt.CalendarID, ""
 		if newCal, ok := props["calendarId"].(string); ok && newCal != "" && newCal != evt.CalendarID {
 			dest, err := h.store.GetCalendar(c.UserContext(), tenantID, newCal)
 			if err != nil || dest == nil || dest.UserID != userID || dest.IsReadOnly {
 				notUpdated[id] = map[string]string{"type": "forbidden", "description": "Calendar not found or access denied"}
 				continue
 			}
-			if err := h.store.MoveEvent(c.UserContext(), tenantID, evt.CalendarID, evt.UID, newCal); err != nil {
-				notUpdated[id] = map[string]string{"type": "serverFail", "description": err.Error()}
-				continue
-			}
-			for _, r := range rows {
-				r.CalendarID = newCal
-			}
+			moveTo = newCal
 		}
 
 		// Apply updates (keep a snapshot of the previous version for scheduling diffs;
 		// applyJMAPUpdates reassigns fields rather than mutating shared slices).
 		oldEvt := *evt
-		applyJMAPUpdates(evt, props)
+		if err := applyJMAPUpdates(evt, props); err != nil {
+			notUpdated[id] = invalidPropertiesError(err)
+			continue
+		}
 
 		// Enforce maximum attendees per event limit
 		var updateAtts []models.Attendee
@@ -450,16 +522,31 @@ func (h *Handler) calendarEventSet(c *fiber.Ctx, tenantID, userID int, call *JMA
 				"properties": []string{"timeZone"}, "description": err.Error()}
 			continue
 		}
-		if zoneAfter := ics.EventTZID(evt); zoneAfter != zoneBefore {
+		if zoneAfter := ics.EventTZID(evt); isSeries && zoneAfter != zoneBefore {
 			for _, r := range rows[1:] { // overrides follow the series' zone
 				_ = ics.SetEventTZID(r, zoneAfter)
 			}
 		}
 
 		if patches, ok := props["recurrenceOverrides"].(map[string]interface{}); ok {
+			if !isSeries {
+				notUpdated[id] = map[string]string{"type": "invalidProperties",
+					"description": "recurrenceOverrides can only be set on a series"}
+				continue
+			}
 			if rows, err = applyOverridePatches(rows, patches); err != nil {
 				notUpdated[id] = map[string]string{"type": "invalidProperties", "description": err.Error()}
 				continue
+			}
+		}
+
+		if moveTo != "" {
+			if err := h.store.MoveEvent(c.UserContext(), tenantID, oldCalendarID, evt.UID, moveTo); err != nil {
+				notUpdated[id] = map[string]string{"type": "serverFail", "description": err.Error()}
+				continue
+			}
+			for _, r := range rows {
+				r.CalendarID = moveTo
 			}
 		}
 		rows = ics.FinalizeResource(rows) // regenerates every component; overrides, alarms and EXDATEs survive
@@ -494,15 +581,31 @@ func (h *Handler) calendarEventSet(c *fiber.Ctx, tenantID, userID int, call *JMA
 			notDestroyed[id] = map[string]string{"type": "forbidden", "description": "Calendar is read-only"}
 			continue
 		}
+		var remaining []*models.Event // other orphan overrides sharing this one's resource
 		if evt.RecurrenceID != "" {
-			if master, _ := h.store.GetEvent(c.UserContext(), tenantID, evt.CalendarID, evt.UID); master != nil && master.RecurrenceID == "" {
+			rows, err := h.store.GetResource(c.UserContext(), tenantID, evt.CalendarID, evt.UID)
+			if err != nil {
+				notDestroyed[id] = map[string]string{"type": "serverFail", "description": err.Error()}
+				continue
+			}
+			if len(rows) > 0 && rows[0].RecurrenceID == "" {
 				// destroying one occurrence must not delete the whole series
 				notDestroyed[id] = map[string]string{"type": "invalidProperties",
 					"description": "this id is a single occurrence; set recurrenceOverrides[<start>] = {\"excluded\": true} on the series instead"}
 				continue
 			}
+			for _, r := range rows {
+				if r.ID != evt.ID {
+					remaining = append(remaining, r)
+				}
+			}
 		}
-		if err := h.store.DeleteEvent(c.UserContext(), tenantID, evt.CalendarID, evt.UID); err != nil {
+		if len(remaining) > 0 {
+			err = h.store.ReplaceResource(c.UserContext(), tenantID, evt.CalendarID, evt.UID, ics.FinalizeResource(remaining))
+		} else {
+			err = h.store.DeleteEvent(c.UserContext(), tenantID, evt.CalendarID, evt.UID)
+		}
+		if err != nil {
 			notDestroyed[id] = map[string]string{"type": "serverFail", "description": err.Error()}
 			continue
 		}
@@ -523,7 +626,7 @@ func (h *Handler) calendarEventSet(c *fiber.Ctx, tenantID, userID int, call *JMA
 
 	result := map[string]interface{}{
 		"accountId":    fmt.Sprintf("%d:%d", tenantID, userID),
-		"oldState":     args.IfInState,
+		"oldState":     oldState,
 		"newState":     newState,
 		"created":      created,
 		"updated":      updated,
@@ -554,15 +657,18 @@ func (h *Handler) calendarEventQuery(c *fiber.Ctx, tenantID, userID int, call *J
 		return jmapMethodError("invalidArguments", "Invalid arguments", call.CallID)
 	}
 
+	if args.Limit < 0 {
+		return jmapMethodError("invalidArguments", "limit must not be negative", call.CallID)
+	}
+	limit := args.Limit
+	if limit == 0 {
+		limit = 100 // Default limit
+	}
+
+	// No SQL LIMIT/OFFSET: recurrence filtering and folding happen in Go, so paging must too.
 	filter := &models.EventFilter{
 		TenantID: tenantID,
 		UserID:   userID,
-		Limit:    args.Limit,
-		Offset:   args.Position,
-	}
-
-	if args.Limit == 0 {
-		filter.Limit = 100 // Default limit
 	}
 
 	// Apply filters
@@ -570,15 +676,26 @@ func (h *Handler) calendarEventQuery(c *fiber.Ctx, tenantID, userID int, call *J
 		if calID, ok := args.Filter["calendarId"].(string); ok {
 			filter.CalendarID = calID
 		}
-		if after, ok := args.Filter["after"].(string); ok {
-			t, _ := time.Parse(time.RFC3339, after)
-			filter.TimeRangeStart = &t
-		}
-		if before, ok := args.Filter["before"].(string); ok {
-			t, _ := time.Parse(time.RFC3339, before)
-			filter.TimeRangeEnd = &t
+		for _, key := range []string{"after", "before"} {
+			raw, present := args.Filter[key]
+			if !present {
+				continue
+			}
+			str, _ := raw.(string)
+			t, err := time.Parse(time.RFC3339, str)
+			if err != nil {
+				return jmapMethodError("invalidArguments", "filter."+key+" must be an RFC 3339 date-time", call.CallID)
+			}
+			if key == "after" {
+				filter.TimeRangeStart = &t
+			} else {
+				filter.TimeRangeEnd = &t
+			}
 		}
 	}
+
+	// State first: a change landing while the data is read then shows up in the next /changes.
+	state, _ := h.store.GetJMAPState(c.UserContext(), tenantID, userID, "CalendarEvent")
 
 	events, err := h.store.QueryResources(c.UserContext(), filter)
 	if err != nil {
@@ -587,20 +704,41 @@ func (h *Handler) calendarEventQuery(c *fiber.Ctx, tenantID, userID int, call *J
 
 	// One id per series: an override that matched on its own resolves to its master's id.
 	folded := foldResources(events)
-	ids := make([]string, 0, len(folded))
-	for _, fe := range folded {
+	sort.SliceStable(folded, func(i, j int) bool {
+		a, b := folded[i].event, folded[j].event
+		if !a.DTStart.Equal(b.DTStart) {
+			return a.DTStart.Before(b.DTStart)
+		}
+		return a.ID < b.ID
+	})
+
+	total := len(folded)
+	pos := args.Position
+	if pos < 0 { // negative: offset from the end (RFC 8620 §5.5)
+		pos += total
+		if pos < 0 {
+			pos = 0
+		}
+	}
+	if pos > total {
+		pos = total
+	}
+	end := total
+	if pos+limit < end {
+		end = pos + limit
+	}
+	ids := make([]string, 0, end-pos)
+	for _, fe := range folded[pos:end] {
 		ids = append(ids, fe.event.ID)
 	}
-
-	state, _ := h.store.GetJMAPState(c.UserContext(), tenantID, userID, "CalendarEvent")
 
 	result := map[string]interface{}{
 		"accountId":           fmt.Sprintf("%d:%d", tenantID, userID),
 		"queryState":          state,
 		"canCalculateChanges": false,
-		"position":            args.Position,
+		"position":            pos,
 		"ids":                 ids,
-		"total":               len(ids),
+		"total":               total,
 	}
 
 	return []interface{}{"CalendarEvent/query", result, call.CallID}
@@ -626,7 +764,14 @@ func (h *Handler) calendarEventChanges(c *fiber.Ctx, tenantID, userID int, call 
 		newState = "initial"
 	}
 
-	if args.SinceState == "" || args.SinceState == newState {
+	// No state, or one this server never handed out (ahead of the current one): the client must resync.
+	since, perr := strconv.ParseInt(args.SinceState, 10, 64)
+	current, _ := strconv.ParseInt(newState, 10, 64)
+	if args.SinceState == "" || (perr == nil && since > current) {
+		return jmapMethodError("cannotCalculateChanges", "Unknown or future sinceState; refetch everything", call.CallID)
+	}
+
+	if args.SinceState == newState {
 		result := map[string]interface{}{
 			"accountId":      fmt.Sprintf("%d:%d", tenantID, userID),
 			"oldState":       args.SinceState,
@@ -668,6 +813,7 @@ func (h *Handler) calendarGet(c *fiber.Ctx, tenantID, userID int, call *JMAPMeth
 	if err := h.store.EnsureDefaultCalendar(c.UserContext(), tenantID, userID); err != nil {
 		log.Printf("Warning: auto-provision default calendar failed: %v", err)
 	}
+	state, _ := h.store.GetJMAPState(c.UserContext(), tenantID, userID, "Calendar")
 	calendars, err := h.store.GetCalendarsByUser(c.UserContext(), tenantID, userID)
 	if err != nil {
 		return jmapMethodError("serverFail", err.Error(), call.CallID)
@@ -698,8 +844,6 @@ func (h *Handler) calendarGet(c *fiber.Ctx, tenantID, userID int, call *JMAPMeth
 		})
 	}
 
-	state, _ := h.store.GetJMAPState(c.UserContext(), tenantID, userID, "Calendar")
-
 	result := map[string]interface{}{
 		"accountId": fmt.Sprintf("%d:%d", tenantID, userID),
 		"state":     state,
@@ -727,15 +871,17 @@ func (h *Handler) calendarSet(c *fiber.Ctx, tenantID, userID int, call *JMAPMeth
 	if err := json.Unmarshal(call.Args, &args); err != nil {
 		return jmapMethodError("invalidArguments", "Invalid arguments", call.CallID)
 	}
+	if len(args.Create)+len(args.Update)+len(args.Destroy) > maxObjectsInSet {
+		return jmapMethodError("requestTooLarge", fmt.Sprintf("at most %d objects per call", maxObjectsInSet), call.CallID)
+	}
 
-	if args.IfInState != "" {
-		currentState, _ := h.store.GetJMAPState(c.UserContext(), tenantID, userID, "Calendar")
-		if args.IfInState != currentState {
-			return []interface{}{"error", map[string]string{
-				"type":        "stateMismatch",
-				"description": "State mismatch",
-			}, call.CallID}
-		}
+	defer lockAccount(tenantID)()
+	oldState, _ := h.store.GetJMAPState(c.UserContext(), tenantID, userID, "Calendar")
+	if args.IfInState != "" && args.IfInState != oldState {
+		return []interface{}{"error", map[string]string{
+			"type":        "stateMismatch",
+			"description": "State mismatch",
+		}, call.CallID}
 	}
 
 	created := make(map[string]map[string]interface{})
@@ -743,6 +889,7 @@ func (h *Handler) calendarSet(c *fiber.Ctx, tenantID, userID int, call *JMAPMeth
 	destroyed := make([]string, 0)
 	notCreated := make(map[string]interface{})
 	notUpdated := make(map[string]interface{})
+	notDestroyed := make(map[string]interface{})
 
 	// Handle creates
 	for tempID, props := range args.Create {
@@ -833,22 +980,37 @@ func (h *Handler) calendarSet(c *fiber.Ctx, tenantID, userID int, call *JMAPMeth
 
 	// Handle destroys
 	for _, id := range args.Destroy {
-		if err := h.store.DeleteCalendar(c.UserContext(), tenantID, id); err == nil {
-			destroyed = append(destroyed, id)
+		if _, err := uuid.Parse(id); err != nil {
+			notDestroyed[id] = map[string]string{"type": "notFound", "description": "Calendar not found"}
+			continue
 		}
+		cal, err := h.store.GetCalendar(c.UserContext(), tenantID, id)
+		if err == nil && cal == nil {
+			notDestroyed[id] = map[string]string{"type": "notFound", "description": "Calendar not found"}
+			continue
+		}
+		if err == nil {
+			err = h.store.DeleteCalendar(c.UserContext(), tenantID, id)
+		}
+		if err != nil {
+			notDestroyed[id] = map[string]string{"type": "serverFail", "description": err.Error()}
+			continue
+		}
+		destroyed = append(destroyed, id)
 	}
 
 	newState, _ := h.store.GetJMAPState(c.UserContext(), tenantID, userID, "Calendar")
 
 	result := map[string]interface{}{
-		"accountId":  fmt.Sprintf("%d:%d", tenantID, userID),
-		"oldState":   args.IfInState,
-		"newState":   newState,
-		"created":    created,
-		"updated":    updated,
-		"destroyed":  destroyed,
-		"notCreated": notCreated,
-		"notUpdated": notUpdated,
+		"accountId":    fmt.Sprintf("%d:%d", tenantID, userID),
+		"oldState":     oldState,
+		"newState":     newState,
+		"created":      created,
+		"updated":      updated,
+		"destroyed":    destroyed,
+		"notCreated":   notCreated,
+		"notUpdated":   notUpdated,
+		"notDestroyed": notDestroyed,
 	}
 
 	return []interface{}{"Calendar/set", result, call.CallID}
@@ -969,6 +1131,118 @@ func parseMethodCall(raw json.RawMessage) (*JMAPMethodCall, error) {
 	}, nil
 }
 
+// resolveResultReferences replaces every "#name": {"resultOf", "name", "path"} argument with the
+// value the path selects in an earlier response of the same request (RFC 8620 §3.7).
+func resolveResultReferences(call *JMAPMethodCall, previous []interface{}) error {
+	var args map[string]json.RawMessage
+	if err := json.Unmarshal(call.Args, &args); err != nil {
+		return nil // not an object: the method reports invalidArguments itself
+	}
+	changed := false
+	for key, raw := range args {
+		if !strings.HasPrefix(key, "#") {
+			continue
+		}
+		if _, dup := args[key[1:]]; dup {
+			return fmt.Errorf("both %q and %q given", key[1:], key)
+		}
+		var ref struct {
+			ResultOf string `json:"resultOf"`
+			Name     string `json:"name"`
+			Path     string `json:"path"`
+		}
+		if err := json.Unmarshal(raw, &ref); err != nil {
+			return fmt.Errorf("%s is not a result reference", key)
+		}
+		var found interface{}
+		resolved := false
+		for _, p := range previous {
+			r, ok := p.([]interface{})
+			if !ok || len(r) != 3 || r[2] != ref.ResultOf {
+				continue
+			}
+			if r[0] != ref.Name {
+				return fmt.Errorf("%s: response %q is %v, not %s", key, ref.ResultOf, r[0], ref.Name)
+			}
+			b, err := json.Marshal(r[1])
+			if err != nil {
+				return err
+			}
+			var doc interface{}
+			if err := json.Unmarshal(b, &doc); err != nil {
+				return err
+			}
+			var parts []string
+			if ref.Path != "" {
+				parts = strings.Split(strings.TrimPrefix(ref.Path, "/"), "/")
+			}
+			v, ok := evalJSONPointer(doc, parts)
+			if !ok {
+				return fmt.Errorf("%s: path %q not found in %s", key, ref.Path, ref.ResultOf)
+			}
+			found, resolved = v, true
+			break
+		}
+		if !resolved {
+			return fmt.Errorf("%s: no earlier response %q", key, ref.ResultOf)
+		}
+		b, err := json.Marshal(found)
+		if err != nil {
+			return err
+		}
+		delete(args, key)
+		args[key[1:]] = b
+		changed = true
+	}
+	if changed {
+		b, err := json.Marshal(args)
+		if err != nil {
+			return err
+		}
+		call.Args = b
+	}
+	return nil
+}
+
+// evalJSONPointer evaluates a JSON pointer with the JMAP "*" extension: on an array it maps the
+// rest of the path over every element, flattening array results into one list.
+func evalJSONPointer(v interface{}, parts []string) (interface{}, bool) {
+	if len(parts) == 0 {
+		return v, true
+	}
+	p := strings.ReplaceAll(strings.ReplaceAll(parts[0], "~1", "/"), "~0", "~")
+	switch t := v.(type) {
+	case map[string]interface{}:
+		next, ok := t[p]
+		if !ok {
+			return nil, false
+		}
+		return evalJSONPointer(next, parts[1:])
+	case []interface{}:
+		if p == "*" {
+			out := make([]interface{}, 0, len(t))
+			for _, e := range t {
+				r, ok := evalJSONPointer(e, parts[1:])
+				if !ok {
+					return nil, false
+				}
+				if list, isList := r.([]interface{}); isList {
+					out = append(out, list...)
+				} else {
+					out = append(out, r)
+				}
+			}
+			return out, true
+		}
+		i, err := strconv.Atoi(p)
+		if err != nil || i < 0 || i >= len(t) {
+			return nil, false
+		}
+		return evalJSONPointer(t[i], parts[1:])
+	}
+	return nil, false
+}
+
 func eventToJMAP(evt *models.Event, overrides []*models.Event) map[string]interface{} {
 	result := map[string]interface{}{
 		"id":             evt.ID,
@@ -1041,7 +1315,56 @@ func eventToJMAP(evt *models.Event, overrides []*models.Event) map[string]interf
 	return result
 }
 
-func jmapToEvent(props map[string]interface{}, tenantID, userID int) *models.Event {
+// propertyError is a create/update value that cannot be accepted (reported as invalidProperties).
+type propertyError struct{ prop, msg string }
+
+func (e *propertyError) Error() string { return e.msg }
+
+func invalidPropertiesError(err error) map[string]interface{} {
+	out := map[string]interface{}{"type": "invalidProperties", "description": err.Error()}
+	if pe, ok := err.(*propertyError); ok {
+		out["properties"] = []string{pe.prop}
+	}
+	return out
+}
+
+// parseJMAPDateTime accepts an RFC 3339 date-time or a JSCalendar LocalDateTime
+// ("2026-11-20T09:00:00", no offset), which is wall-clock time in zone ("" means UTC).
+func parseJMAPDateTime(s, zone string) (time.Time, error) {
+	if t, err := time.Parse(time.RFC3339, s); err == nil {
+		return t, nil
+	}
+	loc := time.UTC
+	if zone != "" {
+		if l, ok := ics.ResolveTZID(zone); ok {
+			loc = l
+		}
+	}
+	return time.ParseInLocation("2006-01-02T15:04:05", s, loc)
+}
+
+// applyJMAPTimes sets start (if present) and end (if a string) from props; LocalDateTime values
+// are read in zone.
+func applyJMAPTimes(evt *models.Event, props map[string]interface{}, zone string) error {
+	if raw, present := props["start"]; present {
+		str, _ := raw.(string)
+		t, err := parseJMAPDateTime(str, zone)
+		if err != nil {
+			return &propertyError{"start", "start must be an RFC 3339 date-time or a LocalDateTime such as 2026-11-20T09:00:00"}
+		}
+		evt.DTStart = t
+	}
+	if str, ok := props["end"].(string); ok {
+		t, err := parseJMAPDateTime(str, zone)
+		if err != nil {
+			return &propertyError{"end", "end must be an RFC 3339 date-time or a LocalDateTime such as 2026-11-20T10:00:00"}
+		}
+		evt.DTEnd = &t
+	}
+	return nil
+}
+
+func jmapToEvent(props map[string]interface{}, tenantID, userID int) (*models.Event, error) {
 	evt := &models.Event{
 		ID:             uuid.New().String(),
 		TenantID:       tenantID,
@@ -1067,21 +1390,21 @@ func jmapToEvent(props map[string]interface{}, tenantID, userID int) *models.Eve
 	if loc, ok := props["location"].(string); ok {
 		evt.Location = loc
 	}
-	if start, ok := props["start"].(string); ok {
-		if t, err := time.Parse(time.RFC3339, start); err == nil {
-			evt.DTStart = t
-		}
-	}
-	if end, ok := props["end"].(string); ok {
-		if t, err := time.Parse(time.RFC3339, end); err == nil {
-			evt.DTEnd = &t
-		}
+	if _, present := props["start"]; !present {
+		return nil, &propertyError{"start", "start is required"}
 	}
 	if dur, ok := props["duration"].(string); ok {
 		evt.Duration = dur
 	}
 	if allDay, ok := props["isAllDay"].(bool); ok {
 		evt.AllDay = allDay
+	}
+	zone := ""
+	if !evt.AllDay {
+		zone, _ = props["timeZone"].(string)
+	}
+	if err := applyJMAPTimes(evt, props, zone); err != nil {
+		return nil, err
 	}
 	if calID, ok := props["calendarId"].(string); ok {
 		evt.CalendarID = calID
@@ -1102,10 +1425,10 @@ func jmapToEvent(props map[string]interface{}, tenantID, userID int) *models.Eve
 		evt.Attendees = atts
 	}
 
-	return evt
+	return evt, nil
 }
 
-func applyJMAPUpdates(evt *models.Event, props map[string]interface{}) {
+func applyJMAPUpdates(evt *models.Event, props map[string]interface{}) error {
 	if title, ok := props["title"].(string); ok {
 		evt.Summary = title
 	}
@@ -1115,21 +1438,18 @@ func applyJMAPUpdates(evt *models.Event, props map[string]interface{}) {
 	if loc, ok := props["location"].(string); ok {
 		evt.Location = loc
 	}
-	if start, ok := props["start"].(string); ok {
-		if t, err := time.Parse(time.RFC3339, start); err == nil {
-			evt.DTStart = t
-		}
-	}
-	if end, ok := props["end"].(string); ok {
-		if t, err := time.Parse(time.RFC3339, end); err == nil {
-			evt.DTEnd = &t
-		}
-	}
 	if dur, ok := props["duration"].(string); ok {
 		evt.Duration = dur
 	}
 	if allDay, ok := props["isAllDay"].(bool); ok {
 		evt.AllDay = allDay
+	}
+	zone := ics.EventTZID(evt) // "" for all-day events
+	if tz, ok := props["timeZone"].(string); ok && !evt.AllDay {
+		zone = tz
+	}
+	if err := applyJMAPTimes(evt, props, zone); err != nil {
+		return err
 	}
 	if calID, ok := props["calendarId"].(string); ok && calID != "" {
 		evt.CalendarID = calID
@@ -1147,6 +1467,7 @@ func applyJMAPUpdates(evt *models.Event, props map[string]interface{}) {
 		evt.Attendees = atts
 	}
 	evt.Sequence++
+	return nil
 }
 
 func hasAttendees(raw json.RawMessage) bool {
@@ -1157,8 +1478,13 @@ func hasAttendees(raw json.RawMessage) bool {
 func parseJMAPParticipants(props map[string]interface{}) (json.RawMessage, bool) {
 	if participants, ok := props["participants"].(map[string]interface{}); ok {
 		var attendees []models.Attendee
-		for _, p := range participants {
-			if pMap, ok := p.(map[string]interface{}); ok {
+		keys := make([]string, 0, len(participants))
+		for k := range participants {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys) // deterministic attendee order
+		for _, k := range keys {
+			if pMap, ok := participants[k].(map[string]interface{}); ok {
 				a := models.Attendee{
 					Role:   "REQ-PARTICIPANT",
 					Status: "NEEDS-ACTION",
@@ -1176,7 +1502,7 @@ func parseJMAPParticipants(props map[string]interface{}) (json.RawMessage, bool)
 				if expectReply, ok := pMap["expectReply"].(bool); ok {
 					a.RSVP = expectReply
 				}
-				if a.Email != "" && len(attendees) < models.MaxAttendeesPerEvent {
+				if a.Email != "" { // no cap here: callers reject events over MaxAttendeesPerEvent
 					attendees = append(attendees, a)
 				}
 			}
@@ -1291,6 +1617,8 @@ func (h *Handler) EventSource(c *fiber.Ctx) error {
 		for {
 			select {
 			case <-ctx.Done():
+				return
+			case <-h.hub.Done(): // server shutting down: end the stream so shutdown isn't held up
 				return
 			case m := <-sub.C:
 				if !write(m) {

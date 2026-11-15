@@ -27,6 +27,10 @@ type Occurrence struct {
 // DefaultLimit caps the occurrences returned for a single event.
 const DefaultLimit = 1000
 
+// maxRuleIterations caps the candidate starts read from one RRULE per expansion (including the
+// ones before the window), so old or pathological series cannot iterate for ever.
+const maxRuleIterations = 100000
+
 type eventProps struct {
 	ExDates []string `json:"exdates"`
 	RDates  []string `json:"rdates"`
@@ -224,9 +228,11 @@ func ruleStarts(e *models.Event, rule string, loc *time.Location, after, before 
 		// Unparseable rule: fall back to the master instance only.
 		return []time.Time{e.DTStart}
 	}
-	switch opt.Freq {
-	case rrule.SECONDLY, rrule.MINUTELY:
-		// Refuse sub-hourly recurrence: expansion cost is unbounded for old series.
+	switch {
+	case opt.Freq == rrule.SECONDLY, opt.Freq == rrule.MINUTELY,
+		opt.Freq == rrule.HOURLY && len(opt.Byminute) > 1, len(opt.Bysecond) > 1:
+		// Refuse sub-hourly recurrence (also via BYMINUTE/BYSECOND lists): expansion cost is
+		// unbounded for old series.
 		return []time.Time{e.DTStart}
 	}
 	dtstart := e.DTStart.In(loc)
@@ -240,7 +246,7 @@ func ruleStarts(e *models.Event, rule string, loc *time.Location, after, before 
 	}
 	var out []time.Time
 	next := r.Iterator()
-	for len(out) < max {
+	for i := 0; len(out) < max && i < maxRuleIterations; i++ {
 		t, ok := next()
 		if !ok || t.After(before) {
 			break

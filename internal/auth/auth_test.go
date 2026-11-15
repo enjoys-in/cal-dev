@@ -52,3 +52,22 @@ func TestExpiredAndWrongIssuerRejected(t *testing.T) {
 		t.Fatal("token from another issuer accepted")
 	}
 }
+
+func TestBasicCache(t *testing.T) {
+	s := svc(true)
+	k := basicKey(" A@x.com ", "pw")
+	if _, ok := s.cachedBasic(k); ok {
+		t.Fatal("empty cache must miss")
+	}
+	s.rememberBasic(k, basicEntry{userID: 7, expires: time.Now().Add(time.Minute)})
+	if e, ok := s.cachedBasic(basicKey("a@x.com", "pw")); !ok || e.userID != 7 {
+		t.Fatal("cached login must hit (email is case-insensitive)")
+	}
+	if _, ok := s.cachedBasic(basicKey("a@x.com", "other")); ok {
+		t.Fatal("a different password must miss")
+	}
+	s.rememberBasic(k, basicEntry{userID: 7, expires: time.Now().Add(-time.Second)})
+	if _, ok := s.cachedBasic(k); ok {
+		t.Fatal("expired entry must miss")
+	}
+}

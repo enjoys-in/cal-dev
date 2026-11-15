@@ -123,3 +123,45 @@ func TestSeriesOccurrencesExpansion(t *testing.T) {
 		t.Errorf("expected override summary, got %s", occSeries[0].Event.Summary)
 	}
 }
+
+func TestReminderCopyScoping(t *testing.T) {
+	atts, _ := json.Marshal([]models.Attendee{{Email: "a@x.com", Status: "ACCEPTED"}, {Email: "b@x.com", Status: "DECLINED"}})
+	rs := []ReminderRecipient{{UserID: 1, Email: "org@x.com"}, {UserID: 2, Email: "a@x.com"}, {Email: "ext@y.com"}}
+
+	orgCopy := &models.Event{UserID: 1, Organizer: "mailto:org@x.com", Attendees: atts}
+	if got := ownerScope(orgCopy, rs); len(got) != 3 {
+		t.Fatalf("organizer copy should remind everyone, got %v", got)
+	}
+	extInvite := &models.Event{UserID: 2, Organizer: "boss@elsewhere.com", Attendees: atts}
+	if got := ownerScope(extInvite, rs); len(got) != 1 || got[0].UserID != 2 {
+		t.Fatalf("external invitation copy should remind only its owner, got %v", got)
+	}
+
+	localCopy := &models.Event{UserID: 2, Properties: json.RawMessage(`{"invitation":{"organizer_user_id":1}}`)}
+	if !isLocalInvitationCopy(localCopy) {
+		t.Error("copy of a local organizer's event must not schedule reminders")
+	}
+	inbound := &models.Event{UserID: 2, Properties: json.RawMessage(`{"invitation":{"organizer_user_id":2}}`)}
+	if isLocalInvitationCopy(inbound) || isLocalInvitationCopy(orgCopy) {
+		t.Error("own events and inbound invitations schedule reminders")
+	}
+
+	if !isActiveParticipant(orgCopy, "ORG@x.com") || !isActiveParticipant(orgCopy, "a@x.com") {
+		t.Error("organizer and accepted attendee are participants")
+	}
+	if isActiveParticipant(orgCopy, "b@x.com") || isActiveParticipant(orgCopy, "gone@x.com") {
+		t.Error("declined or removed attendees are not participants")
+	}
+}
+
+func TestReminderIdentityIncludesStart(t *testing.T) {
+	p := ReminderJobPayload{TenantID: 1, CalendarID: "c", EventUID: "u", StartUTC: utc(2026, 11, 15, 10, 0), RecipientEmail: "a@x.com", MilestoneMinutes: 5}
+	q := p
+	if reminderJobID(p) != reminderJobID(q) {
+		t.Fatal("job id must be deterministic")
+	}
+	q.StartUTC = q.StartUTC.Add(time.Hour)
+	if reminderJobID(p) == reminderJobID(q) || deliveryKey(&p) == deliveryKey(&q) {
+		t.Fatal("a moved occurrence must get a new job id and delivery key")
+	}
+}

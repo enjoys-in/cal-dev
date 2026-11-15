@@ -102,6 +102,52 @@ func (s *Store) GetUserByEmail(ctx context.Context, email string) (*models.User,
 	return u, err
 }
 
+// GetUsersByEmails is GetUserByEmail for many addresses in at most two queries: exact matches
+// first (index-friendly), then the misses ignoring case, lowest id winning. The map is keyed by
+// the lower-cased, trimmed address; addresses without an account are absent.
+func (s *Store) GetUsersByEmails(ctx context.Context, emails []string) (map[string]*models.User, error) {
+	out := make(map[string]*models.User, len(emails))
+	if len(emails) == 0 {
+		return out, nil
+	}
+	const query = `SELECT id, COALESCE(name, '') as name, email, COALESCE(tenant_name, '') as tenant_name,
+		COALESCE(status, 'ACTIVE') as status, COALESCE(type, 'USER') as type, created_at, updated_at
+		FROM mail_accounts WHERE `
+	collect := func(where string, list []string) error {
+		rows, err := s.db.QueryContext(ctx, query+where+" ORDER BY id", pq.Array(list))
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			u := &models.User{}
+			if err := rows.Scan(&u.ID, &u.Name, &u.Email, &u.TenantName, &u.Status, &u.Type, &u.CreatedAt, &u.UpdatedAt); err != nil {
+				return err
+			}
+			if k := strings.ToLower(strings.TrimSpace(u.Email)); out[k] == nil {
+				out[k] = u
+			}
+		}
+		return rows.Err()
+	}
+
+	if err := collect("email = ANY($1)", emails); err != nil {
+		return nil, err
+	}
+	var missing []string
+	for _, e := range emails {
+		if k := strings.ToLower(strings.TrimSpace(e)); k != "" && out[k] == nil {
+			missing = append(missing, k)
+		}
+	}
+	if len(missing) > 0 {
+		if err := collect("lower(email) = ANY($1)", missing); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
 func (s *Store) GetUserByID(ctx context.Context, id int) (*models.User, error) {
 	u := &models.User{}
 	query := `SELECT id, COALESCE(name, '') as name, email, COALESCE(tenant_name, '') as tenant_name,
@@ -225,12 +271,16 @@ func (s *Store) CreateAppPasswordFromInput(ctx context.Context, ap *AppPasswordI
 // ============================================================
 
 func (s *Store) CreateCalendar(ctx context.Context, c *models.Calendar) error {
+	return createCalendar(ctx, s.db, c)
+}
+
+func createCalendar(ctx context.Context, q queryRower, c *models.Calendar) error {
 	query := `INSERT INTO caldev_calendars 
 		(id, tenant_id, user_id, name, description, color, timezone, sort_order, ctag, sync_token,
 		 is_default, is_visible, is_readonly, supported_components, max_resource_size, properties)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
 		RETURNING created_at, updated_at`
-	return s.db.QueryRowContext(ctx, query,
+	return q.QueryRowContext(ctx, query,
 		c.ID, c.TenantID, c.UserID, c.Name, c.Description, c.Color, c.Timezone,
 		c.SortOrder, c.CTag, c.SyncToken, c.IsDefault, c.IsVisible, c.IsReadOnly,
 		pq.Array(c.SupportedComponents), c.MaxResourceSize, c.Properties).
@@ -288,16 +338,28 @@ func (s *Store) GetCalendarsByUser(ctx context.Context, tenantID, userID int) ([
 }
 
 // EnsureDefaultCalendar creates a default "Personal" calendar if the user has none.
+// The check and the insert run in one transaction under a per-user advisory lock, so parallel
+// first requests cannot both create one.
 func (s *Store) EnsureDefaultCalendar(ctx context.Context, tenantID, userID int) error {
 	var count int
 	err := s.db.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM caldev_calendars WHERE tenant_id = $1 AND user_id = $2`,
 		tenantID, userID).Scan(&count)
+	if err != nil || count > 0 {
+		return err // fast path: nearly every call
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
-	if count > 0 {
-		return nil
+	defer tx.Rollback() //nolint:errcheck // no-op after Commit
+	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(6002, $1)`, userID); err != nil {
+		return err
+	}
+	if err := tx.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM caldev_calendars WHERE tenant_id = $1 AND user_id = $2`,
+		tenantID, userID).Scan(&count); err != nil || count > 0 {
+		return err
 	}
 	cal := &models.Calendar{
 		ID:                  uuid.New().String(),
@@ -313,7 +375,10 @@ func (s *Store) EnsureDefaultCalendar(ctx context.Context, tenantID, userID int)
 		MaxResourceSize:     10485760,
 		Properties:          json.RawMessage(`{}`),
 	}
-	return s.CreateCalendar(ctx, cal)
+	if err := createCalendar(ctx, tx, cal); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *Store) UpdateCalendar(ctx context.Context, c *models.Calendar) error {
@@ -502,7 +567,7 @@ func (s *Store) queryEvents(ctx context.Context, filter *models.EventFilter) ([]
 	if len(conditions) > 0 {
 		query += " WHERE " + strings.Join(conditions, " AND ")
 	}
-	query += " ORDER BY dtstart ASC"
+	query += " ORDER BY dtstart ASC, id ASC"
 
 	if filter.Limit > 0 {
 		query += fmt.Sprintf(" LIMIT %d", filter.Limit)
@@ -630,8 +695,13 @@ func (s *Store) GetEventChangesSinceState(ctx context.Context, tenantID, userID 
 		}
 		switch changeType {
 		case "created":
+			if destroyedMap[targetID] {
+				// deleted then re-created under the same id: a move to another calendar
+				delete(destroyedMap, targetID)
+				updatedMap[targetID] = true
+				continue
+			}
 			createdMap[targetID] = true
-			delete(destroyedMap, targetID)
 		case "modified":
 			if !createdMap[targetID] {
 				updatedMap[targetID] = true
@@ -708,15 +778,31 @@ func (s *Store) CopyEvent(ctx context.Context, tenantID int, srcCalendarID, uid,
 // Sync Token Operations
 // ============================================================
 
-func (s *Store) GetSyncChanges(ctx context.Context, calendarID, syncToken string) ([]*models.SyncChange, error) {
+// GetSyncChanges returns the calendar's changes logged after syncToken; an empty token means the
+// whole log. A non-empty token this calendar never issued returns sql.ErrNoRows (CalDAV answers
+// it with DAV:valid-sync-token) instead of silently falling back to the whole log.
+func (s *Store) GetSyncChanges(ctx context.Context, tenantID int, calendarID, syncToken string) ([]*models.SyncChange, error) {
+	var since sql.NullInt64
+	since.Valid = syncToken == ""
+	if syncToken != "" {
+		// The token is either in the change log, or it is the calendar's current token and nothing
+		// was logged yet (a new calendar).
+		err := s.db.QueryRowContext(ctx, `SELECT COALESCE(
+			(SELECT id FROM caldev_sync_changes WHERE tenant_id = $1 AND calendar_id = $2 AND sync_token = $3 LIMIT 1),
+			(SELECT 0 FROM caldev_calendars WHERE tenant_id = $1 AND id = $2 AND sync_token = $3))`,
+			tenantID, calendarID, syncToken).Scan(&since)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if !since.Valid {
+		return nil, sql.ErrNoRows
+	}
 	query := `SELECT id, tenant_id, calendar_id, event_uid, change_type, sync_token, changed_at
 		FROM caldev_sync_changes
-		WHERE calendar_id = $1 AND id > COALESCE(
-			(SELECT id FROM caldev_sync_changes WHERE calendar_id = $1 AND sync_token = $2 LIMIT 1),
-			0
-		)
+		WHERE tenant_id = $1 AND calendar_id = $2 AND id > $3
 		ORDER BY id ASC`
-	rows, err := s.db.QueryContext(ctx, query, calendarID, syncToken)
+	rows, err := s.db.QueryContext(ctx, query, tenantID, calendarID, since.Int64)
 	if err != nil {
 		return nil, err
 	}
@@ -821,6 +907,26 @@ func (s *Store) GetPendingSchedulingMessages(ctx context.Context, tenantID int) 
 		messages = append(messages, m)
 	}
 	return messages, rows.Err()
+}
+
+// GetPendingSchedulingMessage returns one message while it is still pending, or nil when it does
+// not exist or was already processed. tenantID 0 matches any tenant.
+func (s *Store) GetPendingSchedulingMessage(ctx context.Context, tenantID int, id string) (*models.SchedulingMessage, error) {
+	m := &models.SchedulingMessage{}
+	err := s.db.QueryRowContext(ctx,
+		`SELECT id, tenant_id, sender_id, recipient_email, event_uid, method, status, raw_ics, error_message, created_at, sent_at
+		FROM caldev_scheduling_messages
+		WHERE id = $1 AND status = 'pending' AND ($2::int = 0 OR tenant_id = $2)`, id, tenantID).
+		Scan(&m.ID, &m.TenantID, &m.SenderID, &m.RecipientEmail,
+			&m.EventUID, &m.Method, &m.Status, &m.RawICS, &m.ErrorMessage,
+			&m.CreatedAt, &m.SentAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return m, nil
 }
 
 func (s *Store) UpdateSchedulingMessageStatus(ctx context.Context, id, status, errorMsg string) error {
@@ -1042,6 +1148,42 @@ func (s *Store) DeleteSubscription(ctx context.Context, tenantID int, subID stri
 	query := `DELETE FROM caldev_calendar_subscriptions WHERE tenant_id = $1 AND id = $2`
 	_, err := s.db.ExecContext(ctx, query, tenantID, subID)
 	return err
+}
+
+// ReplaceCalendarEvents makes the calendar hold exactly the given events, in one transaction, so
+// readers never see it empty or half-imported. Concurrent replaces of one calendar run one after
+// the other. An event that cannot be stored is skipped (onSkip is told why); the rest still go in.
+func (s *Store) ReplaceCalendarEvents(ctx context.Context, tenantID int, calendarID string, events []*models.Event, onSkip func(*models.Event, error)) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck // no-op after Commit
+	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(6004, hashtext($1))`, calendarID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM caldev_events WHERE tenant_id = $1 AND calendar_id = $2`, tenantID, calendarID); err != nil {
+		return err
+	}
+	for _, e := range events {
+		if _, err := tx.ExecContext(ctx, `SAVEPOINT ev`); err != nil {
+			return err
+		}
+		if err := upsertEvent(ctx, tx, e); err != nil {
+			if _, rerr := tx.ExecContext(ctx, `ROLLBACK TO SAVEPOINT ev`); rerr != nil {
+				return rerr
+			}
+			if onSkip != nil {
+				onSkip(e, err)
+			}
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, `RELEASE SAVEPOINT ev`); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // DeleteEventsByCalendar deletes all events in a calendar (used during re-sync).

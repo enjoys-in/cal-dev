@@ -4,10 +4,8 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
-	"encoding/hex"
+	"encoding/json"
 	"errors"
-	"fmt"
-	"strconv"
 	"strings"
 	"time"
 )
@@ -18,62 +16,58 @@ var (
 
 // RSVPTokenPayload holds data decoded from a signed RSVP token.
 type RSVPTokenPayload struct {
-	TenantID      int
-	EventUID      string
-	AttendeeEmail string
-	ExpiresAt     int64
+	TenantID      int    `json:"t"`
+	EventUID      string `json:"u"`
+	AttendeeEmail string `json:"e"`
+	ExpiresAt     int64  `json:"x"`
 }
 
 // GenerateRSVPToken generates a signed HMAC token for 1-click web RSVP.
+// Format: base64url(JSON payload) + "." + base64url(HMAC-SHA256 of the encoded payload).
 func GenerateRSVPToken(tenantID int, eventUID, email, secret string, ttl time.Duration) string {
 	if ttl == 0 {
 		ttl = 30 * 24 * time.Hour // 30 days default
 	}
-	expiresAt := time.Now().Add(ttl).Unix()
-	raw := fmt.Sprintf("%d|%s|%s|%d", tenantID, eventUID, email, expiresAt)
-	sig := computeHMAC(raw, secret)
-	tokenData := fmt.Sprintf("%s|%s", raw, sig)
-	return base64.RawURLEncoding.EncodeToString([]byte(tokenData))
+	raw, _ := json.Marshal(RSVPTokenPayload{
+		TenantID:      tenantID,
+		EventUID:      eventUID,
+		AttendeeEmail: email,
+		ExpiresAt:     time.Now().Add(ttl).Unix(),
+	})
+	body := base64.RawURLEncoding.EncodeToString(raw)
+	return body + "." + base64.RawURLEncoding.EncodeToString(computeHMAC(body, secret))
 }
 
 // ParseRSVPToken validates and extracts the payload from an RSVP token.
 func ParseRSVPToken(tokenStr, secret string) (*RSVPTokenPayload, error) {
-	bytes, err := base64.RawURLEncoding.DecodeString(tokenStr)
+	body, sigStr, ok := strings.Cut(tokenStr, ".")
+	if !ok {
+		return nil, ErrInvalidRSVPToken
+	}
+	sig, err := base64.RawURLEncoding.DecodeString(sigStr)
+	if err != nil || !hmac.Equal(sig, computeHMAC(body, secret)) {
+		return nil, ErrInvalidRSVPToken
+	}
+
+	raw, err := base64.RawURLEncoding.DecodeString(body)
 	if err != nil {
 		return nil, ErrInvalidRSVPToken
 	}
-
-	parts := strings.Split(string(bytes), "|")
-	if len(parts) != 5 {
+	var payload RSVPTokenPayload
+	if err := json.Unmarshal(raw, &payload); err != nil {
 		return nil, ErrInvalidRSVPToken
 	}
-
-	raw := fmt.Sprintf("%s|%s|%s|%s", parts[0], parts[1], parts[2], parts[3])
-	expectedSig := computeHMAC(raw, secret)
-	if parts[4] != expectedSig {
+	if time.Now().Unix() > payload.ExpiresAt {
 		return nil, ErrInvalidRSVPToken
 	}
-
-	tenantID, err := strconv.Atoi(parts[0])
-	if err != nil {
-		return nil, ErrInvalidRSVPToken
-	}
-
-	expiresAt, err := strconv.ParseInt(parts[3], 10, 64)
-	if err != nil || time.Now().Unix() > expiresAt {
-		return nil, ErrInvalidRSVPToken
-	}
-
-	return &RSVPTokenPayload{
-		TenantID:      tenantID,
-		EventUID:      parts[1],
-		AttendeeEmail: parts[2],
-		ExpiresAt:     expiresAt,
-	}, nil
+	return &payload, nil
 }
 
-func computeHMAC(message, secret string) string {
-	mac := hmac.New(sha256.New, []byte(secret))
+// computeHMAC signs message with a key dedicated to RSVP tokens (derived from secret,
+// so the raw JWT secret is never used directly as the HMAC key).
+func computeHMAC(message, secret string) []byte {
+	key := sha256.Sum256([]byte("caldev-rsvp:" + secret))
+	mac := hmac.New(sha256.New, key[:])
 	mac.Write([]byte(message))
-	return hex.EncodeToString(mac.Sum(nil))
+	return mac.Sum(nil)
 }

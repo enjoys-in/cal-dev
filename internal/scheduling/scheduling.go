@@ -3,9 +3,12 @@ package scheduling
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
+	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/enjoys-in/cal-dev/internal/crypto"
@@ -68,12 +71,17 @@ func (svc *Service) ProcessEvent(ctx context.Context, event *models.Event, metho
 	}
 
 	organizer := normEmail(event.Organizer)
+	emails := make([]string, 0, len(attendees))
+	for _, attendee := range attendees {
+		emails = append(emails, attendee.Email)
+	}
+	users := svc.localUsers(ctx, emails) // one lookup for all attendees
 	for _, attendee := range attendees {
 		if normEmail(attendee.Email) == organizer {
 			continue // the organizer never invites themselves
 		}
 		// Local attendees get the event in their own calendar straight away...
-		svc.deliverLocal(ctx, event, attendee, method)
+		svc.deliverLocal(ctx, event, attendee, method, users)
 		// ...and everyone also gets the standard iMIP email.
 		svc.enqueueMessage(ctx, event, attendee, method)
 	}
@@ -333,64 +341,73 @@ func (svc *Service) HandleSendEmailJob(ctx context.Context, job *jobs.Job) error
 		return err
 	}
 
-	// Fetch the pending message
-	messages, err := svc.store.GetPendingSchedulingMessages(ctx, payload.TenantID)
+	// Fetch just this message (not every pending message of the tenant)
+	msg, err := svc.store.GetPendingSchedulingMessage(ctx, payload.TenantID, payload.MessageID)
 	if err != nil {
-		return fmt.Errorf("fetch pending messages: %w", err)
+		return fmt.Errorf("fetch pending message: %w", err)
+	}
+	if msg == nil {
+		return nil // message not found or already processed
 	}
 
-	for _, msg := range messages {
-		if msg.ID == payload.MessageID {
-			// Fetch the event for enriching the mail payload
-			var event *models.Event
-			events, err := svc.store.QueryEvents(ctx, &models.EventFilter{
-				TenantID: msg.TenantID,
-				UIDs:     []string{msg.EventUID},
-			})
-			if err == nil && len(events) > 0 {
-				event = events[0]
-			}
+	// Fetch the event for enriching the mail payload
+	var event *models.Event
+	events, err := svc.store.QueryEvents(ctx, &models.EventFilter{
+		TenantID: msg.TenantID,
+		UIDs:     []string{msg.EventUID},
+	})
+	if err == nil && len(events) > 0 {
+		event = events[0]
+	}
 
-			// 1. Try delivery via Calendar BYO SMTP if configured
-			if event != nil && event.CalendarID != "" {
-				smtpCfg, err := svc.store.GetCalendarSMTP(ctx, msg.TenantID, event.CalendarID)
-				if err == nil && smtpCfg != nil && smtpCfg.Status == "active" {
-					if err := svc.sendViaBYOSMTP(ctx, msg, event, smtpCfg); err != nil {
-						svc.store.UpdateSchedulingMessageStatus(ctx, msg.ID, "failed", err.Error())
-						return fmt.Errorf("BYO SMTP delivery for %s: %w", msg.RecipientEmail, err)
-					}
-					svc.store.UpdateSchedulingMessageStatus(ctx, msg.ID, "sent", "")
-					log.Printf("scheduling: delivered %s via BYO SMTP for %s → event %s", msg.Method, msg.RecipientEmail, msg.EventUID)
-					return nil
-				}
+	// 1. Try delivery via Calendar BYO SMTP if configured
+	if event != nil && event.CalendarID != "" {
+		smtpCfg, err := svc.store.GetCalendarSMTP(ctx, msg.TenantID, event.CalendarID)
+		if err == nil && smtpCfg != nil && smtpCfg.Status == "active" {
+			if err := svc.sendViaBYOSMTP(ctx, msg, event, smtpCfg); err != nil {
+				svc.recordSendFailure(ctx, job, msg, err)
+				return fmt.Errorf("BYO SMTP delivery for %s: %w", msg.RecipientEmail, err)
 			}
-
-			// 2. Fallback to managed mail server via Redis Pub/Sub if configured
-			if svc.publisher != nil {
-				if err := svc.SendInvitation(ctx, msg, event); err != nil {
-					svc.store.UpdateSchedulingMessageStatus(ctx, msg.ID, "failed", err.Error())
-					return fmt.Errorf("publish for %s: %w", msg.RecipientEmail, err)
-				}
-				svc.store.UpdateSchedulingMessageStatus(ctx, msg.ID, "sent", "")
-				log.Printf("scheduling: published %s for %s → event %s", msg.Method, msg.RecipientEmail, msg.EventUID)
-				return nil
-			}
-
-			// 3. Neither BYO SMTP nor managed mail service is configured
-			errMsg := "Calendar has no SMTP configured and managed fallback is disabled"
-			svc.store.UpdateSchedulingMessageStatus(ctx, msg.ID, "unconfigured_smtp", errMsg)
-			log.Printf("scheduling: skipping delivery for %s: %s", msg.RecipientEmail, errMsg)
+			svc.store.UpdateSchedulingMessageStatus(ctx, msg.ID, "sent", "")
+			log.Printf("scheduling: delivered %s via BYO SMTP for %s → event %s", msg.Method, msg.RecipientEmail, msg.EventUID)
 			return nil
 		}
 	}
 
-	return nil // message not found or already processed
+	// 2. Fallback to managed mail server via Redis Pub/Sub if configured
+	if svc.publisher != nil {
+		if err := svc.SendInvitation(ctx, msg, event); err != nil {
+			svc.recordSendFailure(ctx, job, msg, err)
+			return fmt.Errorf("publish for %s: %w", msg.RecipientEmail, err)
+		}
+		svc.store.UpdateSchedulingMessageStatus(ctx, msg.ID, "sent", "")
+		log.Printf("scheduling: published %s for %s → event %s", msg.Method, msg.RecipientEmail, msg.EventUID)
+		return nil
+	}
+
+	// 3. Neither BYO SMTP nor managed mail service is configured
+	errMsg := "Calendar has no SMTP configured and managed fallback is disabled"
+	svc.store.UpdateSchedulingMessageStatus(ctx, msg.ID, "unconfigured_smtp", errMsg)
+	log.Printf("scheduling: skipping delivery for %s: %s", msg.RecipientEmail, errMsg)
+	return nil
 }
+
+// recordSendFailure keeps the message 'pending' (with its error) so the worker's retry can
+// pick it up again, and marks it 'failed' only on the final attempt.
+func (svc *Service) recordSendFailure(ctx context.Context, job *jobs.Job, msg *models.SchedulingMessage, err error) {
+	if job.Retries >= job.MaxRetry {
+		svc.store.UpdateSchedulingMessageStatus(ctx, msg.ID, "failed", err.Error())
+		return
+	}
+	svc.store.RecordSchedulingMessageError(ctx, msg.ID, err.Error())
+}
+
+// warnLocalhostOnce logs once when RSVP links would point at localhost.
+var warnLocalhostOnce sync.Once
 
 // sendViaBYOSMTP sends an invitation email directly via the calendar's custom SMTP server.
 func (svc *Service) sendViaBYOSMTP(ctx context.Context, msg *models.SchedulingMessage, event *models.Event, smtpCfg *models.CalendarSMTP) error {
-	key := crypto.DeriveKey(svc.jwtSecret)
-	decryptedPassword, err := crypto.Decrypt(smtpCfg.PasswordEncrypted, key)
+	decryptedPassword, err := crypto.DecryptWithFallback(smtpCfg.PasswordEncrypted, svc.jwtSecret)
 	if err != nil {
 		return fmt.Errorf("decrypt smtp password: %w", err)
 	}
@@ -399,7 +416,11 @@ func (svc *Service) sendViaBYOSMTP(ctx context.Context, msg *models.SchedulingMe
 	if baseURL == "" {
 		baseURL = "http://localhost:8443"
 	}
-	rsvpToken := GenerateRSVPToken(msg.TenantID, msg.EventUID, msg.RecipientEmail, svc.jwtSecret, 30*24*time.Hour)
+	if strings.Contains(baseURL, "localhost") {
+		warnLocalhostOnce.Do(func() {
+			log.Printf("scheduling: WARNING: public URL %q contains localhost; RSVP links in emails will not work for recipients", baseURL)
+		})
+	}
 
 	startFmt := ""
 	endFmt := ""
@@ -409,9 +430,20 @@ func (svc *Service) sendViaBYOSMTP(ctx context.Context, msg *models.SchedulingMe
 	organizer := ""
 
 	if event != nil {
-		startFmt = event.DTStart.Format(time.RFC1123)
-		if event.DTEnd != nil {
-			endFmt = event.DTEnd.Format(time.RFC1123)
+		if event.AllDay {
+			// Date only; DTEND of an all-day event is exclusive, so show the last day.
+			startFmt = event.DTStart.UTC().Format("Mon, 02 Jan 2006")
+			if event.DTEnd != nil {
+				if last := event.DTEnd.UTC().AddDate(0, 0, -1); last.After(event.DTStart.UTC()) {
+					endFmt = last.Format("Mon, 02 Jan 2006")
+				}
+			}
+		} else {
+			// Times are shown in UTC (RFC1123 labels them "UTC").
+			startFmt = event.DTStart.UTC().Format(time.RFC1123)
+			if event.DTEnd != nil {
+				endFmt = event.DTEnd.UTC().Format(time.RFC1123)
+			}
 		}
 		summary = event.Summary
 		description = event.Description
@@ -432,6 +464,7 @@ func (svc *Service) sendViaBYOSMTP(ctx context.Context, msg *models.SchedulingMe
 		SenderEmail:    smtpCfg.FromEmail,
 		SenderName:     smtpCfg.FromName,
 		RecipientEmail: msg.RecipientEmail,
+		ReplyTo:        smtpCfg.ReplyTo,
 		Subject:        subject,
 		Method:         msg.Method,
 		Summary:        summary,
@@ -441,9 +474,25 @@ func (svc *Service) sendViaBYOSMTP(ctx context.Context, msg *models.SchedulingMe
 		EndFormatted:   endFmt,
 		Organizer:      organizer,
 		RawICS:         msg.RawICS,
-		RSVPAcceptURL:  fmt.Sprintf("%s/api/scheduling/rsvp?token=%s&action=ACCEPTED", baseURL, rsvpToken),
-		RSVPTentURL:    fmt.Sprintf("%s/api/scheduling/rsvp?token=%s&action=TENTATIVE", baseURL, rsvpToken),
-		RSVPDeclURL:    fmt.Sprintf("%s/api/scheduling/rsvp?token=%s&action=DECLINED", baseURL, rsvpToken),
+	}
+
+	// RSVP links only make sense on invitations (not on cancellations or replies).
+	if msg.Method == "REQUEST" {
+		// Valid for at least 30 days, and until a day after the event ends.
+		ttl := 30 * 24 * time.Hour
+		if event != nil {
+			end := event.DTStart
+			if event.DTEnd != nil {
+				end = *event.DTEnd
+			}
+			if d := time.Until(end.Add(24 * time.Hour)); d > ttl {
+				ttl = d
+			}
+		}
+		rsvpToken := url.QueryEscape(GenerateRSVPToken(msg.TenantID, msg.EventUID, msg.RecipientEmail, svc.jwtSecret, ttl))
+		invData.RSVPAcceptURL = fmt.Sprintf("%s/api/public/rsvp?token=%s&action=ACCEPTED", baseURL, rsvpToken)
+		invData.RSVPTentURL = fmt.Sprintf("%s/api/public/rsvp?token=%s&action=TENTATIVE", baseURL, rsvpToken)
+		invData.RSVPDeclURL = fmt.Sprintf("%s/api/public/rsvp?token=%s&action=DECLINED", baseURL, rsvpToken)
 	}
 
 	mimeBytes, err := smtp.BuildInvitationMIME(invData)
@@ -462,5 +511,13 @@ func (svc *Service) sendViaBYOSMTP(ctx context.Context, msg *models.SchedulingMe
 		Encryption: smtpCfg.Encryption,
 	}
 
-	return smtp.SendMessage(clientCfg, msg.RecipientEmail, mimeBytes)
+	if err := smtp.SendMessage(clientCfg, msg.RecipientEmail, mimeBytes); err != nil {
+		// A connection/auth failure means the config itself is broken: mark it so later
+		// messages fall back to managed delivery.
+		if errors.Is(err, smtp.ErrConnect) {
+			_ = svc.store.UpdateCalendarSMTPTestResult(ctx, smtpCfg.TenantID, smtpCfg.CalendarID, "failing", err.Error())
+		}
+		return err
+	}
+	return nil
 }

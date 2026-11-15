@@ -2,12 +2,14 @@ package auth
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
 	"errors"
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/enjoys-in/cal-dev/internal/config"
@@ -23,6 +25,76 @@ import (
 type Service struct {
 	store  *store.Store
 	config *config.AuthConfig
+
+	basicMu    sync.Mutex
+	basicCache map[[32]byte]basicEntry // recent successful Basic logins, keyed by sha256(email, password)
+	touched    map[string]time.Time    // app password id -> last last_used_at update
+}
+
+// basicEntry is a cached successful Basic login.
+type basicEntry struct {
+	userID    int
+	appPassID string
+	expires   time.Time
+}
+
+const (
+	basicCacheTTL = 5 * time.Minute  // a revoked app password keeps working at most this long
+	basicCacheMax = 10000            // entries; the cache is reset beyond this
+	touchInterval = 10 * time.Minute // last_used_at is written at most this often per password
+)
+
+// dummyHash is compared against for unknown/inactive accounts so they take as long as real ones.
+var dummyHash = sync.OnceValue(func() []byte {
+	h, _ := bcrypt.GenerateFromPassword([]byte("caldev-timing-equaliser"), bcrypt.DefaultCost)
+	return h
+})
+
+// BasicAuthEnabled reports whether CalDAV Basic Auth is enabled (AUTH_BASIC_ENABLED).
+func (s *Service) BasicAuthEnabled() bool {
+	return s.config != nil && s.config.BasicAuthEnabled
+}
+
+func basicKey(email, password string) [32]byte {
+	return sha256.Sum256([]byte(strings.ToLower(strings.TrimSpace(email)) + "\x00" + password))
+}
+
+func (s *Service) cachedBasic(key [32]byte) (basicEntry, bool) {
+	s.basicMu.Lock()
+	defer s.basicMu.Unlock()
+	e, ok := s.basicCache[key]
+	if !ok || time.Now().After(e.expires) {
+		return basicEntry{}, false
+	}
+	return e, true
+}
+
+func (s *Service) rememberBasic(key [32]byte, e basicEntry) {
+	s.basicMu.Lock()
+	defer s.basicMu.Unlock()
+	if s.basicCache == nil || len(s.basicCache) >= basicCacheMax {
+		s.basicCache = make(map[[32]byte]basicEntry)
+	}
+	s.basicCache[key] = e
+}
+
+// touchAppPassword updates last_used_at in the background, at most once per touchInterval.
+func (s *Service) touchAppPassword(id string) {
+	s.basicMu.Lock()
+	if s.touched == nil || len(s.touched) >= basicCacheMax {
+		s.touched = make(map[string]time.Time)
+	}
+	if last, ok := s.touched[id]; ok && time.Since(last) < touchInterval {
+		s.basicMu.Unlock()
+		return
+	}
+	s.touched[id] = time.Now()
+	s.basicMu.Unlock()
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = s.store.TouchAppPassword(ctx, id)
+	}()
 }
 
 // NewService creates a new auth service.
@@ -207,15 +279,24 @@ func ParseBasicAuth(authHeader string) (*BasicAuthResult, error) {
 // 2. Checks the password against caldev_app_passwords
 // Returns (userID, tenantID, error). tenantID == userID since mail_accounts has no tenant_id.
 func (s *Service) AuthenticateBasic(ctx context.Context, email, password string) (int, int, error) {
+	// Clients send Basic credentials on every request: skip bcrypt for recently verified ones.
+	key := basicKey(email, password)
+	if e, ok := s.cachedBasic(key); ok {
+		s.touchAppPassword(e.appPassID)
+		return e.userID, e.userID, nil
+	}
+
 	// Look up user in mail_accounts by email
 	user, err := s.store.GetUserByEmail(ctx, email)
 	if err != nil {
 		return 0, 0, fmt.Errorf("auth: lookup error: %w", err)
 	}
 	if user == nil {
+		_ = bcrypt.CompareHashAndPassword(dummyHash(), []byte(password)) // same timing as a real account
 		return 0, 0, fmt.Errorf("auth: user not found")
 	}
 	if strings.ToUpper(user.Status) != "ACTIVE" {
+		_ = bcrypt.CompareHashAndPassword(dummyHash(), []byte(password))
 		return 0, 0, fmt.Errorf("auth: account is %s", user.Status)
 	}
 
@@ -227,10 +308,9 @@ func (s *Service) AuthenticateBasic(ctx context.Context, email, password string)
 
 	for _, ap := range appPasswords {
 		if CheckPassword(password, ap.PasswordHash) {
-			// Update last_used timestamp asynchronously
-			go func(id string) {
-				_ = s.store.TouchAppPassword(context.Background(), id)
-			}(ap.ID)
+			s.rememberBasic(key, basicEntry{userID: user.ID, appPassID: ap.ID, expires: time.Now().Add(basicCacheTTL)})
+			// Update last_used timestamp asynchronously (throttled)
+			s.touchAppPassword(ap.ID)
 			// tenant_id == user.ID (mail_accounts has no tenant_id)
 			return user.ID, user.ID, nil
 		}
@@ -261,8 +341,9 @@ func (s *Service) ResolveUserFromToken(ctx context.Context, claims *Claims) (*Re
 		}
 	}
 
-	// 2. Fall back to user ID / subject
-	if user == nil && claims.UserID != "" {
+	// 2. Fall back to user ID / subject, only for tokens without an email: an unknown email must
+	// not be mapped onto whatever local account happens to have the same numeric id.
+	if user == nil && claims.Email == "" && claims.UserID != "" {
 		uid, parseErr := strconv.Atoi(claims.UserID)
 		if parseErr == nil {
 			user, err = s.store.GetUserByID(ctx, uid)

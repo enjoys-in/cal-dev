@@ -15,7 +15,7 @@ services:
     networks:
       - caldev_net
     ports:
-      - "6382:6379" # Exposed on 6380 instead of 6379 to avoid conflicts with other local Redis instances, though networks mostly isolate this
+      - "127.0.0.1:6382:6379" # host-local only: Valkey has no password, and published ports bypass ufw
     volumes:
       - valkeydata:/data
     healthcheck:
@@ -59,7 +59,7 @@ services:
       REDIS_URL: "redis://valkey:6379/0" # Connects internally via caldev_net network
       
       # Auth — use same JWT secret & issuer as your mail/other services
-      AUTH_JWT_SECRET: e783e9b23f8b14e6b245e8b479a503d402fad947758f9006e70d30a32d605661ac00645bbf2f1d3894aaff7b01fccabea47a7c417737fb0d9802e297a21b6167
+      AUTH_JWT_SECRET: "${AUTH_JWT_SECRET:?set AUTH_JWT_SECRET in .env}" # never hard-code: shared with the mail services
       AUTH_JWT_ISSUER: ENJOYS
       AUTH_BASIC_ENABLED: "true"
       

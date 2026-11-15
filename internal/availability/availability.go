@@ -104,31 +104,40 @@ func merge(segs []Interval) []Interval {
 	if len(segs) == 0 {
 		return nil
 	}
-	// Collect boundary points, then classify each elementary slice.
-	pts := make([]time.Time, 0, len(segs)*2)
+	// Sweep the sorted segment boundaries once, counting the confirmed and tentative segments
+	// that cover each elementary slice between consecutive boundaries.
+	type edge struct {
+		at        time.Time
+		confirmed bool
+		delta     int
+	}
+	edges := make([]edge, 0, len(segs)*2)
 	for _, s := range segs {
-		pts = append(pts, s.Start, s.End)
+		c := s.Status == StatusConfirmed
+		edges = append(edges, edge{s.Start, c, 1}, edge{s.End, c, -1})
 	}
-	sort.Slice(pts, func(i, j int) bool { return pts[i].Before(pts[j]) })
-	uniq := pts[:0]
-	for i, p := range pts {
-		if i == 0 || !p.Equal(pts[i-1]) {
-			uniq = append(uniq, p)
-		}
-	}
+	sort.Slice(edges, func(i, j int) bool { return edges[i].at.Before(edges[j].at) })
 
 	var out []Interval
-	for i := 0; i+1 < len(uniq); i++ {
-		a, b := uniq[i], uniq[i+1]
-		status := ""
-		for _, s := range segs {
-			if !s.Start.After(a) && !s.End.Before(b) {
-				if s.Status == StatusConfirmed {
-					status = StatusConfirmed
-					break
-				}
-				status = StatusTentative
+	conf, tent := 0, 0
+	for i := 0; i < len(edges); {
+		a := edges[i].at
+		for ; i < len(edges) && edges[i].at.Equal(a); i++ {
+			if edges[i].confirmed {
+				conf += edges[i].delta
+			} else {
+				tent += edges[i].delta
 			}
+		}
+		if i == len(edges) {
+			break
+		}
+		b := edges[i].at
+		status := ""
+		if conf > 0 {
+			status = StatusConfirmed
+		} else if tent > 0 {
+			status = StatusTentative
 		}
 		if status == "" {
 			continue

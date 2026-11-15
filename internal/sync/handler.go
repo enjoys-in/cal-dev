@@ -1,6 +1,7 @@
 package sync
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/enjoys-in/cal-dev/internal/models"
@@ -67,6 +68,7 @@ func (h *Handler) Create(c *fiber.Ctx) error {
 	if req.SourceURL == "" {
 		return response.Error(c, 400, "source_url is required")
 	}
+	req.SourceURL = NormalizeSubscriptionURL(req.SourceURL)
 	if err := ValidateSubscriptionURL(req.SourceURL); err != nil {
 		return response.Error(c, 400, "invalid source_url: "+err.Error())
 	}
@@ -100,12 +102,24 @@ func (h *Handler) Create(c *fiber.Ctx) error {
 		}
 	}
 
-	// Create a dedicated calendar for this subscription if not specified, or verify ownership
+	// Create a dedicated calendar for this subscription if not specified. Every sync replaces ALL
+	// events of that calendar, so an existing calendar is only accepted when it already belongs to
+	// one of the caller's subscriptions (never a normal calendar such as the default one).
 	calendarID := req.CalendarID
 	if calendarID != "" {
-		existingCal, err := h.store.GetCalendar(c.UserContext(), tenantID, calendarID)
-		if err != nil || existingCal == nil || existingCal.UserID != userID {
-			return response.Error(c, 403, "calendar not found or access denied")
+		subs, err := h.store.GetSubscriptionsByUser(c.UserContext(), tenantID, userID)
+		if err != nil {
+			return response.Error(c, 500, "failed to check calendar")
+		}
+		bound := false
+		for _, s := range subs {
+			if s.CalendarID == calendarID {
+				bound = true
+				break
+			}
+		}
+		if !bound {
+			return response.Error(c, 403, "calendar_id must be a calendar created for a subscription; omit it to create one")
 		}
 	} else {
 		cal := &models.Calendar{
@@ -148,9 +162,10 @@ func (h *Handler) Create(c *fiber.Ctx) error {
 		return response.Error(c, 500, "failed to create subscription")
 	}
 
-	// Trigger immediate first sync in background
+	// Trigger immediate first sync in background. The fiber context is recycled once this handler
+	// returns, so the goroutine must not touch it.
 	go func() {
-		if err := h.service.SyncSubscription(c.UserContext(), sub); err != nil {
+		if err := h.service.SyncSubscription(context.Background(), sub); err != nil {
 			// Error is already recorded in the sync state
 			_ = err
 		}
@@ -210,7 +225,11 @@ func (h *Handler) Update(c *fiber.Ctx) error {
 		existing.Color = *req.Color
 	}
 	if req.SourceURL != nil {
-		existing.SourceURL = *req.SourceURL
+		u := NormalizeSubscriptionURL(*req.SourceURL)
+		if err := ValidateSubscriptionURL(u); err != nil {
+			return response.Error(c, 400, "invalid source_url: "+err.Error())
+		}
+		existing.SourceURL = u
 	}
 	if req.AuthType != nil {
 		existing.AuthType = *req.AuthType
@@ -247,13 +266,16 @@ func (h *Handler) Delete(c *fiber.Ctx) error {
 		return response.Error(c, 404, "subscription not found")
 	}
 
-	if err := h.store.DeleteSubscription(c.UserContext(), tenantID, subID); err != nil {
-		return response.Error(c, 500, "failed to delete subscription")
+	if deleteCalendar {
+		// Delete the linked calendar and all its events first (this also removes the subscription),
+		// so a failure leaves everything in place instead of an orphaned calendar.
+		if err := h.store.DeleteCalendar(c.UserContext(), tenantID, sub.CalendarID); err != nil {
+			return response.Error(c, 500, "failed to delete calendar")
+		}
 	}
 
-	if deleteCalendar {
-		// Also delete the linked calendar and all its events
-		_ = h.store.DeleteCalendar(c.UserContext(), tenantID, sub.CalendarID)
+	if err := h.store.DeleteSubscription(c.UserContext(), tenantID, subID); err != nil {
+		return response.Error(c, 500, "failed to delete subscription")
 	}
 
 	return c.SendStatus(204)
