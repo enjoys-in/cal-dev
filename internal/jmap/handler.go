@@ -686,6 +686,9 @@ func (h *Handler) calendarGet(c *fiber.Ctx, tenantID, userID int, call *JMAPMeth
 			"isReadOnly":          cal.IsReadOnly,
 			"timezone":            cal.Timezone,
 			"supportedComponents": cal.SupportedComponents,
+			"hasByoSmtp":          cal.HasByoSmtp,
+			"byoSmtpFrom":         cal.ByoSmtpFrom,
+			"canSendInvitations":  cal.HasByoSmtp,
 			"myRights": map[string]bool{
 				"mayReadItems": true,
 				"mayWriteAll":  !cal.IsReadOnly,

@@ -106,6 +106,14 @@ func (s *ServerConfig) Addr() string {
 	return fmt.Sprintf("%s:%d", s.Host, s.Port)
 }
 
+// PublicURL returns the public base URL of CalDev (from CALDEV_PUBLIC_URL or http://localhost:PORT).
+func (s *ServerConfig) PublicURL() string {
+	if u := os.Getenv("CALDEV_PUBLIC_URL"); u != "" {
+		return strings.TrimRight(u, "/")
+	}
+	return fmt.Sprintf("http://localhost:%d", s.Port)
+}
+
 // Load reads configuration from environment variables with sensible defaults.
 func Load() *Config {
 	return &Config{

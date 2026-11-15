@@ -239,15 +239,19 @@ func (s *Store) CreateCalendar(ctx context.Context, c *models.Calendar) error {
 
 func (s *Store) GetCalendar(ctx context.Context, tenantID int, calendarID string) (*models.Calendar, error) {
 	c := &models.Calendar{}
-	query := `SELECT id, tenant_id, user_id, name, description, color, timezone, sort_order,
-		ctag, sync_token, is_default, is_visible, is_readonly, supported_components,
-		max_resource_size, properties, created_at, updated_at
-		FROM caldev_calendars WHERE tenant_id = $1 AND id = $2`
+	query := `SELECT c.id, c.tenant_id, c.user_id, c.name, c.description, c.color, c.timezone, c.sort_order,
+		c.ctag, c.sync_token, c.is_default, c.is_visible, c.is_readonly, c.supported_components,
+		c.max_resource_size, c.properties, c.created_at, c.updated_at,
+		(s.id IS NOT NULL AND s.status = 'active') AS has_byo_smtp,
+		COALESCE(s.from_email, '') AS byo_smtp_from
+		FROM caldev_calendars c
+		LEFT JOIN caldev_calendar_smtp s ON s.calendar_id = c.id
+		WHERE c.tenant_id = $1 AND c.id = $2`
 	err := s.db.QueryRowContext(ctx, query, tenantID, calendarID).
 		Scan(&c.ID, &c.TenantID, &c.UserID, &c.Name, &c.Description, &c.Color, &c.Timezone,
 			&c.SortOrder, &c.CTag, &c.SyncToken, &c.IsDefault, &c.IsVisible, &c.IsReadOnly,
 			pq.Array(&c.SupportedComponents), &c.MaxResourceSize, &c.Properties,
-			&c.CreatedAt, &c.UpdatedAt)
+			&c.CreatedAt, &c.UpdatedAt, &c.HasByoSmtp, &c.ByoSmtpFrom)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -255,10 +259,14 @@ func (s *Store) GetCalendar(ctx context.Context, tenantID int, calendarID string
 }
 
 func (s *Store) GetCalendarsByUser(ctx context.Context, tenantID, userID int) ([]*models.Calendar, error) {
-	query := `SELECT id, tenant_id, user_id, name, description, color, timezone, sort_order,
-		ctag, sync_token, is_default, is_visible, is_readonly, supported_components,
-		max_resource_size, properties, created_at, updated_at
-		FROM caldev_calendars WHERE tenant_id = $1 AND user_id = $2 ORDER BY sort_order, name`
+	query := `SELECT c.id, c.tenant_id, c.user_id, c.name, c.description, c.color, c.timezone, c.sort_order,
+		c.ctag, c.sync_token, c.is_default, c.is_visible, c.is_readonly, c.supported_components,
+		c.max_resource_size, c.properties, c.created_at, c.updated_at,
+		(s.id IS NOT NULL AND s.status = 'active') AS has_byo_smtp,
+		COALESCE(s.from_email, '') AS byo_smtp_from
+		FROM caldev_calendars c
+		LEFT JOIN caldev_calendar_smtp s ON s.calendar_id = c.id
+		WHERE c.tenant_id = $1 AND c.user_id = $2 ORDER BY c.sort_order, c.name`
 	rows, err := s.db.QueryContext(ctx, query, tenantID, userID)
 	if err != nil {
 		return nil, err
@@ -271,7 +279,7 @@ func (s *Store) GetCalendarsByUser(ctx context.Context, tenantID, userID int) ([
 		if err := rows.Scan(&c.ID, &c.TenantID, &c.UserID, &c.Name, &c.Description, &c.Color,
 			&c.Timezone, &c.SortOrder, &c.CTag, &c.SyncToken, &c.IsDefault, &c.IsVisible,
 			&c.IsReadOnly, pq.Array(&c.SupportedComponents), &c.MaxResourceSize, &c.Properties,
-			&c.CreatedAt, &c.UpdatedAt); err != nil {
+			&c.CreatedAt, &c.UpdatedAt, &c.HasByoSmtp, &c.ByoSmtpFrom); err != nil {
 			return nil, err
 		}
 		calendars = append(calendars, c)

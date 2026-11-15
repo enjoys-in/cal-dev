@@ -266,6 +266,97 @@ Merged ICS of all user's calendars. Supports `ETag` + `If-None-Match`.
 
 ---
 
+## 7. Calendar BYO SMTP — `/api/calendars/:id/smtp`
+
+Auth: **JWT Bearer** or **Basic Auth**
+
+Manages Bring Your Own SMTP credentials per calendar collection.
+
+### `GET /api/calendars/:id/smtp`
+Get current SMTP configuration (password is never exposed).
+
+**Response (Configured):**
+```json
+{
+  "configured": true,
+  "id": "uuid",
+  "calendar_id": "cal-uuid",
+  "host": "smtp.gmail.com",
+  "port": 587,
+  "username": "user@gmail.com",
+  "from_email": "user@gmail.com",
+  "from_name": "Alice Smith",
+  "encryption": "starttls",
+  "status": "active",
+  "last_tested_at": "2026-11-15T12:00:00Z",
+  "last_error": ""
+}
+```
+
+**Response (Not Configured):**
+```json
+{
+  "configured": false,
+  "calendar_id": "cal-uuid"
+}
+```
+
+### `PUT /api/calendars/:id/smtp`
+Create or update SMTP configuration. Passwords are encrypted with AES-256-GCM.
+
+**Request:**
+```json
+{
+  "host": "smtp.gmail.com",
+  "port": 587,
+  "username": "user@gmail.com",
+  "password": "app-specific-password",
+  "from_email": "user@gmail.com",
+  "from_name": "Alice Smith",
+  "encryption": "starttls"
+}
+```
+
+### `POST /api/calendars/:id/smtp/test`
+Verify SMTP server connectivity, handshake, and authentication.
+
+**Request (Optional payload to test unsaved values):**
+```json
+{
+  "host": "smtp.gmail.com",
+  "port": 587,
+  "username": "user@gmail.com",
+  "password": "secret",
+  "encryption": "starttls"
+}
+```
+
+**Response (Success):**
+```json
+{
+  "success": true,
+  "message": "SMTP connection verified successfully"
+}
+```
+
+### `DELETE /api/calendars/:id/smtp`
+Remove SMTP configuration for the calendar.
+
+**Response:** `204 No Content`
+
+---
+
+## 8. Public 1-Click Web RSVP — `/api/scheduling/rsvp`
+
+Auth: **None (Protected by signed HMAC token)**
+
+Allows external email recipients (e.g. Gmail Web, Yahoo) to RSVP directly from email buttons.
+
+### `GET /api/scheduling/rsvp?token=...&action=ACCEPTED|DECLINED|TENTATIVE`
+Renders a responsive RSVP confirmation landing page and dispatches realtime updates to the organizer.
+
+---
+
 ## 7. JMAP API — `/jmap/`
 
 Auth: **JWT Bearer** or **Basic Auth**
@@ -503,6 +594,13 @@ All JSON field names match these models exactly.
 | `PUT` | `/api/subscriptions/:id` | Basic/JWT | Update subscription |
 | `DELETE` | `/api/subscriptions/:id` | Basic/JWT | Delete subscription |
 | `POST` | `/api/subscriptions/:id/sync` | Basic/JWT | Trigger manual sync |
+| `GET` | `/api/calendars/:id/smtp` | Basic/JWT | Get calendar SMTP configuration |
+| `PUT` | `/api/calendars/:id/smtp` | Basic/JWT | Upsert calendar SMTP configuration |
+| `POST` | `/api/calendars/:id/smtp/test` | Basic/JWT | Test calendar SMTP connectivity |
+| `DELETE` | `/api/calendars/:id/smtp` | Basic/JWT | Delete calendar SMTP configuration |
+| `GET` | `/api/scheduling/rsvp` | None | Public 1-click web RSVP landing |
+| `POST` | `/api/scheduling/rsvp` | Basic/JWT | In-app user RSVP endpoint |
+| `POST` | `/api/scheduling/incoming` | Basic/JWT | Inbound iMIP webhook (mail server) |
 
 ---
 

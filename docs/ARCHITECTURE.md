@@ -170,10 +170,11 @@ via `calendar:push` channel.                                     │
    - Discovered automatically by checking `public.mail_accounts`.
    - The event (including all series overrides) is immediately placed in the attendee's primary writable calendar.
    - Internal attendees automatically receive live push notifications and countdown alerts without needing an email.
-2. **External Attendees**:
-   - CalDev creates an RFC 5545 iMIP payload (`REQUEST`, `REPLY`, or `CANCEL`).
-   - Recorded in `caldev_scheduling_messages` with status `pending`.
-   - Published to Redis Pub/Sub channel `calendar:mail` for pickup by the SMTP delivery service.
+2. **External Attendees & Dispatch**:
+   - CalDev creates an RFC 5545 iMIP payload (`REQUEST`, `REPLY`, or `CANCEL`) and records it in `caldev_scheduling_messages`.
+   - **Bring Your Own SMTP (BYO SMTP)**: When the event's calendar has an active custom SMTP configuration (`caldev_calendar_smtp`), the background worker delivers the invitation directly via the user's custom SMTP server with full SPF, DKIM, and DMARC alignment. Emails are delivered as RFC 5322 MIME multipart messages with human-readable text, styled HTML with 1-click RSVP buttons, and the `.ics` component.
+   - **Managed Fallback**: If no BYO SMTP is configured and managed fallback is active, payloads are published to Redis channel `calendar:mail` for pickup by the centralized mail service.
+   - **1-Click Web RSVP**: External recipients clicking Accept/Decline in their email land on a public HMAC-signed endpoint (`/api/scheduling/rsvp`) that records their status and pushes updates in real-time.
 3. **Attendee Capacity & Limits**:
    - CalDev enforces an explicit limit of **3,000 attendees / recipients** per event (`MaxAttendeesPerEvent = 3000`).
    - Any JMAP `CalendarEvent/set` or CalDAV `PUT` containing more than 3,000 attendees is rejected with a `400 Bad Request` (`invalidProperties`).
@@ -191,3 +192,4 @@ All CalDev entities reside in the `caldev` PostgreSQL schema, co-located with `p
 - **`caldev_scheduling_messages`**: Outbox for meeting invitations, replies, and cancellation payloads.
 - **`caldev_changes`**: Sync tokens and changelog for CalDAV delta synchronization.
 - **`caldev_subscriptions`**: External read-only calendars imported from Google Calendar, Outlook, or ICS URLs.
+- **`caldev_calendar_smtp`**: Outbound BYO SMTP credentials (AES-256-GCM encrypted passwords) per calendar collection.

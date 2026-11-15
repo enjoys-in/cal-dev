@@ -2,6 +2,7 @@ package scheduling
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"strconv"
 	"strings"
@@ -188,4 +189,101 @@ func (h *Handler) RSVPRespond(c *fiber.Ctx) error {
 		"attendee":  email,
 		"response":  partstat,
 	})
+}
+
+// PublicWebRSVP handles 1-click RSVP links clicked by external email recipients.
+// GET or POST /api/scheduling/rsvp?token=...&action=ACCEPTED|DECLINED|TENTATIVE
+func (h *Handler) PublicWebRSVP(c *fiber.Ctx) error {
+	token := c.Query("token")
+	if token == "" {
+		token = c.FormValue("token")
+	}
+	action := strings.ToUpper(c.Query("action"))
+	if action == "" {
+		action = strings.ToUpper(c.FormValue("action"))
+	}
+
+	if token == "" {
+		return c.Status(400).SendString("Invalid RSVP link: missing token")
+	}
+
+	payload, err := ParseRSVPToken(token, h.svc.jwtSecret)
+	if err != nil {
+		return c.Status(400).SendString("This invitation response link is invalid or has expired.")
+	}
+
+	switch action {
+	case "ACCEPTED", "ACCEPT", "YES":
+		action = "ACCEPTED"
+	case "DECLINED", "DECLINE", "NO":
+		action = "DECLINED"
+	case "TENTATIVE", "MAYBE":
+		action = "TENTATIVE"
+	default:
+		action = ""
+	}
+
+	// If no action selected yet, render a choice page
+	if action == "" {
+		html := fmt.Sprintf(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Calendar RSVP</title>
+<style>
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f8fafc; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; }
+.card { background: white; padding: 32px; border-radius: 16px; box-shadow: 0 4px 12px rgba(0,0,0,0.06); text-align: center; max-width: 420px; width: 100%%; }
+.btn { display: inline-block; padding: 10px 20px; margin: 8px 4px; border-radius: 8px; text-decoration: none; font-weight: 600; font-size: 14px; color: white; }
+.btn-acc { background: #10B981; }
+.btn-tent { background: #F59E0B; }
+.btn-dec { background: #EF4444; }
+</style></head><body>
+<div class="card">
+<h2>Respond to Invitation</h2>
+<p style="color:#64748b; font-size:14px;">Responding as: <b>%s</b></p>
+<div style="margin-top:24px;">
+<a href="/api/scheduling/rsvp?token=%s&action=ACCEPTED" class="btn btn-acc">Accept</a>
+<a href="/api/scheduling/rsvp?token=%s&action=TENTATIVE" class="btn btn-tent">Tentative</a>
+<a href="/api/scheduling/rsvp?token=%s&action=DECLINED" class="btn btn-dec">Decline</a>
+</div></div></body></html>`, payload.AttendeeEmail, token, token, token)
+		c.Set("Content-Type", "text/html; charset=utf-8")
+		return c.SendString(html)
+	}
+
+	// Update attendee status
+	err = h.svc.ProcessReply(c.UserContext(), payload.TenantID, payload.EventUID, payload.AttendeeEmail, action)
+	if err != nil {
+		log.Printf("scheduling: public RSVP failed for %s: %v", payload.AttendeeEmail, err)
+		return c.Status(404).SendString("Event not found or invitation has expired.")
+	}
+
+	// Send reply to organizer
+	go func() {
+		_ = h.svc.SendReplyToOrganizer(context.Background(), payload.TenantID, payload.EventUID, payload.AttendeeEmail, action)
+	}()
+
+	badgeColor := "#10B981"
+	statusText := "Accepted"
+	if action == "DECLINED" {
+		badgeColor = "#EF4444"
+		statusText = "Declined"
+	} else if action == "TENTATIVE" {
+		badgeColor = "#F59E0B"
+		statusText = "Marked as Tentative"
+	}
+
+	html := fmt.Sprintf(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>RSVP Confirmed</title>
+<style>
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f8fafc; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; }
+.card { background: white; padding: 40px; border-radius: 16px; box-shadow: 0 4px 12px rgba(0,0,0,0.06); text-align: center; max-width: 440px; width: 100%%; }
+.badge { display: inline-block; width: 48px; height: 48px; line-height: 48px; border-radius: 50%%; background: %s; color: white; font-size: 24px; margin-bottom: 16px; }
+h2 { margin: 0 0 8px 0; color: #0f172a; }
+p { color: #64748b; font-size: 14px; margin: 8px 0; }
+</style></head><body>
+<div class="card">
+<div class="badge">&#10003;</div>
+<h2>RSVP Confirmed</h2>
+<p>You have <b>%s</b> this invitation.</p>
+<p style="font-size: 13px; color: #94a3b8; margin-top: 20px;">Email: %s</p>
+<p style="font-size: 12px; color: #cbd5e1;">You can now close this tab.</p>
+</div></body></html>`, badgeColor, statusText, payload.AttendeeEmail)
+
+	c.Set("Content-Type", "text/html; charset=utf-8")
+	return c.SendString(html)
 }

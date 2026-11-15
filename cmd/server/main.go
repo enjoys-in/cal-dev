@@ -25,6 +25,7 @@ import (
 	"github.com/enjoys-in/cal-dev/internal/response"
 	"github.com/enjoys-in/cal-dev/internal/scheduling"
 	"github.com/enjoys-in/cal-dev/internal/sharing"
+	"github.com/enjoys-in/cal-dev/internal/smtp"
 	"github.com/enjoys-in/cal-dev/internal/store"
 	extsync "github.com/enjoys-in/cal-dev/internal/sync"
 	"github.com/gofiber/fiber/v2"
@@ -76,6 +77,7 @@ func main() {
 		"migrations/002_sharing_realtime.sql",
 		"migrations/003_recurrence_overrides.sql",
 		"migrations/004_reminders.sql",
+		"migrations/005_calendar_byo_smtp.sql",
 	}
 	for _, mf := range migrationFiles {
 		sqlBytes, err := os.ReadFile(mf)
@@ -119,6 +121,7 @@ func main() {
 	authSvc := auth.NewService(db, &cfg.Auth)
 	mailPub := publisher.New(jobQueue.Client())
 	schedulingSvc := scheduling.NewService(db, jobQueue, mailPub)
+	schedulingSvc.SetSecrets(cfg.Auth.JWTSecret, cfg.Server.PublicURL())
 	syncSvc := extsync.NewService(db, jobQueue)
 
 	// Initialize background worker
@@ -263,6 +266,13 @@ func main() {
 	calShareGroup.Post("/:id/shares", sharingHandler.CreateCalendarShare)
 	calShareGroup.Delete("/:id/shares/:user_id", sharingHandler.DeleteCalendarShare)
 
+	// Calendar BYO SMTP configuration
+	smtpHandler := smtp.NewHandler(db, cfg.Auth.JWTSecret)
+	calShareGroup.Get("/:id/smtp", smtpHandler.GetSMTP)
+	calShareGroup.Put("/:id/smtp", smtpHandler.UpsertSMTP)
+	calShareGroup.Post("/:id/smtp/test", smtpHandler.TestSMTP)
+	calShareGroup.Delete("/:id/smtp", smtpHandler.DeleteSMTP)
+
 	// Calendars others shared with you
 	sharedGroup := app.Group("/api/shared/calendars", middleware.JMAPAuth(authSvc, db))
 	sharedGroup.Get("/", sharingHandler.ListSharedCalendars)
@@ -298,6 +308,10 @@ func main() {
 	schedGroup := app.Group("/api/scheduling", middleware.JMAPAuth(authSvc, db))
 	schedGroup.Post("/incoming", schedulingHandler.IncomingIMIP)
 	schedGroup.Post("/rsvp", schedulingHandler.RSVPRespond)
+
+	// Public 1-click Web RSVP (accessible by external recipients without login)
+	app.Get("/api/scheduling/rsvp", schedulingHandler.PublicWebRSVP)
+	app.Post("/api/scheduling/rsvp", schedulingHandler.PublicWebRSVP)
 
 	// ============================================================
 	// Calendar Subscriptions — Import from Google/Outlook/any ICS

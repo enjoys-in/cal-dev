@@ -68,8 +68,32 @@ type Calendar struct {
 	SupportedComponents []string        `json:"supported_components" db:"supported_components"`
 	MaxResourceSize     int             `json:"max_resource_size" db:"max_resource_size"`
 	Properties          json.RawMessage `json:"properties" db:"properties"`
+	HasByoSmtp          bool            `json:"has_byo_smtp" db:"has_byo_smtp"`
+	ByoSmtpFrom         string          `json:"byo_smtp_from" db:"byo_smtp_from"`
 	CreatedAt           time.Time       `json:"created_at" db:"created_at"`
 	UpdatedAt           time.Time       `json:"updated_at" db:"updated_at"`
+}
+
+// CalendarSMTP represents the outbound SMTP configuration for a calendar.
+type CalendarSMTP struct {
+	ID                string     `json:"id" db:"id"`
+	CalendarID        string     `json:"calendar_id" db:"calendar_id"`
+	TenantID          int        `json:"tenant_id" db:"tenant_id"`
+	UserID            int        `json:"user_id" db:"user_id"`
+	Host              string     `json:"host" db:"host"`
+	Port              int        `json:"port" db:"port"`
+	Username          string     `json:"username" db:"username"`
+	PasswordEncrypted string     `json:"-" db:"password_encrypted"`
+	Password          string     `json:"password,omitempty" db:"-"` // Only used in API request payloads
+	FromEmail         string     `json:"from_email" db:"from_email"`
+	FromName          string     `json:"from_name" db:"from_name"`
+	ReplyTo           string     `json:"reply_to" db:"reply_to"`
+	Encryption        string     `json:"encryption" db:"encryption"` // 'none', 'ssl', 'starttls'
+	Status            string     `json:"status" db:"status"`         // 'active', 'failing', 'disabled'
+	LastTestedAt      *time.Time `json:"last_tested_at" db:"last_tested_at"`
+	LastError         string     `json:"last_error" db:"last_error"`
+	CreatedAt         time.Time  `json:"created_at" db:"created_at"`
+	UpdatedAt         time.Time  `json:"updated_at" db:"updated_at"`
 }
 
 // Event represents a calendar event (iCalendar resource).

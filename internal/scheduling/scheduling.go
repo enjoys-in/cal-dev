@@ -8,26 +8,35 @@ import (
 	"strings"
 	"time"
 
+	"github.com/enjoys-in/cal-dev/internal/crypto"
 	"github.com/enjoys-in/cal-dev/internal/ics"
 	"github.com/enjoys-in/cal-dev/internal/jobs"
 	"github.com/enjoys-in/cal-dev/internal/models"
 	"github.com/enjoys-in/cal-dev/internal/publisher"
+	"github.com/enjoys-in/cal-dev/internal/smtp"
 	"github.com/enjoys-in/cal-dev/internal/store"
 	"github.com/google/uuid"
 )
 
 // Service implements RFC 6638 scheduling.
-// Instead of sending emails directly, it publishes mail events to Redis Pub/Sub.
-// The internal mail server (separate repo) subscribes and handles actual delivery.
+// Supports direct delivery via Calendar BYO SMTP, with fallback to Redis Pub/Sub.
 type Service struct {
-	store     *store.Store
-	queue     *jobs.Queue
-	publisher *publisher.Publisher
+	store         *store.Store
+	queue         *jobs.Queue
+	publisher     *publisher.Publisher
+	jwtSecret     string
+	publicBaseURL string
 }
 
 // NewService creates a new scheduling service.
 func NewService(s *store.Store, q *jobs.Queue, pub *publisher.Publisher) *Service {
 	return &Service{store: s, queue: q, publisher: pub}
+}
+
+// SetSecrets sets encryption secrets and public URL for web RSVP links.
+func (svc *Service) SetSecrets(jwtSecret, publicBaseURL string) {
+	svc.jwtSecret = jwtSecret
+	svc.publicBaseURL = strings.TrimRight(publicBaseURL, "/")
 }
 
 // ProcessEvent handles scheduling logic when an event is created/updated.
@@ -317,7 +326,7 @@ func generateReplyICS(event *models.Event, attendeeEmail, partstat string) strin
 }
 
 // HandleSendEmailJob is the worker handler for send_scheduling_email jobs.
-// It fetches the scheduling message from DB and publishes it to Redis for the mail server.
+// It prioritizes calendar BYO SMTP when configured, falling back to Redis Pub/Sub for managed mode.
 func (svc *Service) HandleSendEmailJob(ctx context.Context, job *jobs.Job) error {
 	payload, err := jobs.ParsePayload[jobs.SchedulingEmailPayload](job)
 	if err != nil {
@@ -342,15 +351,116 @@ func (svc *Service) HandleSendEmailJob(ctx context.Context, job *jobs.Job) error
 				event = events[0]
 			}
 
-			if err := svc.SendInvitation(ctx, msg, event); err != nil {
-				svc.store.UpdateSchedulingMessageStatus(ctx, msg.ID, "failed", err.Error())
-				return fmt.Errorf("publish for %s: %w", msg.RecipientEmail, err)
+			// 1. Try delivery via Calendar BYO SMTP if configured
+			if event != nil && event.CalendarID != "" {
+				smtpCfg, err := svc.store.GetCalendarSMTP(ctx, msg.TenantID, event.CalendarID)
+				if err == nil && smtpCfg != nil && smtpCfg.Status == "active" {
+					if err := svc.sendViaBYOSMTP(ctx, msg, event, smtpCfg); err != nil {
+						svc.store.UpdateSchedulingMessageStatus(ctx, msg.ID, "failed", err.Error())
+						return fmt.Errorf("BYO SMTP delivery for %s: %w", msg.RecipientEmail, err)
+					}
+					svc.store.UpdateSchedulingMessageStatus(ctx, msg.ID, "sent", "")
+					log.Printf("scheduling: delivered %s via BYO SMTP for %s → event %s", msg.Method, msg.RecipientEmail, msg.EventUID)
+					return nil
+				}
 			}
-			svc.store.UpdateSchedulingMessageStatus(ctx, msg.ID, "sent", "")
-			log.Printf("scheduling: published %s for %s → event %s", msg.Method, msg.RecipientEmail, msg.EventUID)
+
+			// 2. Fallback to managed mail server via Redis Pub/Sub if configured
+			if svc.publisher != nil {
+				if err := svc.SendInvitation(ctx, msg, event); err != nil {
+					svc.store.UpdateSchedulingMessageStatus(ctx, msg.ID, "failed", err.Error())
+					return fmt.Errorf("publish for %s: %w", msg.RecipientEmail, err)
+				}
+				svc.store.UpdateSchedulingMessageStatus(ctx, msg.ID, "sent", "")
+				log.Printf("scheduling: published %s for %s → event %s", msg.Method, msg.RecipientEmail, msg.EventUID)
+				return nil
+			}
+
+			// 3. Neither BYO SMTP nor managed mail service is configured
+			errMsg := "Calendar has no SMTP configured and managed fallback is disabled"
+			svc.store.UpdateSchedulingMessageStatus(ctx, msg.ID, "unconfigured_smtp", errMsg)
+			log.Printf("scheduling: skipping delivery for %s: %s", msg.RecipientEmail, errMsg)
 			return nil
 		}
 	}
 
 	return nil // message not found or already processed
+}
+
+// sendViaBYOSMTP sends an invitation email directly via the calendar's custom SMTP server.
+func (svc *Service) sendViaBYOSMTP(ctx context.Context, msg *models.SchedulingMessage, event *models.Event, smtpCfg *models.CalendarSMTP) error {
+	key := crypto.DeriveKey(svc.jwtSecret)
+	decryptedPassword, err := crypto.Decrypt(smtpCfg.PasswordEncrypted, key)
+	if err != nil {
+		return fmt.Errorf("decrypt smtp password: %w", err)
+	}
+
+	baseURL := svc.publicBaseURL
+	if baseURL == "" {
+		baseURL = "http://localhost:8443"
+	}
+	rsvpToken := GenerateRSVPToken(msg.TenantID, msg.EventUID, msg.RecipientEmail, svc.jwtSecret, 30*24*time.Hour)
+
+	startFmt := ""
+	endFmt := ""
+	summary := "Calendar Event"
+	description := ""
+	location := ""
+	organizer := ""
+
+	if event != nil {
+		startFmt = event.DTStart.Format(time.RFC1123)
+		if event.DTEnd != nil {
+			endFmt = event.DTEnd.Format(time.RFC1123)
+		}
+		summary = event.Summary
+		description = event.Description
+		location = event.Location
+		organizer = event.Organizer
+	}
+
+	subject := fmt.Sprintf("Invitation: %s", summary)
+	if msg.Method == "CANCEL" {
+		subject = fmt.Sprintf("Canceled: %s", summary)
+	} else if msg.Method == "REQUEST" && event != nil && event.Sequence > 0 {
+		subject = fmt.Sprintf("Updated: %s", summary)
+	} else if msg.Method == "REPLY" {
+		subject = fmt.Sprintf("RSVP: %s", summary)
+	}
+
+	invData := &smtp.InvitationData{
+		SenderEmail:    smtpCfg.FromEmail,
+		SenderName:     smtpCfg.FromName,
+		RecipientEmail: msg.RecipientEmail,
+		Subject:        subject,
+		Method:         msg.Method,
+		Summary:        summary,
+		Description:    description,
+		Location:       location,
+		StartFormatted: startFmt,
+		EndFormatted:   endFmt,
+		Organizer:      organizer,
+		RawICS:         msg.RawICS,
+		RSVPAcceptURL:  fmt.Sprintf("%s/api/scheduling/rsvp?token=%s&action=ACCEPTED", baseURL, rsvpToken),
+		RSVPTentURL:    fmt.Sprintf("%s/api/scheduling/rsvp?token=%s&action=TENTATIVE", baseURL, rsvpToken),
+		RSVPDeclURL:    fmt.Sprintf("%s/api/scheduling/rsvp?token=%s&action=DECLINED", baseURL, rsvpToken),
+	}
+
+	mimeBytes, err := smtp.BuildInvitationMIME(invData)
+	if err != nil {
+		return fmt.Errorf("build mime: %w", err)
+	}
+
+	clientCfg := &smtp.Config{
+		Host:       smtpCfg.Host,
+		Port:       smtpCfg.Port,
+		Username:   smtpCfg.Username,
+		Password:   decryptedPassword,
+		FromEmail:  smtpCfg.FromEmail,
+		FromName:   smtpCfg.FromName,
+		ReplyTo:    smtpCfg.ReplyTo,
+		Encryption: smtpCfg.Encryption,
+	}
+
+	return smtp.SendMessage(clientCfg, msg.RecipientEmail, mimeBytes)
 }
