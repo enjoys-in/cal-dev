@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"log"
+	"math"
 	"os"
 	"strconv"
 	"strings"
@@ -159,6 +160,11 @@ func DAVAuth(authSvc *auth.Service, s *store.Store) fiber.Handler {
 			}
 
 			userID, tenantID, err := authSvc.AuthenticateBasic(c.UserContext(), result.Email, result.Password)
+			var locked *auth.TooManyAttemptsError
+			if errors.As(err, &locked) { // too many failed logins for this email
+				c.Set("Retry-After", strconv.Itoa(int(math.Ceil(locked.RetryAfter.Seconds()))))
+				return c.Status(fiber.StatusTooManyRequests).SendString("Too many failed login attempts")
+			}
 			if err != nil {
 				c.Set("WWW-Authenticate", `Basic realm="CalDAV Server"`)
 				return c.Status(401).SendString("Invalid credentials")

@@ -29,6 +29,14 @@ type Service struct {
 	basicMu    sync.Mutex
 	basicCache map[[32]byte]basicEntry // recent successful Basic logins, keyed by sha256(email, password)
 	touched    map[string]time.Time    // app password id -> last last_used_at update
+	fails      map[string]failEntry    // lower-cased email -> recent failed Basic logins
+}
+
+// failEntry counts failed Basic logins for one email.
+type failEntry struct {
+	count  int
+	first  time.Time // start of the counting window
+	locked time.Time // refuse logins until then (zero: not locked)
 }
 
 // basicEntry is a cached successful Basic login.
@@ -42,7 +50,97 @@ const (
 	basicCacheTTL = 5 * time.Minute  // a revoked app password keeps working at most this long
 	basicCacheMax = 10000            // entries; the cache is reset beyond this
 	touchInterval = 10 * time.Minute // last_used_at is written at most this often per password
+
+	// Failed-login lockout (per email, in memory, per server instance: with N instances an
+	// attacker gets at most N*loginMaxFails guesses per window). Not keyed by IP on purpose:
+	// users share proxies/NAT.
+	loginMaxFails = 10               // failures within loginWindow that trigger a lockout
+	loginWindow   = 15 * time.Minute // counting window, starting at the first failure
+	loginLockout  = 15 * time.Minute // how long a locked email is refused without checking
+	loginTrackMax = 10000            // max tracked emails
 )
+
+// TooManyAttemptsError is returned by AuthenticateBasic while an email is locked out.
+// errors.Is(err, ErrTooManyAttempts) is true for it; RetryAfter is the remaining lock time.
+type TooManyAttemptsError struct{ RetryAfter time.Duration }
+
+func (e *TooManyAttemptsError) Error() string {
+	return fmt.Sprintf("auth: too many failed login attempts, retry in %s", e.RetryAfter.Round(time.Second))
+}
+
+func (e *TooManyAttemptsError) Is(target error) bool { return target == ErrTooManyAttempts }
+
+// loginLocked returns how long email is still locked out (0 when it is not).
+func (s *Service) loginLocked(email string, now time.Time) time.Duration {
+	s.basicMu.Lock()
+	defer s.basicMu.Unlock()
+	if f, ok := s.fails[email]; ok && now.Before(f.locked) {
+		return f.locked.Sub(now)
+	}
+	return 0
+}
+
+// loginFailed records a failed login for email and locks it after loginMaxFails in loginWindow.
+func (s *Service) loginFailed(email string, now time.Time) {
+	s.basicMu.Lock()
+	defer s.basicMu.Unlock()
+	f, ok := s.fails[email]
+	if !ok || failExpired(f, now) {
+		if s.fails == nil {
+			s.fails = make(map[string]failEntry)
+		}
+		if len(s.fails) >= loginTrackMax {
+			s.evictFails(now)
+		}
+		f = failEntry{first: now}
+	}
+	f.count++
+	if f.count >= loginMaxFails {
+		f.locked = now.Add(loginLockout)
+	}
+	s.fails[email] = f
+}
+
+// loginSucceeded clears the failure count for email.
+func (s *Service) loginSucceeded(email string) {
+	s.basicMu.Lock()
+	delete(s.fails, email)
+	s.basicMu.Unlock()
+}
+
+// failExpired reports whether f no longer counts: its lock is over, or (unlocked) its window passed.
+func failExpired(f failEntry, now time.Time) bool {
+	if !f.locked.IsZero() {
+		return !now.Before(f.locked)
+	}
+	return now.Sub(f.first) > loginWindow
+}
+
+// evictFails makes room in s.fails (caller holds basicMu): drops expired entries, then, down to
+// 90% of the cap (so this full scan is not repeated on every insert), arbitrary unlocked ones,
+// and only as a last resort locked ones.
+func (s *Service) evictFails(now time.Time) {
+	target := loginTrackMax * 9 / 10
+	for k, f := range s.fails {
+		if failExpired(f, now) {
+			delete(s.fails, k)
+		}
+	}
+	for k, f := range s.fails {
+		if len(s.fails) <= target {
+			return
+		}
+		if f.locked.IsZero() {
+			delete(s.fails, k)
+		}
+	}
+	for k := range s.fails {
+		if len(s.fails) <= target {
+			return
+		}
+		delete(s.fails, k)
+	}
+}
 
 // dummyHash is compared against for unknown/inactive accounts so they take as long as real ones.
 var dummyHash = sync.OnceValue(func() []byte {
@@ -106,6 +204,8 @@ func NewService(s *store.Store, cfg *config.AuthConfig) *Service {
 var (
 	ErrUserNotFound    = errors.New("no account with this email/id in mail_accounts")
 	ErrAccountInactive = errors.New("account is not active")
+	// ErrTooManyAttempts: the email is locked out after repeated failed Basic logins (answer 429).
+	ErrTooManyAttempts = errors.New("too many failed login attempts")
 )
 
 // Claims represents JWT claims (compatible with the shared issuer token format).
@@ -286,6 +386,13 @@ func (s *Service) AuthenticateBasic(ctx context.Context, email, password string)
 		return e.userID, e.userID, nil
 	}
 
+	// Lockout is checked after the cache, so a client that already proved the password keeps
+	// working; everything else is refused without running bcrypt.
+	failKey := strings.ToLower(strings.TrimSpace(email))
+	if wait := s.loginLocked(failKey, time.Now()); wait > 0 {
+		return 0, 0, &TooManyAttemptsError{RetryAfter: wait}
+	}
+
 	// Look up user in mail_accounts by email
 	user, err := s.store.GetUserByEmail(ctx, email)
 	if err != nil {
@@ -293,10 +400,12 @@ func (s *Service) AuthenticateBasic(ctx context.Context, email, password string)
 	}
 	if user == nil {
 		_ = bcrypt.CompareHashAndPassword(dummyHash(), []byte(password)) // same timing as a real account
+		s.loginFailed(failKey, time.Now())
 		return 0, 0, fmt.Errorf("auth: user not found")
 	}
 	if strings.ToUpper(user.Status) != "ACTIVE" {
 		_ = bcrypt.CompareHashAndPassword(dummyHash(), []byte(password))
+		s.loginFailed(failKey, time.Now())
 		return 0, 0, fmt.Errorf("auth: account is %s", user.Status)
 	}
 
@@ -308,6 +417,7 @@ func (s *Service) AuthenticateBasic(ctx context.Context, email, password string)
 
 	for _, ap := range appPasswords {
 		if CheckPassword(password, ap.PasswordHash) {
+			s.loginSucceeded(failKey)
 			s.rememberBasic(key, basicEntry{userID: user.ID, appPassID: ap.ID, expires: time.Now().Add(basicCacheTTL)})
 			// Update last_used timestamp asynchronously (throttled)
 			s.touchAppPassword(ap.ID)
@@ -316,6 +426,7 @@ func (s *Service) AuthenticateBasic(ctx context.Context, email, password string)
 		}
 	}
 
+	s.loginFailed(failKey, time.Now())
 	return 0, 0, fmt.Errorf("auth: invalid credentials")
 }
 

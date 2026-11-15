@@ -1153,6 +1153,8 @@ func (s *Store) DeleteSubscription(ctx context.Context, tenantID int, subID stri
 // ReplaceCalendarEvents makes the calendar hold exactly the given events, in one transaction, so
 // readers never see it empty or half-imported. Concurrent replaces of one calendar run one after
 // the other. An event that cannot be stored is skipped (onSkip is told why); the rest still go in.
+// Rows are upserted on (calendar_id, uid, recurrence_id), so existing events keep their ids; rows
+// whose ETag is unchanged are not rewritten at all, and rows no longer in the feed are deleted.
 func (s *Store) ReplaceCalendarEvents(ctx context.Context, tenantID int, calendarID string, events []*models.Event, onSkip func(*models.Event, error)) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -1162,11 +1164,41 @@ func (s *Store) ReplaceCalendarEvents(ctx context.Context, tenantID int, calenda
 	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(6004, hashtext($1))`, calendarID); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx,
-		`DELETE FROM caldev_events WHERE tenant_id = $1 AND calendar_id = $2`, tenantID, calendarID); err != nil {
+
+	type key struct{ uid, rid string }
+	type storedRow struct{ id, etag string }
+	stored := map[key]storedRow{}
+	rows, err := tx.QueryContext(ctx,
+		`SELECT id, uid, recurrence_id, etag FROM caldev_events WHERE tenant_id = $1 AND calendar_id = $2`,
+		tenantID, calendarID)
+	if err != nil {
 		return err
 	}
+	for rows.Next() {
+		var k key
+		var r storedRow
+		if err := rows.Scan(&r.id, &k.uid, &k.rid, &r.etag); err != nil {
+			rows.Close()
+			return err
+		}
+		stored[k] = r
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	uids := make([]string, 0, len(events))
+	rids := make([]string, 0, len(events))
 	for _, e := range events {
+		uids = append(uids, e.UID)
+		rids = append(rids, e.RecurrenceID)
+		// All rows of a resource share its ETag (a hash of the full resource text), so an equal
+		// ETag means the row's content is unchanged: leave it alone (no change-log entry).
+		if r, ok := stored[key{e.UID, e.RecurrenceID}]; ok && e.TenantID == tenantID && r.etag == e.ETag {
+			e.ID = r.id
+			continue
+		}
 		if _, err := tx.ExecContext(ctx, `SAVEPOINT ev`); err != nil {
 			return err
 		}
@@ -1182,6 +1214,14 @@ func (s *Store) ReplaceCalendarEvents(ctx context.Context, tenantID int, calenda
 		if _, err := tx.ExecContext(ctx, `RELEASE SAVEPOINT ev`); err != nil {
 			return err
 		}
+	}
+	// Delete last: only rows of this calendar that are no longer in the feed.
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM caldev_events
+		 WHERE tenant_id = $1 AND calendar_id = $2
+		   AND (uid, recurrence_id) NOT IN (SELECT * FROM unnest($3::text[], $4::text[]))`,
+		tenantID, calendarID, pq.Array(uids), pq.Array(rids)); err != nil {
+		return err
 	}
 	return tx.Commit()
 }

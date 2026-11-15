@@ -439,10 +439,15 @@ func (svc *Service) sendViaBYOSMTP(ctx context.Context, msg *models.SchedulingMe
 				}
 			}
 		} else {
-			// Times are shown in UTC (RFC1123 labels them "UTC").
-			startFmt = event.DTStart.UTC().Format(time.RFC1123)
+			// Times are shown in the event's own zone with its abbreviation; UTC when it has none.
+			loc := ics.EventLocation(event)
+			if loc == nil {
+				loc = time.UTC
+			}
+			const layout = "Mon, 02 Jan 2006 15:04 MST"
+			startFmt = event.DTStart.In(loc).Format(layout)
 			if event.DTEnd != nil {
-				endFmt = event.DTEnd.UTC().Format(time.RFC1123)
+				endFmt = event.DTEnd.In(loc).Format(layout)
 			}
 		}
 		summary = event.Summary

@@ -138,6 +138,12 @@ func eventLocation(e *models.Event) *time.Location {
 	return loc
 }
 
+// EventLocation returns the event's own time zone (its TZID resolved), or nil when it has none
+// or the zone is unknown; callers then use UTC.
+func EventLocation(e *models.Event) *time.Location {
+	return eventLocation(e)
+}
+
 // writeDateTime writes a date-time property: "NAME;TZID=Zone:local" when loc is set,
 // otherwise "NAME:...Z" in UTC.
 func writeDateTime(b *strings.Builder, name string, t time.Time, loc *time.Location) {

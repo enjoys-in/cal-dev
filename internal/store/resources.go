@@ -338,7 +338,24 @@ func (s *Store) FindResourceByUID(ctx context.Context, tenantID int, uid string)
 // stored row's id when possible, and ETags are untouched because raw_ics is not regenerated.
 // It is idempotent: a resource that already has a row per component is left alone.
 // It returns the number of resources repaired.
+//
+// The scan runs once: a run that completes without error records repairFlattenedMarker in
+// caldev_migrations and later calls return immediately. Every current write path (CalDAV PUT,
+// JMAP, scheduling, subscription sync) stores one row per component, so nothing new can need it.
 func (s *Store) RepairFlattenedResources(ctx context.Context) (int, error) {
+	if done, err := s.IsMigrationApplied(repairFlattenedMarker); err != nil || done {
+		return 0, err
+	}
+	n, err := s.repairFlattenedResources(ctx)
+	if err != nil {
+		return n, err
+	}
+	return n, s.RecordMigration(repairFlattenedMarker)
+}
+
+const repairFlattenedMarker = "repair:flattened-resources-v1"
+
+func (s *Store) repairFlattenedResources(ctx context.Context) (int, error) {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT `+eventColumns+` FROM caldev_events
 		 WHERE raw_ics LIKE '%BEGIN:VEVENT%BEGIN:VEVENT%' OR raw_ics LIKE '%BEGIN:VTODO%BEGIN:VTODO%'

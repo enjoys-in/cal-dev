@@ -23,6 +23,7 @@ import (
 	"github.com/enjoys-in/cal-dev/internal/store"
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
+	"github.com/redis/go-redis/v9"
 )
 
 // Handler provides JMAP (RFC 8620) endpoint handlers.
@@ -32,6 +33,8 @@ type Handler struct {
 	scheduling *scheduling.Service
 	hub        *realtime.Hub
 	avail      *availability.Service
+	locker     *redis.Client // cross-instance /set lock; nil = in-process lock only
+	lockPrefix string
 }
 
 // SetRealtime enables live streaming on /jmap/eventsource.
@@ -39,6 +42,13 @@ func (h *Handler) SetRealtime(hub *realtime.Hub) { h.hub = hub }
 
 // SetAvailability enables the JMAP Principal/getAvailability method.
 func (h *Handler) SetAvailability(a *availability.Service) { h.avail = a }
+
+// SetLocker makes /set take a per-account Redis lock (key "<prefix>:jmap:lock:<tenant>:<user>"),
+// so ifInState is honoured across server instances.
+func (h *Handler) SetLocker(client *redis.Client, prefix string) {
+	h.locker = client
+	h.lockPrefix = prefix
+}
 
 // NewHandler creates a new JMAP handler.
 func NewHandler(s *store.Store, baseURL string, sched *scheduling.Service) *Handler {
@@ -61,11 +71,58 @@ const (
 // the writes happen without another /set of the same account in between.
 var setLocks sync.Map // tenantID -> *sync.Mutex
 
-func lockAccount(tenantID int) func() {
+const (
+	setLockTTL   = 30 * time.Second // the Redis lock frees itself if its holder dies
+	setLockWait  = 5 * time.Second  // give up (serverUnavailable) after waiting this long
+	setLockRetry = 50 * time.Millisecond
+)
+
+// unlockScript deletes the lock only if it still holds our token (it may have expired and been
+// taken by another instance).
+var unlockScript = redis.NewScript(`if redis.call("GET", KEYS[1]) == ARGV[1] then return redis.call("DEL", KEYS[1]) end return 0`)
+
+// lockAccount serialises /set calls of one account: always in this process (cheap, and local
+// callers then queue on the mutex instead of polling Redis), and across instances through a
+// Redis lock when SetLocker was called. It fails when the Redis lock cannot be taken in time or
+// Redis is unreachable; the returned func releases both locks.
+func (h *Handler) lockAccount(ctx context.Context, tenantID, userID int) (func(), error) {
 	v, _ := setLocks.LoadOrStore(tenantID, &sync.Mutex{})
 	m := v.(*sync.Mutex)
 	m.Lock()
-	return m.Unlock
+	if h.locker == nil {
+		return m.Unlock, nil
+	}
+	key := fmt.Sprintf("%s:jmap:lock:%d:%d", h.lockPrefix, tenantID, userID)
+	token := uuid.NewString()
+	deadline := time.Now().Add(setLockWait)
+	for {
+		err := h.locker.SetArgs(ctx, key, token, redis.SetArgs{Mode: "NX", TTL: setLockTTL}).Err()
+		if err == nil {
+			break
+		}
+		if err != redis.Nil || time.Now().After(deadline) {
+			m.Unlock()
+			if err == redis.Nil {
+				err = fmt.Errorf("account is locked by another request")
+			}
+			return nil, err
+		}
+		select {
+		case <-ctx.Done():
+			m.Unlock()
+			return nil, ctx.Err()
+		case <-time.After(setLockRetry):
+		}
+	}
+	return func() {
+		// Not the request context: release even if the request was cancelled.
+		rctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		if err := unlockScript.Run(rctx, h.locker, []string{key}, token).Err(); err != nil {
+			log.Printf("jmap: release %s: %v (expires in %s)", key, err, setLockTTL)
+		}
+		cancel()
+		m.Unlock()
+	}, nil
 }
 
 func (h *Handler) Session(c *fiber.Ctx) error {
@@ -320,7 +377,13 @@ func (h *Handler) calendarEventSet(c *fiber.Ctx, tenantID, userID int, call *JMA
 		return jmapMethodError("requestTooLarge", fmt.Sprintf("at most %d objects per call", maxObjectsInSet), call.CallID)
 	}
 
-	defer lockAccount(tenantID)()
+	unlock, err := h.lockAccount(c.UserContext(), tenantID, userID)
+	if err != nil {
+		// RFC 8620 §3.6.2 serverUnavailable: temporary, the client may retry after a backoff.
+		log.Printf("jmap: %s lock for account %d: %v", call.MethodName, tenantID, err)
+		return jmapMethodError("serverUnavailable", "account is busy, retry later", call.CallID)
+	}
+	defer unlock()
 	oldState, _ := h.store.GetJMAPState(c.UserContext(), tenantID, userID, "CalendarEvent")
 	if args.IfInState != "" && args.IfInState != oldState {
 		return []interface{}{"error", map[string]string{
@@ -875,7 +938,13 @@ func (h *Handler) calendarSet(c *fiber.Ctx, tenantID, userID int, call *JMAPMeth
 		return jmapMethodError("requestTooLarge", fmt.Sprintf("at most %d objects per call", maxObjectsInSet), call.CallID)
 	}
 
-	defer lockAccount(tenantID)()
+	unlock, err := h.lockAccount(c.UserContext(), tenantID, userID)
+	if err != nil {
+		// RFC 8620 §3.6.2 serverUnavailable: temporary, the client may retry after a backoff.
+		log.Printf("jmap: %s lock for account %d: %v", call.MethodName, tenantID, err)
+		return jmapMethodError("serverUnavailable", "account is busy, retry later", call.CallID)
+	}
+	defer unlock()
 	oldState, _ := h.store.GetJMAPState(c.UserContext(), tenantID, userID, "Calendar")
 	if args.IfInState != "" && args.IfInState != oldState {
 		return []interface{}{"error", map[string]string{

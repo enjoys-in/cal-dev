@@ -117,7 +117,9 @@ func (h *Handler) UpsertSMTP(c *fiber.Ctx) error {
 		return response.Error(c, 400, "port must be between 1 and 65535")
 	}
 	req.Encryption = strings.ToLower(strings.TrimSpace(req.Encryption))
-	if req.Encryption == "" {
+	if req.Encryption == "" && req.Port == 465 {
+		req.Encryption = "ssl" // implicit TLS port
+	} else if req.Encryption == "" {
 		req.Encryption = "starttls"
 	}
 	if req.Encryption != "none" && req.Encryption != "ssl" && req.Encryption != "starttls" {

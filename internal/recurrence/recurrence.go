@@ -240,6 +240,9 @@ func ruleStarts(e *models.Event, rule string, loc *time.Location, after, before 
 		dtstart = time.Date(e.DTStart.Year(), e.DTStart.Month(), e.DTStart.Day(), 0, 0, 0, 0, time.UTC)
 	}
 	opt.Dtstart = dtstart
+	if neverMatches(*opt) {
+		return nil
+	}
 	r, err := rrule.NewRRule(*opt)
 	if err != nil {
 		return []time.Time{e.DTStart}
@@ -257,6 +260,32 @@ func ruleStarts(e *models.Event, rule string, loc *time.Location, after, before 
 		out = append(out, t)
 	}
 	return out
+}
+
+// neverMatches reports whether the rule, ignoring COUNT and UNTIL, has no occurrence at all (e.g.
+// FREQ=DAILY;BYMONTH=2;BYMONTHDAY=30). rrule-go looks for the next match up to the year 9999
+// before giving up, and UNTIL does not stop that search (it is only compared with candidates
+// that matched), so such a rule cost ~200ms per expansion. The Gregorian calendar repeats every
+// 400 years, so the rule's pattern repeats every 400*INTERVAL years: a probe moved forward by a
+// multiple of that period, to within two periods of 9999, searches at most two periods.
+func neverMatches(opt rrule.ROption) bool {
+	if len(opt.Byeaster) > 0 {
+		return false // Easter does not follow the 400-year cycle
+	}
+	period := 400 * max(opt.Interval, 1)
+	shift := (rrule.MAXYEAR - period - opt.Dtstart.Year()) / period * period
+	if shift <= 0 {
+		return false // the real search is already within about one period of its end
+	}
+	opt.Dtstart = opt.Dtstart.AddDate(shift, 0, 0)
+	opt.Count = 0
+	opt.Until = time.Time{}
+	r, err := rrule.NewRRule(opt)
+	if err != nil {
+		return false
+	}
+	_, ok := r.Iterator()()
+	return !ok
 }
 
 func overlaps(start time.Time, dur time.Duration, from, to time.Time) bool {

@@ -111,7 +111,7 @@ func (w *Worker) Stop() {
 func (w *Worker) processLoop(ctx context.Context, workerID int, jobTypes []string) {
 	defer w.wg.Done()
 
-	// BRPOP serves keys in the given order, so rotate it every poll: a flooded queue must not
+	// Dequeue serves keys in the given order, so rotate it every poll: a flooded queue must not
 	// starve the others.
 	order := make([]string, len(jobTypes))
 	for n := workerID; ; n++ {
@@ -151,7 +151,9 @@ func (w *Worker) handleJob(ctx context.Context, workerID int, job *Job) {
 		defer dcancel()
 		if err := w.queue.sendToDeadLetter(dctx, job); err != nil {
 			log.Printf("ERROR worker[%d]: dead-letter push failed: %v", workerID, err)
+			return // not acked: the reaper re-queues it
 		}
+		w.ack(dctx, workerID, job)
 		return
 	}
 
@@ -176,13 +178,16 @@ func (w *Worker) handleJob(ctx context.Context, workerID int, job *Job) {
 		result.Status = "failed"
 		result.ErrorMessage = err.Error()
 
-		// Retry if possible
+		// Retry if possible. If even that fails the job is not acked, so the reaper re-queues it.
 		if retryErr := w.queue.Retry(bctx, job); retryErr != nil {
 			log.Printf("worker[%d]: retry enqueue failed: %v", workerID, retryErr)
 			result.Status = "dead"
+		} else {
+			w.ack(bctx, workerID, job)
 		}
 	} else {
 		result.Status = "completed"
+		w.ack(bctx, workerID, job)
 	}
 
 	// Record in job_history (best-effort)
@@ -191,7 +196,16 @@ func (w *Worker) handleJob(ctx context.Context, workerID int, job *Job) {
 	}
 }
 
-// promoterLoop periodically moves scheduled/delayed jobs into their queues.
+// ack removes a finished job from the processing set. A failed ack only means the job may run
+// once more after the visibility timeout.
+func (w *Worker) ack(ctx context.Context, workerID int, job *Job) {
+	if err := w.queue.Ack(ctx, job); err != nil {
+		log.Printf("worker[%d]: ack of job %s/%s failed: %v", workerID, job.Type, job.ID, err)
+	}
+}
+
+// promoterLoop periodically moves scheduled/delayed jobs into their queues and re-queues jobs
+// whose worker died before acking them.
 func (w *Worker) promoterLoop(ctx context.Context) {
 	defer w.wg.Done()
 	ticker := time.NewTicker(time.Second)

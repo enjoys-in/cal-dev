@@ -31,9 +31,22 @@ type Job struct {
 	Retries  int             `json:"retries"`
 	MaxRetry int             `json:"max_retry"`
 	Created  time.Time       `json:"created"`
+
+	raw string // exact JSON as dequeued; identifies the job in the processing set (see Ack)
 }
 
-// Queue provides a Valkey-backed job queue using LPUSH/BRPOP.
+// visibilityTimeout is how long a dequeued job may run before the reaper assumes its worker died
+// and puts it back on its queue. It must stay well above any normal handler's run time.
+const visibilityTimeout = 5 * time.Minute
+
+// dequeuePoll is how often an idle Dequeue re-checks the queues.
+const dequeuePoll = 250 * time.Millisecond
+
+// Queue provides a Valkey-backed reliable job queue: LPUSH to enqueue; Dequeue atomically moves a
+// job into a processing set until it is acked, and the promoter re-queues jobs whose worker died.
+// Delivery is therefore at-least-once: a job can run twice if a worker crashes (or overruns the
+// visibility timeout) after doing its work but before Ack. Handlers are expected to be idempotent
+// (scheduling emails only send while still 'pending', reminders are deduplicated).
 type Queue struct {
 	client     *redis.Client
 	prefix     string
@@ -84,6 +97,12 @@ func (q *Queue) queueKey(jobType string) string {
 // deadLetterKey returns the dead-letter queue key.
 func (q *Queue) deadLetterKey() string {
 	return fmt.Sprintf("%s:dead", q.prefix)
+}
+
+// processingKey returns the sorted set of in-flight jobs (member = raw job JSON, score = unix
+// deadline after which the job is re-queued).
+func (q *Queue) processingKey() string {
+	return fmt.Sprintf("%s:processing", q.prefix)
 }
 
 // Enqueue pushes a job onto the queue.
@@ -160,37 +179,86 @@ func (q *Queue) enqueueDelayed(ctx context.Context, id string, created time.Time
 	return job.ID, nil
 }
 
-// Dequeue blocks until a job is available on any of the given queues.
-// Returns nil if context is cancelled.
+// dequeueScript pops one job from the first non-empty queue list in KEYS[2..] (in the given order,
+// like BRPOP) and, in the same atomic step, records it in the processing set KEYS[1] with score
+// ARGV[1] (its deadline). Returns {queueKey, raw} or nil when every queue is empty.
+var dequeueScript = redis.NewScript(`
+for i = 2, #KEYS do
+  local raw = redis.call('RPOP', KEYS[i])
+  if raw then
+    redis.call('ZADD', KEYS[1], ARGV[1], raw)
+    return {KEYS[i], raw}
+  end
+end
+return false
+`)
+
+// Dequeue waits up to timeout for a job on any of the given queues (checked in order) and moves it
+// into the processing set; the caller must Ack it once its outcome is recorded.
+// Returns nil if no job arrived or the context is cancelled.
 func (q *Queue) Dequeue(ctx context.Context, timeout time.Duration, jobTypes ...string) (*Job, error) {
-	keys := make([]string, len(jobTypes))
-	for i, jt := range jobTypes {
-		keys[i] = q.queueKey(jt)
+	keys := make([]string, 0, len(jobTypes)+1)
+	keys = append(keys, q.processingKey())
+	for _, jt := range jobTypes {
+		keys = append(keys, q.queueKey(jt))
 	}
 
-	result, err := q.client.BRPop(ctx, timeout, keys...).Result()
-	if err != nil {
-		if err == redis.Nil {
+	// BLMOVE only takes one source list, so poll a non-blocking pop across all queues instead.
+	end := time.Now().Add(timeout)
+	for {
+		deadline := time.Now().Add(visibilityTimeout).Unix()
+		result, err := dequeueScript.Run(ctx, q.client, keys, deadline).StringSlice()
+		if err == nil && len(result) == 2 {
+			return q.decodeJob(ctx, result[0], result[1]), nil
+		}
+		if err != nil && err != redis.Nil {
+			return nil, fmt.Errorf("jobs: dequeue: %w", err)
+		}
+
+		wait := time.Until(end)
+		if wait <= 0 {
 			return nil, nil // timeout, no job
 		}
-		return nil, fmt.Errorf("jobs: dequeue: %w", err)
-	}
-
-	if len(result) < 2 {
-		return nil, nil
-	}
-
-	var job Job
-	if err := json.Unmarshal([]byte(result[1]), &job); err != nil {
-		// Keep the raw job for inspection instead of dropping it silently.
-		log.Printf("ERROR jobs: unparseable job from %s moved to dead-letter: %v: %s", result[0], err, result[1])
-		if dlErr := q.client.LPush(context.WithoutCancel(ctx), q.deadLetterKey(), result[1]).Err(); dlErr != nil {
-			log.Printf("ERROR jobs: dead-letter push failed: %v", dlErr)
+		if wait > dequeuePoll {
+			wait = dequeuePoll
 		}
-		return nil, nil
+		select {
+		case <-ctx.Done():
+			return nil, nil
+		case <-time.After(wait):
+		}
 	}
+}
 
-	return &job, nil
+// decodeJob parses a dequeued job. An unparseable one is moved to the dead-letter list (and out of
+// the processing set) and nil is returned.
+func (q *Queue) decodeJob(ctx context.Context, queueKey, raw string) *Job {
+	var job Job
+	if err := json.Unmarshal([]byte(raw), &job); err != nil {
+		// Keep the raw job for inspection instead of dropping it silently.
+		log.Printf("ERROR jobs: unparseable job from %s moved to dead-letter: %v: %s", queueKey, err, raw)
+		bctx := context.WithoutCancel(ctx)
+		if dlErr := q.client.LPush(bctx, q.deadLetterKey(), raw).Err(); dlErr != nil {
+			log.Printf("ERROR jobs: dead-letter push failed: %v", dlErr)
+			return nil // left in processing; the reaper will re-queue it
+		}
+		if ackErr := q.client.ZRem(bctx, q.processingKey(), raw).Err(); ackErr != nil {
+			log.Printf("ERROR jobs: ack of dead-lettered job failed: %v", ackErr)
+		}
+		return nil
+	}
+	job.raw = raw
+	return &job
+}
+
+// Ack removes a dequeued job from the processing set. Call it only after the job's outcome
+// (completed, retry scheduled or dead-lettered) is stored, so a crash in between re-runs the job
+// instead of losing it.
+func (q *Queue) Ack(ctx context.Context, job *Job) error {
+	if job.raw == "" {
+		return nil
+	}
+	return q.client.ZRem(ctx, q.processingKey(), job.raw).Err()
 }
 
 // Retry re-enqueues a failed job with incremented retry count.
@@ -230,7 +298,7 @@ func (q *Queue) sendToDeadLetter(ctx context.Context, job *Job) error {
 const promoteBatch = 100
 
 // promoteScript atomically moves up to ARGV[2] due members (score <= ARGV[1]) of the scheduled
-// set KEYS[1] to their queue list ARGV[3]..":"..type, so two instances can never promote the same
+// or processing set KEYS[1] to their queue list ARGV[3]..":"..type, so two instances can never promote the same
 // job twice. Members that are not valid job JSON go to the dead-letter list KEYS[2].
 var promoteScript = redis.NewScript(`
 local items = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, tonumber(ARGV[2]))
@@ -246,17 +314,36 @@ end
 return #items
 `)
 
-// PromoteScheduled moves scheduled/delayed jobs that are ready into their queues.
-// Should be called periodically.
+// PromoteScheduled moves scheduled/delayed jobs that are ready into their queues, and re-queues
+// in-flight jobs whose visibility timeout expired (their worker crashed or was cut off at
+// shutdown). Should be called periodically.
 func (q *Queue) PromoteScheduled(ctx context.Context) error {
-	keys := []string{fmt.Sprintf("%s:scheduled", q.prefix), q.deadLetterKey()}
+	if _, err := q.promoteDue(ctx, fmt.Sprintf("%s:scheduled", q.prefix)); err != nil {
+		return fmt.Errorf("jobs: promote scheduled: %w", err)
+	}
+	n, err := q.promoteDue(ctx, q.processingKey())
+	if err != nil {
+		return fmt.Errorf("jobs: requeue expired: %w", err)
+	}
+	if n > 0 {
+		log.Printf("jobs: re-queued %d job(s) not acked within %s", n, visibilityTimeout)
+	}
+	return nil
+}
+
+// promoteDue moves all members of the sorted set zkey with score <= now onto their queues
+// (atomically per batch, so concurrent instances never move the same member twice).
+func (q *Queue) promoteDue(ctx context.Context, zkey string) (int, error) {
+	keys := []string{zkey, q.deadLetterKey()}
+	total := 0
 	for {
 		n, err := promoteScript.Run(ctx, q.client, keys, time.Now().Unix(), promoteBatch, q.prefix).Int()
 		if err != nil {
-			return fmt.Errorf("jobs: promote scheduled: %w", err)
+			return total, err
 		}
+		total += n
 		if n < promoteBatch {
-			return nil
+			return total, nil
 		}
 	}
 }

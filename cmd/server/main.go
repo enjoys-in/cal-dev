@@ -163,6 +163,7 @@ func main() {
 	jmapHandler := jmap.NewHandler(db, baseURL, schedulingSvc)
 	jmapHandler.SetRealtime(rtHub)
 	jmapHandler.SetAvailability(availSvc)
+	jmapHandler.SetLocker(jobQueue.Client(), cfg.Worker.QueuePrefix) // ifInState lock shared by all instances
 
 	// Create Fiber app with WebDAV method support
 	app := fiber.New(fiber.Config{
