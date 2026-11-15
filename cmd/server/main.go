@@ -79,6 +79,7 @@ func main() {
 		"migrations/004_reminders.sql",
 		"migrations/005_calendar_byo_smtp.sql",
 		"migrations/006_change_log_fixes.sql",
+		"migrations/007_onboarding_api_keys.sql",
 	}
 	// A missing or failed migration stops startup: running on a partial schema breaks later features.
 	for _, mf := range migrationFiles {
@@ -338,12 +339,23 @@ func main() {
 	// ============================================================
 	// User Onboarding & Admin API
 	// ============================================================
-	onboardHandler := createUserHandler(db, authSvc)
-	app.Post("/api/calendar/onboard", onboardHandler)
-	app.Post("/api/users/onboard", onboardHandler)
+	// Onboarding: X-API-Key (onboards users of the key's domain) or AirSend JWT (own email only).
+	onboardAuth := middleware.OnboardAuth(authSvc, db)
+	onboardHandler := createUserHandler(db, true)
+	app.Post("/api/calendar/onboard", onboardAuth, onboardHandler)
+	app.Post("/api/users/onboard", onboardAuth, onboardHandler)
+
+	// Onboarding API keys, managed by the signed-in user for their own email
+	apiKeyGroup := app.Group("/api/api-keys", middleware.JMAPAuth(authSvc, db))
+	apiKeyGroup.Get("/", listOwnAPIKeysHandler(db))
+	apiKeyGroup.Post("/", createOwnAPIKeyHandler(db))
+	apiKeyGroup.Delete("/:id", revokeOwnAPIKeyHandler(db))
 
 	adminGroup := app.Group("/api/admin", middleware.APIKeyAuth(cfg.Auth.AdminAPIKey))
-	adminGroup.Post("/users", onboardHandler)
+	adminGroup.Post("/users", createUserHandler(db, false))
+	adminGroup.Get("/api-keys", adminListAPIKeysHandler(db))
+	adminGroup.Post("/api-keys", adminCreateAPIKeyHandler(db))
+	adminGroup.Delete("/api-keys/:id", adminRevokeAPIKeyHandler(db))
 
 	// ============================================================
 	// Graceful Shutdown
@@ -505,35 +517,48 @@ func deleteAppPasswordHandler(db *store.Store) fiber.Handler {
 }
 
 // createUserHandler provisions a user in mail_accounts (one per email) and creates their default calendar.
-func createUserHandler(db *store.Store, authSvc *auth.Service) fiber.Handler {
+// scoped=true (the public onboarding routes, behind middleware.OnboardAuth) limits who may be
+// onboarded: an API key only users of its domain, a JWT only its own email. scoped=false is the
+// admin route (ADMIN_API_KEY), which may onboard any email.
+func createUserHandler(db *store.Store, scoped bool) fiber.Handler {
 	return func(c *fiber.Ctx) error {
 		var req struct {
 			Email string `json:"email"`
 			Name  string `json:"name"`
 		}
 		_ = c.BodyParser(&req)
+		req.Email = strings.ToLower(strings.TrimSpace(req.Email))
 
-		// If email not in body, try to extract from Bearer token
-		if req.Email == "" {
-			if authHeader := c.Get("Authorization"); strings.HasPrefix(authHeader, "Bearer ") {
-				token := strings.TrimPrefix(authHeader, "Bearer ")
-				if claims, err := authSvc.ValidateToken(token); err == nil && claims.Email != "" {
-					req.Email = claims.Email
-					if req.Name == "" {
-						req.Name = claims.DisplayName
-					}
+		if scoped {
+			if own, _ := c.Locals("onboard_email").(string); own != "" {
+				if req.Email != "" && req.Email != own {
+					return response.Error(c, 403, "a token can only onboard its own email")
 				}
+				req.Email = own
+				if req.Name == "" {
+					req.Name, _ = c.Locals("onboard_name").(string)
+				}
+			} else if domain, _ := c.Locals("onboard_domain").(string); domain != "" {
+				if req.Email != "" && store.EmailDomain(req.Email) != domain {
+					return response.Error(c, 403, "this API key can only onboard users of "+domain)
+				}
+			} else {
+				return response.Error(c, 401, "X-API-Key or Bearer token required")
 			}
 		}
 
-		if req.Email == "" {
-			return response.Error(c, 400, "email is required")
+		if req.Email == "" || store.EmailDomain(req.Email) == "" {
+			return response.Error(c, 400, "a valid email is required")
 		}
 
 		// Look up or insert user into mail_accounts (ensuring 1 user per email)
 		user, err := db.EnsureUserByEmail(c.UserContext(), req.Email, req.Name)
 		if err != nil {
-			return response.Error(c, 500, "failed to provision user: "+err.Error())
+			log.Printf("onboard: provision %s: %v", req.Email, err)
+			return response.Error(c, 500, "failed to provision user")
+		}
+		if !strings.EqualFold(user.Status, "ACTIVE") {
+			return response.Error(c, 403, "account is not active")
 		}
 
 		// Ensure default calendar exists (tenant_id == user.ID)

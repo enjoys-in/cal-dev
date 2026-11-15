@@ -370,6 +370,48 @@ Records the answer (sent by the page's buttons), updates the organizer's copy an
 
 ---
 
+## 8b. User Onboarding & API Keys
+
+### `POST /api/users/onboard` (same as `POST /api/calendar/onboard`)
+Creates the user's account if it doesn't exist yet and makes sure they have a default calendar. No app headers needed. Two ways to authenticate:
+
+| Caller | Send | May onboard |
+|---|---|---|
+| AirSend apps (internal) | `Authorization: Bearer <jwt>` or the `access_token` cookie | only the token's own email (the body `email` may be omitted; a different one → `403`) |
+| External services (can't hold the JWT secret) | `X-API-Key: cdk_…` | any user whose email is in the key's domain (key linked to `admin@customer.com` → `*@customer.com`; other domains → `403`) |
+
+**Request:** `{ "email": "bob@customer.com", "name": "Bob" }`
+
+**Response:**
+```json
+{ "user_id": 42, "email": "bob@customer.com", "tenant_id": 42,
+  "calendar_id": "uuid", "calendars": [ … ] }
+```
+
+- New accounts are created `ACTIVE` with `tenant_name` = the email's domain (that decides org visibility).
+- An existing account keeps its status: a suspended account is **not** reactivated, and onboarding it returns `403 account is not active`.
+- No credentials → `401`; invalid or revoked key → `401`.
+
+### Managing API keys
+A key is shown **once**, when it is created; only its SHA-256 hash is stored. Keys don't expire; revoke them when no longer needed.
+
+**Your own keys** (JWT, normal app headers) — scoped to your email's domain. Not allowed for public webmail domains (gmail.com, outlook.com, …); at most 10 active keys.
+```
+GET    /api/api-keys                 → { "api_keys": [ … ] }   (key text is never listed)
+POST   /api/api-keys   {"label": ""} → 201 { "key": "cdk_…", "api_key": { … } }
+DELETE /api/api-keys/:id             → 204 (404 if not yours or already revoked)
+```
+
+**Admin** (`X-API-Key: <ADMIN_API_KEY>`) — keys for any owner email, including public domains:
+```
+GET    /api/admin/api-keys[?owner_email=…]
+POST   /api/admin/api-keys   {"owner_email": "admin@customer.com", "label": "Customer CRM"} → 201
+DELETE /api/admin/api-keys/:id
+POST   /api/admin/users      {"email": "…", "name": "…"}   → onboard any email (no domain limit)
+```
+
+---
+
 ## 7. JMAP API — `/jmap/`
 
 Auth: **JWT Bearer** or **Basic Auth**
@@ -615,6 +657,14 @@ All JSON field names match these models exactly.
 | `POST` | `/api/public/rsvp` | Signed token | Public web RSVP: records the answer |
 | `POST` | `/api/scheduling/rsvp` | Basic/JWT | In-app user RSVP endpoint |
 | `POST` | `/api/scheduling/incoming` | Basic/JWT | Inbound iMIP webhook (mail server) |
+| `POST` | `/api/users/onboard`, `/api/calendar/onboard` | JWT (own email) or `X-API-Key` (key's domain) | Create account + default calendar |
+| `GET` | `/api/api-keys` | JWT | List your onboarding API keys |
+| `POST` | `/api/api-keys` | JWT | Create an onboarding API key (shown once) |
+| `DELETE` | `/api/api-keys/:id` | JWT | Revoke one of your keys |
+| `GET` | `/api/admin/api-keys` | Admin key | List all keys (`?owner_email=`) |
+| `POST` | `/api/admin/api-keys` | Admin key | Create a key for any owner email |
+| `DELETE` | `/api/admin/api-keys/:id` | Admin key | Revoke any key |
+| `POST` | `/api/admin/users` | Admin key | Onboard any email |
 
 ---
 

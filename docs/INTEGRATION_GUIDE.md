@@ -52,7 +52,9 @@ Returns:
 ### 2.2 Onboarding & "Start Using Calendar" (1 Calendar Per Email)
 CalDev enforces **one primary calendar per email address**.
 - If a user has no calendar (or is encountering a setup state), prompt with **"Start Using Calendar"**.
-- Trigger onboarding via `POST /api/onboard` or JMAP `Calendar/set`.
+- Trigger onboarding via `POST /api/calendar/onboard` (or `/api/users/onboard`) or JMAP `Calendar/set`.
+  - AirSend apps call it with the user's JWT; it onboards only that user.
+  - External services that can't hold the JWT secret get an onboarding API key (`X-API-Key`), which onboards users of the key's email domain only. Keys come from `POST /api/admin/api-keys` (admin) or `POST /api/api-keys` (a signed-in user, for their own domain). See [API Reference §8b](API_REFERENCE.md).
 - Once created, feature settings (name, description, color, timezone) can be customized anytime.
 
 ### 2.3 Handling 401 (View-Only Mode)

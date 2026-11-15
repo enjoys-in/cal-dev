@@ -123,7 +123,8 @@ cal-dev/
 │   ├── 003_recurrence_overrides.sql # One row per RECURRENCE-ID override
 │   ├── 004_reminders.sql            # Reminder deliveries deduplication table
 │   ├── 005_calendar_byo_smtp.sql    # Per-calendar BYO SMTP settings
-│   └── 006_change_log_fixes.sql     # Change log: calendar delete/move, ordered ids
+│   ├── 006_change_log_fixes.sql     # Change log: calendar delete/move, ordered ids
+│   └── 007_onboarding_api_keys.sql  # Onboarding API keys (hashed, domain-scoped)
 ├── build.sh                     # Automated build, stop-old, run-new deployment
 ├── run.sh                       # Quick run script
 ├── docker-compose.yml           # PostgreSQL + Valkey + CalDev
@@ -248,6 +249,14 @@ POST /jmap/api        → Method calls (CalendarEvent/*, Calendar/*)
 POST   /api/app-passwords/     → Create app password
 DELETE /api/app-passwords/:id  → Delete app password
 ```
+
+### User Onboarding
+```
+POST /api/users/onboard   (alias: /api/calendar/onboard)   {"email": "...", "name": "..."}
+  Authorization: Bearer <jwt>  → AirSend apps: onboards only the token's own email
+  X-API-Key: cdk_...           → external services: onboards users of the key's email domain
+```
+Creates the account (`tenant_name` = email domain) and its default calendar. Suspended accounts are not reactivated (`403`). Keys are created once-visible and stored hashed: by an admin via `POST /api/admin/api-keys` (any owner email) or by a signed-in user via `POST /api/api-keys` (their own domain; not for public webmail domains). See [API Reference §8b](docs/API_REFERENCE.md).
 
 ### ICS Feeds (Outlook, Google, Apple subscription)
 ```

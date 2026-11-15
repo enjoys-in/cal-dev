@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/flate"
 	"compress/gzip"
+	"context"
 	"crypto/subtle"
 	"errors"
 	"io"
@@ -352,6 +353,49 @@ func APIKeyAuth(apiKey string) fiber.Handler {
 	}
 }
 
+// OnboardAuth protects the onboarding endpoints.
+//   - External services send X-API-Key (a key from caldev_api_keys); they may onboard only users
+//     of the key's email domain. Sets Locals "onboard_domain".
+//   - AirSend apps send their JWT (Bearer header or access_token cookie); they may onboard only
+//     the token's own email. The account may not exist yet, so only the token is validated.
+//     Sets Locals "onboard_email" and "onboard_name".
+func OnboardAuth(authSvc *auth.Service, s *store.Store) fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		if key := strings.TrimSpace(c.Get("X-API-Key")); key != "" {
+			k, err := s.GetActiveAPIKey(c.UserContext(), key)
+			if err != nil {
+				log.Printf("onboard: api key lookup: %v", err)
+				return c.Status(500).JSON(fiber.Map{"error": "internal error"})
+			}
+			if k == nil {
+				return c.Status(401).JSON(fiber.Map{"error": "Invalid or revoked API key"})
+			}
+			id := k.ID
+			go func() { _ = s.TouchAPIKey(context.Background(), id) }()
+			c.Locals("onboard_domain", k.Domain)
+			return c.Next()
+		}
+
+		token := ""
+		if h := c.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
+			token = strings.TrimPrefix(h, "Bearer ")
+		}
+		if token == "" {
+			token = c.Cookies("access_token")
+		}
+		if token == "" {
+			return c.Status(401).JSON(fiber.Map{"error": "X-API-Key or Bearer token required"})
+		}
+		claims, err := authSvc.ValidateToken(token)
+		if err != nil || strings.TrimSpace(claims.Email) == "" {
+			return c.Status(401).JSON(fiber.Map{"error": "Invalid token"})
+		}
+		c.Locals("onboard_email", strings.ToLower(strings.TrimSpace(claims.Email)))
+		c.Locals("onboard_name", claims.DisplayName)
+		return c.Next()
+	}
+}
+
 // AppHeaders validates the required application headers:
 //   - X-App-Version  (must match configured version)
 //   - X-App-Name     (must match configured app name)
@@ -367,7 +411,10 @@ func AppHeaders(appCfg *config.AppConfig) fiber.Handler {
 			path == "/jmap/eventsource" ||
 			path == "/api/public/rsvp" || // opened from an email by people outside the app
 			strings.HasPrefix(path, "/api/calendar/onboard") ||
-			strings.HasPrefix(path, "/api/users/onboard") {
+			strings.HasPrefix(path, "/api/users/onboard") ||
+			// Admin routes authenticate with X-API-Key = ADMIN_API_KEY; the same header name would
+			// otherwise also have to equal APP_API_KEY below.
+			strings.HasPrefix(path, "/api/admin/") {
 			return c.Next()
 		}
 

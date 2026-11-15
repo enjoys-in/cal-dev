@@ -621,7 +621,7 @@ Important details:
 | Presence | none — only calendar busy/free |
 | Invitations to people without an account | email only; the server does not track their reply unless it arrives at `/api/scheduling/incoming` |
 | `CalendarEvent/get` without ids | returns everything (no paging) |
-| Onboarding | users must already exist in the mail system. `POST /api/calendar/onboard` exists but is not yet safe to call from a browser (it trusts the email in the body); don't use it until it is secured |
+| Onboarding | `POST /api/calendar/onboard` with the user's JWT (cookie or Bearer) onboards **that** user only; a different `email` in the body gets `403`. Suspended accounts get `403` |
 
 ---
 
