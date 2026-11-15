@@ -7,27 +7,73 @@ Supports Apple Calendar, Thunderbird, Google Calendar interop, and modern JMAP c
 ## Architecture
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│                     CalDev Server (Fiber)                     │
-├─────────────────────┬────────────────────┬───────────────────┤
-│   CalDAV (RFC 4791) │  JMAP (RFC 8620)   │   App Passwords   │
-│   /dav/...          │  /jmap/...         │   /api/...        │
-├─────────────────────┴────────────────────┴───────────────────┤
-│                      Auth Middleware                          │
-│          JWT (shared secret/issuer) + Basic Auth              │
-├──────────────────────────────────────────────────────────────┤
-│  Store (PostgreSQL)      │      Jobs (Valkey Queue)          │
-│  caldev schema           │      Background Workers           │
-│  public.mail_accounts    │      Scheduling / Cleanup         │
-└──────────────────────────┴───────────────────────────────────┘
+                   ┌─────────────────────────────────────────┐
+                   │               Client Tier               │
+                   │  - Web Client (imap-web)                │
+                   │  - CalDAV Clients (Apple / Thunderbird) │
+                   │  - External ICS Subscriptions (Outlook) │
+                   └────────────────────┬────────────────────┘
+                                        │ HTTP / HTTPS (Port 8443)
+                                        ▼
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                           CalDev Server (Go / Fiber)                            │
+├───────────────────────┬─────────────────────────┬───────────────────────────────┤
+│   CalDAV Subsystem    │     JMAP Subsystem      │        REST / Sync API        │
+│   (RFC 4791 / 4918)   │   (RFC 8620 / Calendar) │  (Feeds, Availability, Share) │
+├───────────────────────┴─────────────────────────┴───────────────────────────────┤
+│                               Auth Middleware                                   │
+│            JWT (Shared Issuer/Secret)  |  App Passwords (Basic Auth)            │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                               Core Engines                                      │
+│  - Recurrence Engine: RRULE, EXDATE, RDATE & RECURRENCE-ID Overrides            │
+│  - Scheduling Engine: RFC 6638 Internal Fan-out & External iMIP                 │
+│  - Reminders Daemon: 24h Window Sweeper & Countdown Milestones (15m, 10m, 5m, 0m│
+│  - Live Realtime Engine: SSE EventSource Stream                                 │
+└───────────────┬─────────────────────────────────────────────────┬───────────────┘
+                │                                                 │
+                ▼                                                 ▼
+┌───────────────────────────────┐               ┌─────────────────────────────────┐
+│     PostgreSQL 16+ Store      │               │    Valkey / Redis (Port 6379)   │
+├───────────────────────────────┤               ├─────────────────────────────────┤
+│ caldev.caldev_calendars       │               │ Job Queue (LPUSH / BRPOP):      │
+│ caldev.caldev_events          │               │  - Delayed Countdown Reminders  │
+│ caldev.caldev_changes         │               │  - Periodic 1h Window Sweeps    │
+│ caldev.caldev_reminder_deliv. │               │  - Scheduling Email Generation  │
+│ caldev.caldev_scheduling_msgs │               ├─────────────────────────────────┤
+│ caldev.caldev_subscriptions   │               │ Pub/Sub Channels:               │
+│ public.mail_accounts (shared) │               │  - `calendar:push` (Realtime)   │
+└───────────────────────────────┘               │  - `calendar:mail` (SMTP Relay) │
+                                                └────────────────┬────────────────┘
+                                                                 │
+                                                                 ▼
+                                                ┌─────────────────────────────────┐
+                                                │   External Mail / SMTP Worker   │
+                                                │  (Processes .ics invites &      │
+                                                │   sends email to invitees)      │
+                                                └─────────────────────────────────┘
 ```
+
+## Documentation & Guides
+
+Comprehensive guides for development, architecture, and client/service integration:
+
+| Document | Purpose |
+|---|---|
+| [**Architecture Specification**](docs/ARCHITECTURE.md) | In-depth topology, database schemas, recurrence engine, reminder daemon, and attendee fan-out. |
+| [**Integration Guide**](docs/INTEGRATION_GUIDE.md) | How to integrate CalDev with web apps, external mail relays, push workers, and CalDAV clients. |
+| [**UI Integration Guide**](docs/UI_GUIDE.md) | Complete frontend manual: sign-in, JMAP calls, recurrence overrides, free/busy, and SSE stream. |
+| [**API Guide**](API_GUIDE.txt) | Detailed reference for REST, JMAP, and WebDAV routes and payloads. |
+| [**Backend Guide**](BACKEND_GUIDE.txt) | Architectural rules and conventions for Go backend development. |
 
 ## Key Features
 
 - **CalDAV** — Full RFC 4791/4918 (PROPFIND, PROPPATCH, REPORT, MKCALENDAR, PUT, DELETE, MOVE, COPY, LOCK/UNLOCK)
 - **JMAP** — RFC 8620 session + API (CalendarEvent/get, set, query, changes; Calendar/get, set)
-- **ICS** — RFC 5545 iCalendar parser & generator
-- **Scheduling** — RFC 6638 invitations/replies/cancellations via SMTP (background jobs)
+- **Recurrence & Series Engine** — Full RFC 5545 recurrence (`FREQ`, `INTERVAL`, `COUNT`, `UNTIL`, `BYDAY`, `EXDATE`, `RDATE`) with single-occurrence modifications and cancellations (`RECURRENCE-ID` overrides)
+- **Server-Side Background Reminders** — Built-in background daemon evaluating upcoming events in a strict 24-hour window $[NOW(), NOW() + 24\text{ hours}]$, scheduling countdown milestone alerts (15m, 10m, 5m, 0m) via Redis `calendar:push`
+- **Dual Sweeper & Triggering** — 1-hour periodic safety sweep ticker + instant on-demand scheduling when events are created or updated
+- **Attendee Fan-Out & Role Demarcation** — Local attendees get meetings directly in their calendar via `deliverLocal`; external attendees have `.ics` invites dispatched via Redis `calendar:mail` for SMTP delivery
+- **1 Calendar Per Email** — Enforces single-calendar-per-account architecture with onboarding ("Start Using Calendar") and customizable feature settings
 - **Multi-tenant** — Full tenant isolation; `mail_accounts.id` serves as both user ID and tenant ID
 - **Shared Users** — Reads from `public.mail_accounts` (same table as your mail system)
 - **App Passwords** — CalDAV clients use `email + app-password` for Basic Auth
@@ -36,6 +82,7 @@ Supports Apple Calendar, Thunderbird, Google Calendar interop, and modern JMAP c
 - **Sync Tokens** — Efficient delta sync for CalDAV clients
 - **ICS Feeds** — Read-only `.ics` feed endpoints for Outlook, Google Calendar, Apple subscription
 - **External Calendar Import** — Subscribe to Google Calendar, Outlook, or any ICS URL — events synced automatically
+- **One-Command Build & Deploy** — Automated `build.sh` script (builds fresh image, stops old container, runs new container with `.env`)
 
 ## Project Structure
 
@@ -44,8 +91,13 @@ cal-dev/
 ├── cmd/
 │   ├── server/main.go           # Entry point, routing, graceful shutdown
 │   └── demo/demo.go             # Standalone demo (no external deps)
+├── docs/
+│   ├── ARCHITECTURE.md          # Complete architectural specification & schemas
+│   ├── INTEGRATION_GUIDE.md     # Client and service integration manual
+│   └── UI_GUIDE.md              # Frontend UI integration guide
 ├── internal/
 │   ├── auth/auth.go             # JWT (shared issuer) + app password auth + tenant resolution
+│   ├── availability/            # Team availability & free/busy calculations
 │   ├── caldav/handler.go        # All WebDAV/CalDAV method handlers
 │   ├── config/config.go         # Environment-based configuration
 │   ├── feeds/handler.go         # ICS feed endpoints for Outlook/Google/Apple
@@ -53,20 +105,26 @@ cal-dev/
 │   ├── jmap/handler.go          # JMAP session + API handlers
 │   ├── jobs/
 │   │   ├── queue.go             # Valkey-backed job queue (LPUSH/BRPOP)
-│   │   └── worker.go            # Worker pool with retry & dead-letter
+│   │   └── worker.go            # Worker pool with 1h maintenance sweep & retry
 │   ├── middleware/middleware.go  # Security, rate limiting, CORS, auth
 │   ├── models/models.go         # Domain models
-│   ├── scheduling/scheduling.go # RFC 6638 scheduling via job queue
-│   ├── store/store.go           # PostgreSQL repository layer
-│   ├── sync/
-│   │   ├── handler.go           # REST API for external calendar subscriptions
-│   │   └── service.go           # Sync engine (fetch, parse, import ICS feeds)
+│   ├── publisher/               # Redis Pub/Sub publisher (calendar:push, calendar:mail)
+│   ├── realtime/                # SSE stream (/jmap/eventsource)
+│   ├── recurrence/              # Series expansion & RECURRENCE-ID overrides
+│   ├── scheduling/              # RFC 6638 fan-out, deliverLocal, & reminder scheduler
+│   ├── store/store.go           # PostgreSQL repository layer & reminder queries
+│   ├── sync/                    # Sync engine for external calendar feeds
 │   └── xmlutil/xmlutil.go       # WebDAV XML parsing & response generation
 ├── migrations/
-│   └── 001_init.sql             # Full CalDev schema (tables, indexes, triggers, functions)
+│   ├── 001_init.sql             # Full CalDev schema
+│   ├── 002_user_status.sql      # User status enum
+│   ├── 003_realtime_sharing.sql # Availability & calendar shares
+│   └── 004_reminders.sql         # Reminder deliveries deduplication table
+├── build.sh                     # Automated build, stop-old, run-new deployment
+├── run.sh                       # Quick run script
 ├── docker-compose.yml           # PostgreSQL + Valkey + CalDev
-├── Dockerfile                   # Multi-stage build
-└── .env.example                 # All environment variables
+├── Dockerfile                   # Multi-stage production build
+└── .env.example                 # Environment configuration template
 ```
 
 ## Prerequisites
@@ -78,7 +136,19 @@ cal-dev/
 
 ## Quick Start
 
-### 1. Docker Compose (recommended)
+### 1. Standalone Container Deployment (`build.sh`)
+
+Automated one-command deployment that builds the image first, stops the old container, and starts the new container with `.env`:
+
+```bash
+# Configure environment (copy and adjust secrets/DB host)
+cp .env.example .env
+
+# Build new image, stop old container, and run new container
+./build.sh
+```
+
+### 2. Docker Compose (Full Stack with local Valkey)
 
 ```bash
 # Set your shared JWT secret
@@ -86,10 +156,10 @@ export AUTH_JWT_SECRET="your-shared-secret"
 export AUTH_JWT_ISSUER="your-issuer"
 
 # Start everything
-docker-compose up --build
+docker-compose up --build -d
 ```
 
-### 2. Manual Setup
+### 3. Manual Setup
 
 ```bash
 # Clone and build

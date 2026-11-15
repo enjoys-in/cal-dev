@@ -8,6 +8,7 @@ IMAGE_NAME="caldev-server"
 CONTAINER_NAME="caldev-server"
 ENV_FILE=".env"
 DEFAULT_PORT="8443"
+BIND_IP="127.0.0.1" # Accessible only on localhost, never exposed publicly
 RESTART_POLICY="unless-stopped"
 
 # Ensure .env file exists
@@ -42,17 +43,17 @@ docker stop "$CONTAINER_NAME" 2>/dev/null || true
 echo "🗑️  Removing old container '$CONTAINER_NAME'..."
 docker rm "$CONTAINER_NAME" 2>/dev/null || true
 
-# 3. Run the new container using the environment file
-echo "🚀 Step 3: Running new container '$CONTAINER_NAME' on port $PORT..."
+# 3. Run the new container using the environment file (bound to localhost only)
+echo "🚀 Step 3: Running new container '$CONTAINER_NAME' on $BIND_IP:$PORT (localhost only)..."
 docker run -d \
     --name "$CONTAINER_NAME" \
     --env-file "$ENV_FILE" \
     --restart "$RESTART_POLICY" \
     --add-host=host.docker.internal:host-gateway \
-    -p "$PORT:$PORT" \
+    -p "$BIND_IP:$PORT:$PORT" \
     "$IMAGE_NAME"
 
 echo "=========================================="
-echo "✅ $CONTAINER_NAME is up and running!"
+echo "✅ $CONTAINER_NAME is up and running on $BIND_IP:$PORT (localhost only)!"
 echo "=========================================="
 docker ps --filter "name=$CONTAINER_NAME"
