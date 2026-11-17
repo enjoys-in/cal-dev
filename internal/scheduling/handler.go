@@ -194,9 +194,12 @@ func (h *Handler) RSVPRespond(c *fiber.Ctx) error {
 
 // PublicWebRSVP handles RSVP links clicked by external email recipients.
 //
-//	GET  /api/public/rsvp?token=...[&action=...]  only renders a page (email link scanners
-//	                                              follow GET links, so GET must never change state)
-//	POST /api/public/rsvp  (form: token, action)  records the response
+//	GET  /api/public/rsvp?token=...&action=...  records the response in one click
+//	GET  /api/public/rsvp?token=...             renders a page with Accept/Tentative/Decline
+//	POST /api/public/rsvp  (form: token, action)  records the response (used by that page)
+//
+// A GET with an action changes state, so an email link scanner that opens the link records
+// that response; a later click by the guest overwrites it.
 func (h *Handler) PublicWebRSVP(c *fiber.Ctx) error {
 	token := c.Query("token")
 	if token == "" {
@@ -227,14 +230,10 @@ func (h *Handler) PublicWebRSVP(c *fiber.Ctx) error {
 		action = ""
 	}
 
-	// GET (or no valid action): render a page whose buttons POST the response back.
-	if c.Method() != fiber.MethodPost || action == "" {
+	// No valid action: render a page whose buttons POST the chosen response back.
+	if action == "" {
 		heading := "Respond to Invitation"
 		buttons := rsvpButton(token, "ACCEPTED") + rsvpButton(token, "TENTATIVE") + rsvpButton(token, "DECLINED")
-		if action != "" {
-			heading = "Confirm your response"
-			buttons = rsvpButton(token, action)
-		}
 		page := fmt.Sprintf(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Calendar RSVP</title>
 <style>
 body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f8fafc; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; }
@@ -253,7 +252,7 @@ form { display: inline; }
 		return c.SendString(page)
 	}
 
-	// POST: record the response once. SendReplyToOrganizer updates the organizer's copy and other
+	// Record the response. SendReplyToOrganizer updates the organizer's copy and other
 	// local attendees when the organizer is local, otherwise it queues a REPLY email.
 	err = h.svc.SendReplyToOrganizer(c.UserContext(), payload.TenantID, payload.EventUID, payload.AttendeeEmail, action)
 	if err != nil && strings.HasPrefix(err.Error(), "event not found") {

@@ -323,7 +323,7 @@ func main() {
 	schedGroup.Post("/rsvp", schedulingHandler.RSVPRespond)
 
 	// Public web RSVP for email recipients (no login). It lives outside /api/scheduling because
-	// that group's auth middleware runs for every path under it. GET shows a page, POST records.
+	// that group's auth middleware runs for every path under it. GET with an action records it.
 	app.Get("/api/public/rsvp", rsvpPageHeaders, schedulingHandler.PublicWebRSVP)
 	app.Post("/api/public/rsvp", rsvpPageHeaders, schedulingHandler.PublicWebRSVP)
 
