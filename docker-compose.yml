@@ -42,6 +42,10 @@ services:
     # (the image does not contain .env; compose injects it)
     env_file:
       - .env
+    # Lets .env point DB_HOST (etc.) at host.docker.internal on Linux, where Docker
+    # does not define that name by default (Docker Desktop already does).
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     # Only what must differ inside the container network. These win over .env.
     environment:
       SERVER_HOST: "0.0.0.0"
