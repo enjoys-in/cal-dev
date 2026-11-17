@@ -973,9 +973,11 @@ func (h *Handler) Unlock(c *fiber.Ctx) error {
 // DAVx5) probe it before they have credentials, so it must not require authentication, and
 // it cannot know the user — it redirects to the DAV context path. The client then sends its
 // PROPFIND there, gets the Basic challenge, and reads current-user-principal (see propfindRoot).
+// 307, not 301: clients cache a permanent redirect indefinitely, and 307 also keeps the
+// request method (a PROPFIND probe is re-sent to /dav/ as a PROPFIND).
 func (h *Handler) WellKnown(c *fiber.Ctx) error {
 	c.Set("Location", "/dav/")
-	return c.SendStatus(fiber.StatusMovedPermanently)
+	return c.SendStatus(fiber.StatusTemporaryRedirect)
 }
 
 // ============================================================

@@ -634,8 +634,8 @@ All JSON field names match these models exactly.
 | Method | Path | Auth | Description |
 |---|---|---|---|
 | `GET` | `/health` | None | Health check |
-| `ALL` | `/.well-known/caldav` | None (public) | CalDAV discovery (RFC 6764): `301` → `/dav/` |
-| `GET` | `/.well-known/jmap` | None (public) | JMAP autodiscovery (RFC 8620 §2.2): `301` → `/jmap/session` |
+| `ALL` | `/.well-known/caldav` | None (public) | CalDAV discovery (RFC 6764): `307` → `/dav/` |
+| `GET` | `/.well-known/jmap` | None (public) | JMAP autodiscovery (RFC 8620 §2.2): `307` → `/jmap/session` |
 | `PROPFIND` | `/dav/` | Basic/JWT | DAV context root: returns `current-user-principal` |
 | `*` | `/dav/{tenant}/{user}/...` | Basic/JWT | CalDAV (WebDAV methods) |
 | `GET` | `/jmap/session` | JWT | JMAP session resource |

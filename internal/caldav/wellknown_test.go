@@ -22,8 +22,8 @@ func TestWellKnownIsPublicRedirectToDAVRoot(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s: %v", method, err)
 		}
-		if resp.StatusCode != 301 {
-			t.Errorf("%s: status = %d, want 301", method, resp.StatusCode)
+		if resp.StatusCode != 307 {
+			t.Errorf("%s: status = %d, want 307", method, resp.StatusCode)
 		}
 		if loc := resp.Header.Get("Location"); loc != "/dav/" {
 			t.Errorf("%s: Location = %q, want /dav/", method, loc)

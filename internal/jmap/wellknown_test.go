@@ -18,8 +18,8 @@ func TestWellKnownIsPublicRedirectToSession(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp.StatusCode != 301 {
-		t.Errorf("status = %d, want 301", resp.StatusCode)
+	if resp.StatusCode != 307 {
+		t.Errorf("status = %d, want 307", resp.StatusCode)
 	}
 	if loc := resp.Header.Get("Location"); loc != "/jmap/session" {
 		t.Errorf("Location = %q, want /jmap/session", loc)
