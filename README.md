@@ -76,7 +76,7 @@ Comprehensive guides for development, architecture, and client/service integrati
 - **Attendee Fan-Out & Role Demarcation** — Local attendees get meetings directly in their calendar via `deliverLocal`; external attendees have `.ics` invites dispatched via Redis `calendar:mail` for SMTP delivery
 - **1 Calendar Per Email** — Enforces single-calendar-per-account architecture with onboarding ("Start Using Calendar") and customizable feature settings
 - **Multi-tenant** — Full tenant isolation; `mail_accounts.id` serves as both user ID and tenant ID
-- **Shared Users** — Reads from `public.mail_accounts` (same table as your mail system)
+- **Own accounts** — `caldev.mail_accounts`: Airsend mailboxes are copied in (same id and email) on first use while the calendar is enabled; external accounts exist only there. `public.mail_accounts` is read, never written
 - **App Passwords** — CalDAV clients use `email + app-password` for Basic Auth
 - **JWT** — Shared secret & issuer with your other services
 - **Background Jobs** — Valkey-backed queue with retry, dead-letter, delayed scheduling
@@ -127,7 +127,7 @@ cal-dev/
 │   ├── 007_onboarding_api_keys.sql  # Onboarding API keys (hashed, domain-scoped)
 │   └── 008_mail_accounts_email_lower.sql # Index for case-insensitive account lookups
 ├── schema/
-│   └── full_init.sql            # The whole schema (migrations 001-008) in one file, for new databases
+│   └── full_init.sql            # The whole schema (migrations 001-010) in one file, for new databases
 ├── build.sh                     # Automated build, stop-old, run-new deployment
 ├── run.sh                       # Quick run script
 ├── docker-compose.yml           # PostgreSQL + Valkey + CalDev
@@ -140,7 +140,7 @@ cal-dev/
 - Go 1.24+
 - PostgreSQL 16+
 - Valkey 8+ (or Redis 7+ — wire-compatible)
-- Your existing `public.mail_accounts` table with columns: `id (INTEGER PK)`, `email`, `name`
+- Optional: the mail system's `public.mail_accounts` (+ `public.account_settings`) — internal accounts are copied from it
 
 ## Quick Start
 
@@ -191,7 +191,7 @@ cp .env.example .env
 psql -U caldev -d caldev -v ON_ERROR_STOP=1 -f schema/full_init.sql
 ```
 
-`schema/full_init.sql` is checked against the migrations (the schema it creates is identical to running 001–008 in order) and is safe to run again. When you add a migration, update it too and add the new filename to its `caldev_migrations` list. It also fixes one gap for standalone setups: it creates `mail_accounts` with the `password` column that onboarding writes (the table migration 001 creates lacks it; your real mail system's table has it).
+`schema/full_init.sql` creates everything in the `caldev` schema (the result of running 001–010 in order) and is safe to run again. When you add a migration, update it too and add the new filename to its `caldev_migrations` list.
 
 ### 3. Demo Mode (no external dependencies)
 
@@ -209,7 +209,7 @@ All configuration via environment variables. See `.env.example` for the full lis
 |---|---|---|
 | `SERVER_PORT` | `8443` | HTTP listen port |
 | `DB_HOST` | `localhost` | PostgreSQL host |
-| `DB_SCHEMA` | — | Read but **not applied**: tables live in `public` (switching `search_path` could silently point the app at other tables) |
+| `DB_SCHEMA` | `caldev` | CalDev's own schema, first on `search_path` (then `public`). On start, CalDev objects an older version left in `public` are moved into it (`ALTER … SET SCHEMA`: data kept, nothing dropped) |
 | `CALDEV_PUBLIC_URL` | `http://localhost:PORT` | **Set in production.** Public base URL used for RSVP links in emails and the JMAP session URLs. While unset (or localhost) the server treats itself as dev and allows CORS from any localhost port |
 | `CALDEV_SMTP_ENCRYPTION_KEY` | — | Key for encrypting BYO SMTP passwords. When unset, a key derived from `AUTH_JWT_SECRET` is used (rotating that secret then makes saved SMTP passwords unreadable). Passwords saved before the key was set still decrypt |
 | `CORS_ALLOWED_ORIGINS` | — | Extra allowed browser origins, comma-separated |
@@ -456,14 +456,16 @@ Delivery is **at-least-once**: taking a job moves it into a `<prefix>:processing
 
 ## Database Schema
 
-All CalDev tables live in the `public` schema with a `caldev_` prefix and reference `mail_accounts` by integer id (no foreign key is enforced, so the mail system can own that table). Migrations in `migrations/` run automatically at startup, in order.
+Everything CalDev owns lives in its own schema (`DB_SCHEMA`, default `caldev`); `public` holds no CalDev object. Tables reference `caldev.mail_accounts` by integer id. Migrations in `migrations/` run automatically at startup, in order. The mail system's `public.mail_accounts` / `public.account_settings` are only read.
 
 ```
-mail_accounts (YOUR TABLE — created only for standalone/test setups)
-  ├── id (INTEGER PK)     ← serves as both user ID and tenant ID
-  ├── email (unique)
+caldev.mail_accounts (CalDev's own accounts)
+  ├── id (INTEGER PK)     ← user ID and tenant ID. internal: the Airsend id; external: from 1,000,000,000
+  ├── email (unique)      ← the key that links an internal account to public.mail_accounts
   ├── name, tenant_name   ← tenant_name groups users into an organisation (AVAILABILITY_ORG_VISIBLE)
-  └── status              ← must be ACTIVE to sign in
+  ├── account_origin      ← internal (Airsend mailbox) | external (onboarding API)
+  └── status              ← CalDev's own ACTIVE | INACTIVE | SUSPENDED; must be ACTIVE to sign in.
+                            internal accounts also need their Airsend mailbox ACTIVE and the calendar enabled
 
 caldev_app_passwords          CalDAV Basic-auth passwords
 caldev_calendars              calendars (owner = user_id)

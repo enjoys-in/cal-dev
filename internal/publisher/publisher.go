@@ -63,6 +63,12 @@ type MailEvent struct {
 	// The raw ICS attachment (text/calendar) for the email
 	RawICS string `json:"raw_ics"`
 
+	// One-click web RSVP links for this recipient (REQUEST only). They open CalDev's
+	// public /api/public/rsvp page; the token inside is signed and tied to this guest.
+	RSVPAcceptURL    string `json:"rsvp_accept_url,omitempty"`
+	RSVPTentativeURL string `json:"rsvp_tentative_url,omitempty"`
+	RSVPDeclineURL   string `json:"rsvp_decline_url,omitempty"`
+
 	// Tracking
 	MessageID string `json:"message_id"` // links to caldev_scheduling_messages.id
 	Timestamp string `json:"timestamp"`  // ISO 8601
@@ -97,8 +103,14 @@ func (p *Publisher) PublishMailEvent(ctx context.Context, evt *MailEvent) error 
 		return fmt.Errorf("publisher: marshal mail event: %w", err)
 	}
 
-	if err := p.client.Publish(ctx, ChannelCalendarMail, data).Err(); err != nil {
+	receivers, err := p.client.Publish(ctx, ChannelCalendarMail, data).Result()
+	if err != nil {
 		return fmt.Errorf("publisher: publish to %s: %w", ChannelCalendarMail, err)
+	}
+	if receivers == 0 {
+		// Pub/Sub does not buffer: with no mail service listening the email would be lost.
+		// Returning an error keeps the message pending so the job is retried.
+		return fmt.Errorf("publisher: no subscriber on %s, email not delivered", ChannelCalendarMail)
 	}
 
 	log.Printf("publisher: published %s event for %s → %s (msg=%s)",

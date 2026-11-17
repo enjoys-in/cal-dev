@@ -52,6 +52,7 @@ type Queue struct {
 	prefix     string
 	maxRetry   int
 	retryDelay time.Duration
+	schedules  map[string][]time.Duration // per job type waits between retries (see retry.go)
 }
 
 // NewQueue creates a new Valkey job queue.
@@ -76,6 +77,9 @@ func NewQueue(redisCfg *config.RedisConfig, workerCfg *config.WorkerConfig) (*Qu
 		prefix:     workerCfg.QueuePrefix,
 		maxRetry:   workerCfg.RetryMax,
 		retryDelay: workerCfg.RetryDelay,
+		schedules: map[string][]time.Duration{
+			JobSendSchedulingEmail: SchedulingEmailRetrySchedule,
+		},
 	}, nil
 }
 
@@ -117,7 +121,7 @@ func (q *Queue) Enqueue(ctx context.Context, jobType string, payload interface{}
 		Type:     jobType,
 		Payload:  json.RawMessage(payloadBytes),
 		Retries:  0,
-		MaxRetry: q.maxRetry,
+		MaxRetry: q.maxRetryFor(jobType),
 		Created:  time.Now().UTC(),
 	}
 
@@ -157,7 +161,7 @@ func (q *Queue) enqueueDelayed(ctx context.Context, id string, created time.Time
 		Type:     jobType,
 		Payload:  json.RawMessage(payloadBytes),
 		Retries:  0,
-		MaxRetry: q.maxRetry,
+		MaxRetry: q.maxRetryFor(jobType),
 		Created:  created,
 	}
 
@@ -264,6 +268,12 @@ func (q *Queue) Ack(ctx context.Context, job *Job) error {
 // Retry re-enqueues a failed job with incremented retry count.
 // If max retries exceeded, sends to dead-letter queue.
 func (q *Queue) Retry(ctx context.Context, job *Job) error {
+	return q.RetryAfter(ctx, job, 0)
+}
+
+// RetryAfter is Retry with a minimum wait (e.g. the receiver's Retry-After). The wait is the
+// longer of minWait and the job type's schedule (or WORKER_RETRY_DELAY × attempt).
+func (q *Queue) RetryAfter(ctx context.Context, job *Job, minWait time.Duration) error {
 	job.Retries++
 
 	if job.Retries > job.MaxRetry {
@@ -277,7 +287,11 @@ func (q *Queue) Retry(ctx context.Context, job *Job) error {
 
 	// Re-enqueue with delay using sorted set
 	scheduledKey := fmt.Sprintf("%s:scheduled", q.prefix)
-	score := float64(time.Now().Add(q.retryDelay * time.Duration(job.Retries)).Unix())
+	wait := q.retryDelayFor(job)
+	if minWait > wait {
+		wait = minWait
+	}
+	score := float64(time.Now().Add(wait).Unix())
 
 	return q.client.ZAdd(ctx, scheduledKey, redis.Z{
 		Score:  score,

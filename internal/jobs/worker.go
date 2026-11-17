@@ -179,7 +179,7 @@ func (w *Worker) handleJob(ctx context.Context, workerID int, job *Job) {
 		result.ErrorMessage = err.Error()
 
 		// Retry if possible. If even that fails the job is not acked, so the reaper re-queues it.
-		if retryErr := w.queue.Retry(bctx, job); retryErr != nil {
+		if retryErr := w.queue.RetryAfter(bctx, job, retryHint(err)); retryErr != nil {
 			log.Printf("worker[%d]: retry enqueue failed: %v", workerID, retryErr)
 			result.Status = "dead"
 		} else {

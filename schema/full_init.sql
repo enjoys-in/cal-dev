@@ -1,24 +1,26 @@
 -- ============================================================
 -- CalDev: complete database schema in one file
 --
--- This is the end result of migrations 001 .. 008 (it does NOT replace them: the server still
+-- This is the end result of migrations 001 .. 010 (it does NOT replace them: the server still
 -- applies migrations/ on startup). Use it to set up a brand-new database in one step:
 --
 --     psql -U caldev -d caldev -v ON_ERROR_STOP=1 -f schema/full_init.sql
 --
--- At the end it records 001..008 in caldev_migrations, so a server started afterwards sees them
+-- Everything is created in the `caldev` schema (the server's default DB_SCHEMA). If you use another
+-- DB_SCHEMA, replace "caldev" in the two lines after the extensions.
+--
+-- At the end it records 001..010 in caldev_migrations, so a server started afterwards sees them
 -- as applied and only runs migrations added later. Safe to run again (every statement is
 -- idempotent).
 --
--- Keep it current: when you add migrations/009_*.sql, update the schema above AND add its
+-- Keep it current: when you add migrations/011_*.sql, update the schema above AND add its
 -- filename to the caldev_migrations list at the bottom. Dropped on purpose, because migration 006
 -- left it unused: the caldev_update_jmap_state() function and the three trg_caldev_events_
 -- jmap_state_* triggers.
 --
 -- Differences from running the migrations on an empty database:
---   * mail_accounts has a `password` column (the migrations' standalone table lacks it, which
---     makes onboarding fail: EnsureUserByEmail inserts into it). Your real mail system's table
---     already has it; this only matters when CalDev runs without the mail system.
+--   * caldev.mail_accounts is created directly in its final shape (migration 001 makes a smaller
+--     one that 010 then completes).
 --   * the lower(email) index is created normally, not CONCURRENTLY (the table is new and empty,
 --     and CONCURRENTLY cannot run inside the single transaction this file may be sent in).
 -- ============================================================
@@ -26,23 +28,31 @@
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 
+CREATE SCHEMA IF NOT EXISTS caldev;
+SET search_path = caldev, public;
+
 -- ============================================================
--- Shared mail accounts. In production this table belongs to the mail system and already exists;
--- it is created here only for standalone / test setups.
--- tenant_id == user_id == mail_accounts.id everywhere in CalDev. tenant_name groups users into an
--- organisation (set to the email domain when a user is onboarded).
+-- CalDev's own accounts (caldev.mail_accounts — the mail system's public.mail_accounts is never
+-- written). tenant_id == user_id == mail_accounts.id everywhere in CalDev.
+--   internal: copy of an Airsend mailbox, same id and email (added on first use, calendar enabled)
+--   external: created by the onboarding API, ids from 1,000,000,000 so they never meet Airsend ids
+--   status:   CalDev's own ACTIVE | INACTIVE | SUSPENDED
 -- ============================================================
+CREATE SEQUENCE IF NOT EXISTS caldev_external_account_id_seq START 1000000000;
 CREATE TABLE IF NOT EXISTS mail_accounts (
-    id SERIAL PRIMARY KEY,
+    id INTEGER PRIMARY KEY DEFAULT nextval('caldev_external_account_id_seq'),
     name VARCHAR(255) NOT NULL DEFAULT '',
     email VARCHAR(255) NOT NULL UNIQUE,
     tenant_name VARCHAR(255) NOT NULL DEFAULT '',
-    status VARCHAR(50) NOT NULL DEFAULT 'ACTIVE',
+    status VARCHAR(50) NOT NULL DEFAULT 'ACTIVE'
+        CONSTRAINT chk_caldev_mail_accounts_status CHECK (status IN ('ACTIVE', 'INACTIVE', 'SUSPENDED')),
     type VARCHAR(50) NOT NULL DEFAULT 'USER',
+    account_origin VARCHAR(16) NOT NULL DEFAULT 'external'
+        CONSTRAINT chk_caldev_mail_accounts_origin CHECK (account_origin IN ('internal', 'external')),
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    password VARCHAR(255) NOT NULL DEFAULT ''
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+CREATE UNIQUE INDEX IF NOT EXISTS idx_caldev_mail_accounts_email_lower ON mail_accounts (lower(email));
 
 -- Case-insensitive account lookups (GetUserByEmail's lower(email) fallback)
 CREATE INDEX IF NOT EXISTS idx_mail_accounts_email_lower ON mail_accounts (lower(email));
@@ -600,5 +610,6 @@ INSERT INTO caldev_migrations (filename) VALUES
     ('migrations/005_calendar_byo_smtp.sql'),
     ('migrations/006_change_log_fixes.sql'),
     ('migrations/007_onboarding_api_keys.sql'),
-    ('migrations/008_mail_accounts_email_lower.sql')
+    ('migrations/008_mail_accounts_email_lower.sql'),
+    ('migrations/010_caldev_mail_accounts.sql')
 ON CONFLICT (filename) DO NOTHING;

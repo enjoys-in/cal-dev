@@ -425,6 +425,13 @@ func (s *Service) AuthenticateBasic(ctx context.Context, email, password string)
 		s.loginFailed(failKey, time.Now())
 		return 0, 0, fmt.Errorf("auth: account is %s", user.Status)
 	}
+	if reason, err := s.internalBlocked(ctx, user); err != nil {
+		return 0, 0, fmt.Errorf("auth: %w", err)
+	} else if reason != "" {
+		_ = bcrypt.CompareHashAndPassword(dummyHash(), []byte(password))
+		s.loginFailed(failKey, time.Now())
+		return 0, 0, fmt.Errorf("auth: %w (%s)", ErrAccountInactive, reason)
+	}
 
 	// Check app passwords for this user
 	appPasswords, err := s.store.GetAppPasswordsByUser(ctx, user.ID)
@@ -448,6 +455,20 @@ func (s *Service) AuthenticateBasic(ctx context.Context, email, password string)
 }
 
 // ResolvedAuth holds the resolved user identity with integer IDs.
+// internalBlocked returns why an internal (Airsend) account may not use CalDev right now — its
+// mailbox is gone or not active, or its calendar is turned off in Airsend — or "" when it may.
+// External accounts depend only on CalDev's own status.
+func (s *Service) internalBlocked(ctx context.Context, user *models.User) (string, error) {
+	if user.AccountOrigin != store.AccountOriginInternal {
+		return "", nil
+	}
+	ok, reason, err := s.store.InternalAccountAllowed(ctx, user.ID)
+	if err != nil || ok {
+		return "", err
+	}
+	return reason, nil
+}
+
 type ResolvedAuth struct {
 	UserID   int
 	TenantID int
@@ -490,6 +511,11 @@ func (s *Service) ResolveUserFromToken(ctx context.Context, claims *Claims) (*Re
 	}
 	if strings.ToUpper(user.Status) != "ACTIVE" {
 		return nil, fmt.Errorf("auth: %w (status %s)", ErrAccountInactive, user.Status)
+	}
+	if reason, err := s.internalBlocked(ctx, user); err != nil {
+		return nil, fmt.Errorf("auth: %w", err)
+	} else if reason != "" {
+		return nil, fmt.Errorf("auth: %w (%s)", ErrAccountInactive, reason)
 	}
 
 	// Always use canonical values from mail_accounts

@@ -5,17 +5,19 @@ import (
 	"time"
 )
 
-// User represents a user from mail_accounts (shared with mail system).
-// This table is NOT managed by caldev — it reads from mail_accounts.
+// User is an account in CalDev's own table (<schema>.mail_accounts). An internal account is a
+// copy of the mail system's public.mail_accounts row (same id and email); an external one was
+// created by CalDev's onboarding API and exists only in CalDev.
 type User struct {
-	ID         int       `json:"id" db:"id"`
-	Email      string    `json:"email" db:"email"`
-	Name       string    `json:"name" db:"name"`
-	TenantName string    `json:"tenant_name" db:"tenant_name"`
-	Status     string    `json:"status" db:"status"`
-	Type       string    `json:"type" db:"type"`
-	CreatedAt  time.Time `json:"created_at" db:"created_at"`
-	UpdatedAt  time.Time `json:"updated_at" db:"updated_at"`
+	ID            int       `json:"id" db:"id"`
+	Email         string    `json:"email" db:"email"`
+	Name          string    `json:"name" db:"name"`
+	TenantName    string    `json:"tenant_name" db:"tenant_name"`
+	Status        string    `json:"status" db:"status"` // ACTIVE | INACTIVE | SUSPENDED (CalDev's own)
+	Type          string    `json:"type" db:"type"`
+	AccountOrigin string    `json:"account_origin" db:"account_origin"` // internal | external
+	CreatedAt     time.Time `json:"created_at" db:"created_at"`
+	UpdatedAt     time.Time `json:"updated_at" db:"updated_at"`
 }
 
 // APIKey lets an external service onboard users of one email domain (caldev_api_keys).

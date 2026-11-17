@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/enjoys-in/cal-dev/internal/airsend"
 	"github.com/enjoys-in/cal-dev/internal/crypto"
 	"github.com/enjoys-in/cal-dev/internal/ics"
 	"github.com/enjoys-in/cal-dev/internal/jobs"
@@ -27,6 +28,7 @@ type Service struct {
 	store         *store.Store
 	queue         *jobs.Queue
 	publisher     *publisher.Publisher
+	airsend       *airsend.Client // internal accounts' calendar mail via airsend-api (nil = off)
 	jwtSecret     string
 	publicBaseURL string
 }
@@ -185,6 +187,17 @@ func (svc *Service) SendInvitation(ctx context.Context, msg *models.SchedulingMe
 		}
 	}
 
+	// A REPLY is sent by the attendee who answered, not by the organizer.
+	if msg.Method == "REPLY" && msg.SenderID > 0 {
+		if u, err := svc.store.GetUserByID(ctx, msg.SenderID); err == nil && u != nil && u.Email != "" {
+			mailEvt.SenderEmail = u.Email
+		}
+	}
+
+	if msg.Method == "REQUEST" {
+		mailEvt.RSVPAcceptURL, mailEvt.RSVPTentativeURL, mailEvt.RSVPDeclineURL = svc.rsvpLinks(msg, event)
+	}
+
 	return svc.publisher.PublishMailEvent(ctx, mailEvt)
 }
 
@@ -333,6 +346,37 @@ func generateReplyICS(event *models.Event, attendeeEmail, partstat string) strin
 	return b.String()
 }
 
+// rsvpLinks returns the Accept / Tentative / Decline links of CalDev's public RSVP page
+// for msg's recipient. The token is valid for at least 30 days, and until a day after
+// the event ends.
+func (svc *Service) rsvpLinks(msg *models.SchedulingMessage, event *models.Event) (accept, tentative, decline string) {
+	baseURL := svc.publicBaseURL
+	if baseURL == "" {
+		baseURL = "http://localhost:8443"
+	}
+	if strings.Contains(baseURL, "localhost") {
+		warnLocalhostOnce.Do(func() {
+			log.Printf("scheduling: WARNING: public URL %q contains localhost; RSVP links in emails will not work for recipients", baseURL)
+		})
+	}
+
+	ttl := 30 * 24 * time.Hour
+	if event != nil {
+		end := event.DTStart
+		if event.DTEnd != nil {
+			end = *event.DTEnd
+		}
+		if d := time.Until(end.Add(24 * time.Hour)); d > ttl {
+			ttl = d
+		}
+	}
+	token := url.QueryEscape(GenerateRSVPToken(msg.TenantID, msg.EventUID, msg.RecipientEmail, svc.jwtSecret, ttl))
+	link := func(action string) string {
+		return fmt.Sprintf("%s/api/public/rsvp?token=%s&action=%s", baseURL, token, action)
+	}
+	return link("ACCEPTED"), link("TENTATIVE"), link("DECLINED")
+}
+
 // HandleSendEmailJob is the worker handler for send_scheduling_email jobs.
 // It prioritizes calendar BYO SMTP when configured, falling back to Redis Pub/Sub for managed mode.
 func (svc *Service) HandleSendEmailJob(ctx context.Context, job *jobs.Job) error {
@@ -374,7 +418,24 @@ func (svc *Service) HandleSendEmailJob(ctx context.Context, job *jobs.Job) error
 		}
 	}
 
-	// 2. Fallback to managed mail server via Redis Pub/Sub if configured
+	// 2. Internal Airsend account → airsend-api internal route (signed HTTP, retried on
+	//    5m/10m/15m/25m/1h). External accounts (CalDev-only) have no Airsend mailbox to send from.
+	if svc.airsend != nil {
+		internal, err := svc.isInternalSender(ctx, msg)
+		if err != nil {
+			svc.recordSendFailure(ctx, job, msg, err)
+			return err
+		}
+		if internal {
+			return svc.sendViaAirsend(ctx, job, msg, event)
+		}
+		errMsg := "Not an Airsend mailbox (account_origin external/unknown) and no active calendar SMTP: configure the calendar's SMTP to send invitations"
+		svc.store.UpdateSchedulingMessageStatus(ctx, msg.ID, "unconfigured_smtp", errMsg)
+		log.Printf("scheduling: skipping delivery for %s: %s", msg.RecipientEmail, errMsg)
+		return nil
+	}
+
+	// 3. Legacy: managed mail server via Redis Pub/Sub (only when AIRSEND_INTERNAL_URL is not set)
 	if svc.publisher != nil {
 		if err := svc.SendInvitation(ctx, msg, event); err != nil {
 			svc.recordSendFailure(ctx, job, msg, err)
@@ -385,7 +446,7 @@ func (svc *Service) HandleSendEmailJob(ctx context.Context, job *jobs.Job) error
 		return nil
 	}
 
-	// 3. Neither BYO SMTP nor managed mail service is configured
+	// 4. Neither BYO SMTP nor managed mail service is configured
 	errMsg := "Calendar has no SMTP configured and managed fallback is disabled"
 	svc.store.UpdateSchedulingMessageStatus(ctx, msg.ID, "unconfigured_smtp", errMsg)
 	log.Printf("scheduling: skipping delivery for %s: %s", msg.RecipientEmail, errMsg)
@@ -412,15 +473,6 @@ func (svc *Service) sendViaBYOSMTP(ctx context.Context, msg *models.SchedulingMe
 		return fmt.Errorf("decrypt smtp password: %w", err)
 	}
 
-	baseURL := svc.publicBaseURL
-	if baseURL == "" {
-		baseURL = "http://localhost:8443"
-	}
-	if strings.Contains(baseURL, "localhost") {
-		warnLocalhostOnce.Do(func() {
-			log.Printf("scheduling: WARNING: public URL %q contains localhost; RSVP links in emails will not work for recipients", baseURL)
-		})
-	}
 
 	startFmt := ""
 	endFmt := ""
@@ -483,21 +535,7 @@ func (svc *Service) sendViaBYOSMTP(ctx context.Context, msg *models.SchedulingMe
 
 	// RSVP links only make sense on invitations (not on cancellations or replies).
 	if msg.Method == "REQUEST" {
-		// Valid for at least 30 days, and until a day after the event ends.
-		ttl := 30 * 24 * time.Hour
-		if event != nil {
-			end := event.DTStart
-			if event.DTEnd != nil {
-				end = *event.DTEnd
-			}
-			if d := time.Until(end.Add(24 * time.Hour)); d > ttl {
-				ttl = d
-			}
-		}
-		rsvpToken := url.QueryEscape(GenerateRSVPToken(msg.TenantID, msg.EventUID, msg.RecipientEmail, svc.jwtSecret, ttl))
-		invData.RSVPAcceptURL = fmt.Sprintf("%s/api/public/rsvp?token=%s&action=ACCEPTED", baseURL, rsvpToken)
-		invData.RSVPTentURL = fmt.Sprintf("%s/api/public/rsvp?token=%s&action=TENTATIVE", baseURL, rsvpToken)
-		invData.RSVPDeclURL = fmt.Sprintf("%s/api/public/rsvp?token=%s&action=DECLINED", baseURL, rsvpToken)
+		invData.RSVPAcceptURL, invData.RSVPTentURL, invData.RSVPDeclURL = svc.rsvpLinks(msg, event)
 	}
 
 	mimeBytes, err := smtp.BuildInvitationMIME(invData)

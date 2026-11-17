@@ -80,117 +80,11 @@ func (s *Store) RecordMigration(filename string) error {
 }
 
 // ============================================================
-// User Operations (reads from mail_accounts — NOT managed by caldev)
+// User Operations — see accounts.go (CalDev's own <schema>.mail_accounts)
 // ============================================================
 
-func (s *Store) GetUserByEmail(ctx context.Context, email string) (*models.User, error) {
-	// Emails are stored lower-case in practice, so the normalized address usually matches on the
-	// unique email index in one query.
-	email = strings.ToLower(strings.TrimSpace(email))
-	u := &models.User{}
-	query := `SELECT id, COALESCE(name, '') as name, email, COALESCE(tenant_name, '') as tenant_name,
-		COALESCE(status, 'ACTIVE') as status, COALESCE(type, 'USER') as type, created_at, updated_at
-		FROM mail_accounts WHERE email = $1`
-	err := s.db.QueryRowContext(ctx, query, email).
-		Scan(&u.ID, &u.Name, &u.Email, &u.TenantName, &u.Status, &u.Type, &u.CreatedAt, &u.UpdatedAt)
-	if err == sql.ErrNoRows {
-		// A row stored with capitals: retry ignoring case (uses idx_mail_accounts_email_lower, migration 008).
-		ciQuery := strings.Replace(query, "WHERE email = $1", "WHERE lower(email) = $1", 1) + " ORDER BY id LIMIT 1"
-		err = s.db.QueryRowContext(ctx, ciQuery, email).
-			Scan(&u.ID, &u.Name, &u.Email, &u.TenantName, &u.Status, &u.Type, &u.CreatedAt, &u.UpdatedAt)
-		if err == sql.ErrNoRows {
-			return nil, nil
-		}
-	}
-	return u, err
-}
-
-// GetUsersByEmails is GetUserByEmail for many addresses in at most two queries: exact matches
-// first (index-friendly), then the misses ignoring case, lowest id winning. The map is keyed by
-// the lower-cased, trimmed address; addresses without an account are absent.
-func (s *Store) GetUsersByEmails(ctx context.Context, emails []string) (map[string]*models.User, error) {
-	out := make(map[string]*models.User, len(emails))
-	if len(emails) == 0 {
-		return out, nil
-	}
-	const query = `SELECT id, COALESCE(name, '') as name, email, COALESCE(tenant_name, '') as tenant_name,
-		COALESCE(status, 'ACTIVE') as status, COALESCE(type, 'USER') as type, created_at, updated_at
-		FROM mail_accounts WHERE `
-	collect := func(where string, list []string) error {
-		rows, err := s.db.QueryContext(ctx, query+where+" ORDER BY id", pq.Array(list))
-		if err != nil {
-			return err
-		}
-		defer rows.Close()
-		for rows.Next() {
-			u := &models.User{}
-			if err := rows.Scan(&u.ID, &u.Name, &u.Email, &u.TenantName, &u.Status, &u.Type, &u.CreatedAt, &u.UpdatedAt); err != nil {
-				return err
-			}
-			if k := strings.ToLower(strings.TrimSpace(u.Email)); out[k] == nil {
-				out[k] = u
-			}
-		}
-		return rows.Err()
-	}
-
-	if err := collect("email = ANY($1)", emails); err != nil {
-		return nil, err
-	}
-	var missing []string
-	for _, e := range emails {
-		if k := strings.ToLower(strings.TrimSpace(e)); k != "" && out[k] == nil {
-			missing = append(missing, k)
-		}
-	}
-	if len(missing) > 0 {
-		if err := collect("lower(email) = ANY($1)", missing); err != nil {
-			return nil, err
-		}
-	}
-	return out, nil
-}
-
-func (s *Store) GetUserByID(ctx context.Context, id int) (*models.User, error) {
-	u := &models.User{}
-	query := `SELECT id, COALESCE(name, '') as name, email, COALESCE(tenant_name, '') as tenant_name,
-		COALESCE(status, 'ACTIVE') as status, COALESCE(type, 'USER') as type, created_at, updated_at
-		FROM mail_accounts WHERE id = $1`
-	err := s.db.QueryRowContext(ctx, query, id).
-		Scan(&u.ID, &u.Name, &u.Email, &u.TenantName, &u.Status, &u.Type, &u.CreatedAt, &u.UpdatedAt)
-	if err == sql.ErrNoRows {
-		return nil, nil
-	}
-	return u, err
-}
-
-// EnsureUserByEmail inserts or returns an existing user from mail_accounts.
-// Enforces that there is only one user account per email address.
-func (s *Store) EnsureUserByEmail(ctx context.Context, email, name string) (*models.User, error) {
-	if name == "" {
-		name = email
-	}
-	u := &models.User{}
-	// Every onboarded account belongs to the org of its email domain (tenant_name drives org
-	// visibility), new or existing. An existing account keeps its status: onboarding must never
-	// un-suspend a blocked user.
-	query := `INSERT INTO mail_accounts (email, name, tenant_name, password, status, type)
-		VALUES ($1, $2, $3, '', 'ACTIVE', 'USER')
-		ON CONFLICT (email) DO UPDATE SET
-			name = CASE WHEN mail_accounts.name = '' THEN EXCLUDED.name ELSE mail_accounts.name END,
-			tenant_name = EXCLUDED.tenant_name
-		RETURNING id, COALESCE(name, '') as name, email, COALESCE(tenant_name, '') as tenant_name,
-			COALESCE(status, 'ACTIVE') as status, COALESCE(type, 'USER') as type, created_at, updated_at`
-	err := s.db.QueryRowContext(ctx, query, email, name, EmailDomain(email)).
-		Scan(&u.ID, &u.Name, &u.Email, &u.TenantName, &u.Status, &u.Type, &u.CreatedAt, &u.UpdatedAt)
-	if err != nil {
-		return nil, err
-	}
-	return u, nil
-}
-
 func (s *Store) GetUserByTenantAndEmail(ctx context.Context, tenantID int, email string) (*models.User, error) {
-	// Since mail_accounts has no tenant_id, tenantID == user.ID.
+	// Accounts have no separate tenant id: tenantID == user.ID.
 	// We just look up by email and verify the ID matches.
 	u, err := s.GetUserByEmail(ctx, email)
 	if err != nil || u == nil {

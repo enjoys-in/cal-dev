@@ -44,9 +44,26 @@ func TestDSNQuotesValues(t *testing.T) {
 		t.Fatalf("dsnQuote = %s, want %s", got, want)
 	}
 	d := DatabaseConfig{Host: "h", Port: 5432, User: "u", Password: "a b sslmode=disable", DBName: "db", SSLMode: "require", Schema: "caldev"}
-	// Schema is not applied to the DSN (see DatabaseConfig.DSN).
-	want := `host='h' port=5432 user='u' password='a b sslmode=disable' dbname='db' sslmode='require'`
+	// CalDev's schema comes first on search_path; public stays for extensions and the mail system.
+	want := `host='h' port=5432 user='u' password='a b sslmode=disable' dbname='db' sslmode='require' search_path='caldev,public'`
 	if got := d.DSN(); got != want {
 		t.Fatalf("DSN = %s", got)
+	}
+}
+
+func TestSchemaName(t *testing.T) {
+	cases := map[string]string{
+		"":               "caldev", // default
+		"caldev":         "caldev",
+		"calendar_2":     "calendar_2",
+		"public":         "caldev", // never CalDev's own schema
+		"Caldev":         "caldev", // not a plain lower-case identifier
+		"x; drop table":  "caldev",
+		`caldev",public`: "caldev",
+	}
+	for in, want := range cases {
+		if got := (&DatabaseConfig{Schema: in}).SchemaName(); got != want {
+			t.Errorf("SchemaName(%q) = %q, want %q", in, got, want)
+		}
 	}
 }

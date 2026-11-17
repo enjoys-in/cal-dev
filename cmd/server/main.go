@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/joho/godotenv"
 
+	"github.com/enjoys-in/cal-dev/internal/airsend"
 	"github.com/enjoys-in/cal-dev/internal/auth"
 	"github.com/enjoys-in/cal-dev/internal/availability"
 	"github.com/enjoys-in/cal-dev/internal/caldav"
@@ -64,6 +66,14 @@ func main() {
 	defer db.Close()
 	log.Println("Connected to PostgreSQL")
 
+	// CalDev lives in its own schema (DB_SCHEMA, default caldev). Before anything else, move
+	// CalDev objects an older version left in public into it (data kept, nothing dropped), so the
+	// migration table below is found there instead of being created empty.
+	if err := db.PrepareSchema(cfg.Database.SchemaName()); err != nil {
+		log.Fatalf("Preparing schema %q failed: %v", cfg.Database.SchemaName(), err)
+	}
+	log.Printf("Using schema %q", cfg.Database.SchemaName())
+
 	// Ensure migration tracking table exists (runs outside the main migration transaction)
 	db.RunMigration(`CREATE TABLE IF NOT EXISTS caldev_migrations (
 		id SERIAL PRIMARY KEY,
@@ -81,6 +91,7 @@ func main() {
 		"migrations/006_change_log_fixes.sql",
 		"migrations/007_onboarding_api_keys.sql",
 		"migrations/008_mail_accounts_email_lower.sql",
+		"migrations/010_caldev_mail_accounts.sql",
 	}
 	// A missing or failed migration stops startup: running on a partial schema breaks later features.
 	for _, mf := range migrationFiles {
@@ -124,6 +135,10 @@ func main() {
 	mailPub := publisher.New(jobQueue.Client())
 	schedulingSvc := scheduling.NewService(db, jobQueue, mailPub)
 	schedulingSvc.SetSecrets(cfg.Auth.JWTSecret, cfg.Server.PublicURL())
+	if c := airsend.New(cfg.Airsend.InternalURL, cfg.Airsend.Token, cfg.Airsend.Secret, cfg.Airsend.Timeout); c != nil {
+		schedulingSvc.SetAirsendClient(c)
+		log.Printf("Calendar emails of internal accounts go to airsend-api (%s)", cfg.Airsend.InternalURL)
+	}
 	syncSvc := extsync.NewService(db, jobQueue)
 
 	// Initialize background worker
@@ -560,8 +575,12 @@ func createUserHandler(db *store.Store, scoped bool) fiber.Handler {
 			return response.Error(c, 400, "a valid email is required")
 		}
 
-		// Look up or insert user into mail_accounts (ensuring 1 user per email)
+		// Look up or add the account in CalDev's own table (one account per email; an Airsend
+		// mailbox keeps its Airsend id, anything else becomes an external account)
 		user, err := db.EnsureUserByEmail(c.UserContext(), req.Email, req.Name)
+		if errors.Is(err, store.ErrCalendarDisabled) {
+			return response.Error(c, 409, "this email is an Airsend mailbox whose calendar is not enabled; enable the calendar in Airsend")
+		}
 		if err != nil {
 			log.Printf("onboard: provision %s: %v", req.Email, err)
 			return response.Error(c, 500, "failed to provision user")

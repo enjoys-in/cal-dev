@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -19,6 +20,18 @@ type Config struct {
 	TLS      TLSConfig
 	Worker   WorkerConfig
 	Sharing  SharingConfig
+	Airsend  AirsendConfig
+}
+
+// AirsendConfig is the airsend-api internal route that sends calendar emails of internal
+// Airsend accounts (mail_accounts.account_origin = 'internal').
+type AirsendConfig struct {
+	// InternalURL is the full route, e.g. https://api.airsend.in/api/v1/internal/calendar/mail.
+	// Empty = off (internal accounts then use the legacy Redis calendar:mail channel).
+	InternalURL string
+	Token       string        // Authorization: Bearer <Token>
+	Secret      string        // HMAC-SHA256 key for X-Caldev-Signature (separate from Token)
+	Timeout     time.Duration // per request
 }
 
 // SharingConfig controls who can see whose free/busy.
@@ -55,7 +68,7 @@ type DatabaseConfig struct {
 	Password        string
 	DBName          string
 	SSLMode         string
-	Schema          string // DB_SCHEMA: read but not applied (see DSN)
+	Schema          string // DB_SCHEMA (default "caldev"): CalDev's own schema, first on search_path
 	MaxOpenConns    int
 	MaxIdleConns    int
 	ConnMaxLifetime time.Duration
@@ -102,9 +115,22 @@ func (d *DatabaseConfig) DSN() string {
 		"host=%s port=%d user=%s password=%s dbname=%s sslmode=%s",
 		dsnQuote(d.Host), d.Port, dsnQuote(d.User), dsnQuote(d.Password), dsnQuote(d.DBName), dsnQuote(d.SSLMode),
 	)
-	// d.Schema (DB_SCHEMA) is deliberately not applied as search_path: existing deployments keep
-	// their tables in public, and switching schemas silently could point the app at other tables.
+	// Every CalDev object lives in its own schema (DB_SCHEMA, default "caldev"); public stays on the
+	// path only for extension functions (uuid_generate_v4) and the mail system's tables, which CalDev
+	// always names explicitly (public.mail_accounts, public.account_settings).
+	dsn += " search_path=" + dsnQuote(d.SchemaName()+",public")
 	return dsn
+}
+
+// schemaNameRe is what DB_SCHEMA may be: a plain lower-case SQL identifier.
+var schemaNameRe = regexp.MustCompile(`^[a-z_][a-z0-9_]{0,62}$`)
+
+// SchemaName returns CalDev's schema, "caldev" unless DB_SCHEMA names a valid identifier.
+func (d *DatabaseConfig) SchemaName() string {
+	if schemaNameRe.MatchString(d.Schema) && d.Schema != "public" {
+		return d.Schema
+	}
+	return "caldev"
 }
 
 // dsnQuote quotes a key/value connection-string value per lib/pq: single quotes, with
@@ -145,7 +171,7 @@ func Load() *Config {
 			Password:        envStr("DB_PASSWORD", "caldev"),
 			DBName:          envStr("DB_NAME", "caldev"),
 			SSLMode:         envStr("DB_SSLMODE", "disable"),
-			Schema:          envStr("DB_SCHEMA", ""),
+			Schema:          envStr("DB_SCHEMA", "caldev"),
 			MaxOpenConns:    envInt("DB_MAX_OPEN_CONNS", 50),
 			MaxIdleConns:    envInt("DB_MAX_IDLE_CONNS", 10),
 			ConnMaxLifetime: envDuration("DB_CONN_MAX_LIFETIME", 30*time.Minute),
@@ -177,6 +203,12 @@ func Load() *Config {
 		},
 		Sharing: SharingConfig{
 			OrgVisible: envBool("AVAILABILITY_ORG_VISIBLE", false),
+		},
+		Airsend: AirsendConfig{
+			InternalURL: envStr("AIRSEND_INTERNAL_URL", ""),
+			Token:       envStr("AIRSEND_INTERNAL_TOKEN", ""),
+			Secret:      envStr("AIRSEND_INTERNAL_SECRET", ""),
+			Timeout:     envDuration("AIRSEND_INTERNAL_TIMEOUT", 10*time.Second),
 		},
 		Worker: WorkerConfig{
 			Concurrency:     envInt("WORKER_CONCURRENCY", 4),
@@ -233,6 +265,13 @@ func (c *Config) Validate() (fatal, warnings []string) {
 		warnings = append(warnings, "CALDEV_PUBLIC_URL is not set: links in emails and feeds will point at http://localhost")
 	} else if strings.Contains(u, "://localhost") || strings.Contains(u, "://127.0.0.1") || strings.Contains(u, "://[::1]") {
 		warnings = append(warnings, "CALDEV_PUBLIC_URL points at localhost: links in emails and feeds will not work for other people")
+	}
+	if c.Airsend.InternalURL != "" && (c.Airsend.Token == "" || c.Airsend.Secret == "") {
+		fatal = append(fatal, "AIRSEND_INTERNAL_URL is set but AIRSEND_INTERNAL_TOKEN or AIRSEND_INTERNAL_SECRET is empty")
+	}
+	if c.Airsend.InternalURL != "" && !strings.HasPrefix(strings.ToLower(c.Airsend.InternalURL), "https://") &&
+		!strings.Contains(c.Airsend.InternalURL, "://localhost") && !strings.Contains(c.Airsend.InternalURL, "://airsend-api") {
+		warnings = append(warnings, "AIRSEND_INTERNAL_URL is not https: calendar emails would cross the network unencrypted")
 	}
 	if c.Auth.AdminAPIKey == defaultAdminKey {
 		warnings = append(warnings, "ADMIN_API_KEY is the default shipped in docker-compose.yml: anyone who has seen the repository knows it")
