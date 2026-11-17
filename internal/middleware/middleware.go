@@ -409,7 +409,7 @@ func AppHeaders(appCfg *config.AppConfig) fiber.Handler {
 		if path == "/health" || strings.HasPrefix(path, "/.well-known/") ||
 			strings.HasPrefix(path, "/dav/") || strings.HasPrefix(path, "/feeds/") ||
 			path == "/jmap/eventsource" ||
-			path == "/api/public/rsvp" || // opened from an email by people outside the app
+			path == "/api/public/rsvp" || path == "/api/public/ics" || // opened from an email by people outside the app
 			strings.HasPrefix(path, "/api/calendar/onboard") ||
 			strings.HasPrefix(path, "/api/users/onboard") ||
 			// Admin routes authenticate with X-API-Key = ADMIN_API_KEY; the same header name would

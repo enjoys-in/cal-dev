@@ -90,6 +90,14 @@ type RSVP struct {
 	DeclineURL   string `json:"decline_url"`
 }
 
+// AddToCalendar holds the "Add to calendar" links of an invitation: prefilled Google Calendar
+// and Outlook.com pages, and a download of the event's .ics (Apple Calendar and other apps).
+type AddToCalendar struct {
+	GoogleURL  string `json:"google_url"`
+	OutlookURL string `json:"outlook_url"`
+	ICSURL     string `json:"ics_url"`
+}
+
 // CalendarMail is the v1 request body of POST /internal/calendar/mail.
 type CalendarMail struct {
 	Version   int    `json:"version"`
@@ -104,6 +112,9 @@ type CalendarMail struct {
 	RSVP      *RSVP  `json:"rsvp,omitempty"`
 	Attempt   int    `json:"attempt"`
 	CreatedAt string `json:"created_at"`
+
+	// REQUEST only
+	AddToCalendar *AddToCalendar `json:"add_to_calendar,omitempty"`
 }
 
 // SendError is a failed call. Retryable says whether trying again later can help;

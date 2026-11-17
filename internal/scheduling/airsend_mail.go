@@ -150,6 +150,8 @@ func (svc *Service) buildCalendarMail(ctx context.Context, job *jobs.Job, msg *m
 	if msg.Method == "REQUEST" {
 		acc, tent, decl := svc.rsvpLinks(msg, event)
 		mail.RSVP = &airsend.RSVP{AcceptURL: acc, TentativeURL: tent, DeclineURL: decl}
+		add := svc.addToCalendarLinks(msg, event)
+		mail.AddToCalendar = &airsend.AddToCalendar{GoogleURL: add.Google, OutlookURL: add.Outlook, ICSURL: add.ICS}
 	}
 	return mail, nil
 }

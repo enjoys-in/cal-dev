@@ -293,6 +293,24 @@ p { color: #64748b; font-size: 14px; margin: 8px 0; }
 	return c.SendString(page)
 }
 
+// PublicEventICS serves the event of an invitation email as a .ics download, for its
+// "Add to calendar → Apple / Other" buttons. The token is the recipient's RSVP token.
+//
+//	GET /api/public/ics?token=...
+func (h *Handler) PublicEventICS(c *fiber.Ctx) error {
+	payload, err := ParseRSVPToken(c.Query("token"), h.svc.jwtSecret)
+	if err != nil {
+		return c.Status(400).SendString("This calendar link is invalid or has expired.")
+	}
+	body, err := h.svc.GuestEventICS(c.UserContext(), payload)
+	if err != nil {
+		return c.Status(404).SendString("Event not found or invitation has expired.")
+	}
+	c.Set("Content-Type", "text/calendar; charset=utf-8")
+	c.Set("Content-Disposition", `attachment; filename="invite.ics"`)
+	return c.SendString(body)
+}
+
 // rsvpButton renders a small form that POSTs token+action to the public RSVP endpoint.
 func rsvpButton(token, action string) string {
 	label, class := "Accept", "btn-acc"

@@ -281,6 +281,15 @@ func generateReplyICS(event *models.Event, attendeeEmail, partstat string) strin
 // for msg's recipient. The token is valid for at least 30 days, and until a day after
 // the event ends.
 func (svc *Service) rsvpLinks(msg *models.SchedulingMessage, event *models.Event) (accept, tentative, decline string) {
+	baseURL, token := svc.rsvpBaseURL(), svc.rsvpToken(msg, event)
+	link := func(action string) string {
+		return fmt.Sprintf("%s/api/public/rsvp?token=%s&action=%s", baseURL, token, action)
+	}
+	return link("ACCEPTED"), link("TENTATIVE"), link("DECLINED")
+}
+
+// rsvpBaseURL is the public address put in links of emails.
+func (svc *Service) rsvpBaseURL() string {
 	baseURL := svc.publicBaseURL
 	if baseURL == "" {
 		baseURL = "http://localhost:8443"
@@ -290,7 +299,11 @@ func (svc *Service) rsvpLinks(msg *models.SchedulingMessage, event *models.Event
 			log.Printf("scheduling: WARNING: public URL %q contains localhost; RSVP links in emails will not work for recipients", baseURL)
 		})
 	}
+	return baseURL
+}
 
+// rsvpToken signs msg's recipient for the public RSVP and .ics links (query-escaped).
+func (svc *Service) rsvpToken(msg *models.SchedulingMessage, event *models.Event) string {
 	ttl := 30 * 24 * time.Hour
 	if event != nil {
 		end := event.DTStart
@@ -301,11 +314,7 @@ func (svc *Service) rsvpLinks(msg *models.SchedulingMessage, event *models.Event
 			ttl = d
 		}
 	}
-	token := url.QueryEscape(GenerateRSVPToken(msg.TenantID, msg.EventUID, msg.RecipientEmail, svc.jwtSecret, ttl))
-	link := func(action string) string {
-		return fmt.Sprintf("%s/api/public/rsvp?token=%s&action=%s", baseURL, token, action)
-	}
-	return link("ACCEPTED"), link("TENTATIVE"), link("DECLINED")
+	return url.QueryEscape(GenerateRSVPToken(msg.TenantID, msg.EventUID, msg.RecipientEmail, svc.jwtSecret, ttl))
 }
 
 // HandleSendEmailJob is the worker handler for send_scheduling_email jobs.
@@ -399,13 +408,24 @@ func (svc *Service) sendViaBYOSMTP(ctx context.Context, msg *models.SchedulingMe
 
 	startFmt := ""
 	endFmt := ""
+	dayOfMonth := ""
+	recipientName := ""
 	summary := "Calendar Event"
 	description := ""
 	location := ""
 	organizer := ""
 
 	if event != nil {
+		var attendees []models.Attendee
+		_ = json.Unmarshal(event.Attendees, &attendees)
+		for _, a := range attendees {
+			if strings.EqualFold(a.Email, msg.RecipientEmail) {
+				recipientName = a.DisplayName
+				break
+			}
+		}
 		if event.AllDay {
+			dayOfMonth = event.DTStart.UTC().Format("2")
 			// Date only; DTEND of an all-day event is exclusive, so show the last day.
 			startFmt = event.DTStart.UTC().Format("Mon, 02 Jan 2006")
 			if event.DTEnd != nil {
@@ -420,9 +440,15 @@ func (svc *Service) sendViaBYOSMTP(ctx context.Context, msg *models.SchedulingMe
 				loc = time.UTC
 			}
 			const layout = "Mon, 02 Jan 2006 15:04 MST"
+			dayOfMonth = event.DTStart.In(loc).Format("2")
 			startFmt = event.DTStart.In(loc).Format(layout)
 			if event.DTEnd != nil {
-				endFmt = event.DTEnd.In(loc).Format(layout)
+				end := event.DTEnd.In(loc)
+				if end.Format("2006-01-02") == event.DTStart.In(loc).Format("2006-01-02") {
+					endFmt = end.Format("15:04 MST") // same day: only the time
+				} else {
+					endFmt = end.Format(layout)
+				}
 			}
 		}
 		summary = event.Summary
@@ -454,11 +480,17 @@ func (svc *Service) sendViaBYOSMTP(ctx context.Context, msg *models.SchedulingMe
 		EndFormatted:   endFmt,
 		Organizer:      organizer,
 		RawICS:         msg.RawICS,
+		RecipientName:  recipientName,
+		DayOfMonth:     dayOfMonth,
+		IsUpdate:       msg.Method == "REQUEST" && event != nil && event.Sequence > 0,
+		MeetingURL:     meetingURL(location, description),
 	}
 
 	// RSVP links only make sense on invitations (not on cancellations or replies).
 	if msg.Method == "REQUEST" {
 		invData.RSVPAcceptURL, invData.RSVPTentURL, invData.RSVPDeclURL = svc.rsvpLinks(msg, event)
+		add := svc.addToCalendarLinks(msg, event)
+		invData.GoogleCalendarURL, invData.OutlookCalendarURL, invData.ICSURL = add.Google, add.Outlook, add.ICS
 	}
 
 	mimeBytes, err := smtp.BuildInvitationMIME(invData)

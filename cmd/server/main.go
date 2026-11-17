@@ -326,6 +326,8 @@ func main() {
 	// that group's auth middleware runs for every path under it. GET with an action records it.
 	app.Get("/api/public/rsvp", rsvpPageHeaders, schedulingHandler.PublicWebRSVP)
 	app.Post("/api/public/rsvp", rsvpPageHeaders, schedulingHandler.PublicWebRSVP)
+	// .ics download for the invitation email's "Add to calendar → Apple / Other" (same token)
+	app.Get("/api/public/ics", rsvpPageHeaders, schedulingHandler.PublicEventICS)
 
 	// ============================================================
 	// Calendar Subscriptions — Import from Google/Outlook/any ICS

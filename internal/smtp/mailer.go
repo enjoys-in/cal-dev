@@ -34,7 +34,19 @@ type InvitationData struct {
 	RSVPAcceptURL  string
 	RSVPTentURL    string
 	RSVPDeclURL    string
+
+	// Shown in the HTML part
+	RecipientName      string // guest's display name, for the greeting
+	DayOfMonth         string // "18": the start day in the event's zone, for the date circle
+	IsUpdate           bool   // REQUEST that changes an earlier invitation
+	MeetingURL         string // video meeting link, shown as "Join meeting"
+	GoogleCalendarURL  string // "Add to calendar" links (REQUEST only)
+	OutlookCalendarURL string
+	ICSURL             string // .ics download, used for Apple and "Other"
 }
+
+// EmailIconBaseURL hosts the PNG icons of the "Add to calendar" buttons (Gmail shows no SVG).
+const EmailIconBaseURL = "https://airsend.in/email-icons/"
 
 // BuildInvitationMIME builds an RFC 5322 MIME multipart/alternative message
 // containing a text part, an HTML part with 1-click RSVP buttons, and the RFC 5545 .ics payload.
@@ -158,76 +170,121 @@ func generatePlainTextBody(d *InvitationData) string {
 	return sb.String()
 }
 
+// Email HTML: tables and inline styles only, so Gmail and Outlook render it the same way.
+const (
+	mailFont       = "-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif"
+	mailBlue       = "#2F8CF0"
+	mailInk        = "#1A1F36"
+	mailMuted      = "#7A8199"
+	mailPillStyle  = "display:inline-block;margin:0 8px 10px 0;padding:10px 18px;border:2px solid #E3E5EB;border-radius:14px;background:#ffffff;color:#1F2937;font-size:16px;font-weight:700;line-height:20px;text-decoration:none;white-space:nowrap"
+	mailIconStyle  = "width:20px;height:20px;border:0;vertical-align:-4px;margin-right:10px"
+	mailDotPattern = "<span style=\"display:inline-block;width:10px;height:10px;border-radius:5px;background:%s;margin-right:8px\"></span>"
+)
+
+// mailPill is an outlined, rounded button: an optional icon (or colored dot) and a label.
+func mailPill(href, label, lead string) string {
+	return fmt.Sprintf("<a href=\"%s\" target=\"_blank\" style=\"%s\">%s%s</a>", escapeHTML(href), mailPillStyle, lead, escapeHTML(label))
+}
+
+func mailIcon(name, alt string) string {
+	return fmt.Sprintf("<img src=\"%s%s.png\" width=\"20\" height=\"20\" alt=\"%s\" style=\"%s\">", EmailIconBaseURL, name, alt, mailIconStyle)
+}
+
+// mailGreetingName: the guest's first name, else the part of the address before "@".
+func mailGreetingName(name, email string) string {
+	if f := strings.Fields(name); len(f) > 0 {
+		return f[0]
+	}
+	local, _, _ := strings.Cut(email, "@")
+	return local
+}
+
 func generateHTMLBody(d *InvitationData) string {
-	title := "Calendar Invitation"
-	badgeColor := "#0078D4"
-	if d.Method == "CANCEL" {
-		title = "Event Canceled"
-		badgeColor = "#D13438"
-	} else if d.Method == "REPLY" {
-		title = "RSVP Update"
-		badgeColor = "#6B7280"
+	cancelled := d.Method == "CANCEL"
+	who := mailGreetingName(d.RecipientName, d.RecipientEmail)
+	greeting, accent := fmt.Sprintf("Hello %s! You're invited, add this event to your calendar", who), mailBlue
+	switch {
+	case cancelled:
+		greeting, accent = fmt.Sprintf("Hello %s! This event has been cancelled", who), "#E5484D"
+	case d.Method == "REPLY":
+		greeting = "A guest replied to your invitation"
+	case d.IsUpdate:
+		greeting = fmt.Sprintf("Hello %s! This event has been updated", who)
 	}
 
 	var sb strings.Builder
-	sb.WriteString("<!DOCTYPE html><html><head><meta charset=\"UTF-8\">")
-	sb.WriteString("<style>")
-	sb.WriteString("body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background-color: #f4f6f8; margin: 0; padding: 24px; color: #1e293b; }")
-	sb.WriteString(".card { max-width: 560px; margin: 0 auto; background: #ffffff; border-radius: 12px; border: 1px solid #e2e8f0; overflow: hidden; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.05); }")
-	sb.WriteString(".header { padding: 20px 24px; border-bottom: 1px solid #f1f5f9; }")
-	sb.WriteString(fmt.Sprintf(".badge { display: inline-block; font-size: 11px; font-weight: 700; text-transform: uppercase; color: #fff; background: %s; padding: 3px 8px; border-radius: 6px; letter-spacing: 0.5px; }", badgeColor))
-	sb.WriteString(".title { font-size: 20px; font-weight: 700; margin: 10px 0 0 0; color: #0f172a; }")
-	sb.WriteString(".body { padding: 24px; }")
-	sb.WriteString(".meta-row { display: flex; margin-bottom: 12px; font-size: 14px; line-height: 1.5; }")
-	sb.WriteString(".meta-label { font-weight: 600; width: 85px; color: #64748b; flex-shrink: 0; }")
-	sb.WriteString(".meta-val { color: #1e293b; }")
-	sb.WriteString(".desc { margin-top: 18px; padding-top: 18px; border-top: 1px solid #f1f5f9; font-size: 14px; color: #334155; white-space: pre-wrap; }")
-	sb.WriteString(".rsvp-section { padding: 20px 24px; background: #f8fafc; border-top: 1px solid #e2e8f0; text-align: center; }")
-	sb.WriteString(".rsvp-title { font-size: 13px; font-weight: 600; color: #64748b; margin-bottom: 12px; }")
-	sb.WriteString(".btn { display: inline-block; padding: 8px 18px; margin: 0 4px; font-size: 13px; font-weight: 600; text-decoration: none; border-radius: 6px; transition: opacity 0.2s; }")
-	sb.WriteString(".btn-accept { background: #10B981; color: #ffffff; }")
-	sb.WriteString(".btn-tentative { background: #F59E0B; color: #ffffff; }")
-	sb.WriteString(".btn-decline { background: #EF4444; color: #ffffff; }")
-	sb.WriteString("</style></head><body>")
+	sb.WriteString("<!DOCTYPE html><html><head><meta charset=\"UTF-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"></head>")
+	sb.WriteString(fmt.Sprintf("<body style=\"margin:0;padding:0;background:#ffffff;font-family:%s;color:%s\">", mailFont, mailInk))
+	sb.WriteString("<table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" border=\"0\"><tr><td align=\"center\" style=\"padding:32px 16px\">")
+	sb.WriteString("<table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" border=\"0\" style=\"max-width:600px\"><tr><td align=\"left\">")
 
-	sb.WriteString("<div class=\"card\">")
-	sb.WriteString("<div class=\"header\">")
-	sb.WriteString(fmt.Sprintf("<span class=\"badge\">%s</span>", title))
-	sb.WriteString(fmt.Sprintf("<h2 class=\"title\">%s</h2>", escapeHTML(d.Summary)))
-	sb.WriteString("</div>")
+	sb.WriteString(fmt.Sprintf("<p style=\"margin:0 0 32px;font-size:18px;font-weight:700;color:%s\">%s</p>", accent, escapeHTML(greeting)))
 
-	sb.WriteString("<div class=\"body\">")
-	if d.StartFormatted != "" {
-		sb.WriteString("<div class=\"meta-row\"><span class=\"meta-label\">When:</span><span class=\"meta-val\">")
-		sb.WriteString(escapeHTML(d.StartFormatted))
-		if d.EndFormatted != "" {
-			sb.WriteString(fmt.Sprintf(" – %s", escapeHTML(d.EndFormatted)))
+	// Date circle | title, description, when, where
+	sb.WriteString("<table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" border=\"0\"><tr>")
+	if d.DayOfMonth != "" {
+		circle := "#3B8EEA"
+		if cancelled {
+			circle = "#A0A6B8"
 		}
-		sb.WriteString("</span></div>")
+		sb.WriteString("<td width=\"96\" valign=\"top\" style=\"padding:0 28px 0 0\">")
+		sb.WriteString(fmt.Sprintf("<div style=\"width:96px;height:96px;border-radius:48px;background:%s;color:#ffffff;font-size:44px;font-weight:800;line-height:96px;text-align:center\">%s</div>", circle, escapeHTML(d.DayOfMonth)))
+		sb.WriteString("</td>")
+	}
+	sb.WriteString("<td valign=\"top\">")
+	titleDeco := ""
+	if cancelled {
+		titleDeco = "text-decoration:line-through;"
+	}
+	sb.WriteString(fmt.Sprintf("<p style=\"margin:4px 0 6px;font-size:26px;font-weight:700;line-height:32px;color:%s;%s\">%s</p>", mailInk, titleDeco, escapeHTML(d.Summary)))
+	if d.Description != "" {
+		sb.WriteString(fmt.Sprintf("<p style=\"margin:0;font-size:18px;line-height:26px;color:%s;white-space:pre-wrap\">%s</p>", mailMuted, escapeHTML(d.Description)))
+	}
+	if d.StartFormatted != "" {
+		when := d.StartFormatted
+		if d.EndFormatted != "" {
+			when += " – " + d.EndFormatted
+		}
+		sb.WriteString(fmt.Sprintf("<p style=\"margin:18px 0 0;font-size:16px;font-weight:700;color:%s\">%s</p>", mailMuted, escapeHTML(when)))
 	}
 	if d.Location != "" {
-		sb.WriteString(fmt.Sprintf("<div class=\"meta-row\"><span class=\"meta-label\">Where:</span><span class=\"meta-val\">%s</span></div>", escapeHTML(d.Location)))
+		sb.WriteString(fmt.Sprintf("<p style=\"margin:14px 0 0;font-size:16px;color:%s\">%s</p>", mailMuted, escapeHTML(d.Location)))
 	}
 	if d.Organizer != "" {
-		sb.WriteString(fmt.Sprintf("<div class=\"meta-row\"><span class=\"meta-label\">Organizer:</span><span class=\"meta-val\">%s</span></div>", escapeHTML(d.Organizer)))
+		sb.WriteString(fmt.Sprintf("<p style=\"margin:8px 0 0;font-size:14px;color:%s\">Organizer: %s</p>", mailMuted, escapeHTML(strings.TrimPrefix(strings.TrimPrefix(d.Organizer, "mailto:"), "MAILTO:"))))
 	}
-	if d.Description != "" {
-		sb.WriteString(fmt.Sprintf("<div class=\"desc\">%s</div>", escapeHTML(d.Description)))
+	if d.MeetingURL != "" && !cancelled {
+		sb.WriteString(fmt.Sprintf("<p style=\"margin:14px 0 0;font-size:16px;font-weight:700\"><a href=\"%s\" target=\"_blank\" style=\"color:%s;text-decoration:none\">Join meeting &rarr;</a></p>", escapeHTML(d.MeetingURL), mailBlue))
 	}
-	sb.WriteString("</div>")
+	sb.WriteString("</td></tr></table>")
 
 	if d.Method == "REQUEST" && d.RSVPAcceptURL != "" {
-		sb.WriteString("<div class=\"rsvp-section\">")
-		sb.WriteString("<div class=\"rsvp-title\">Going? Respond to this invitation:</div>")
-		sb.WriteString(fmt.Sprintf("<a href=\"%s\" class=\"btn btn-accept\">Accept</a>", escapeHTML(d.RSVPAcceptURL)))
+		sb.WriteString(fmt.Sprintf("<p style=\"margin:36px 0 12px;font-size:15px;font-weight:700;color:%s\">Going?</p><div>", mailInk))
+		sb.WriteString(mailPill(d.RSVPAcceptURL, "Yes", fmt.Sprintf(mailDotPattern, "#10B981")))
 		if d.RSVPTentURL != "" {
-			sb.WriteString(fmt.Sprintf("<a href=\"%s\" class=\"btn btn-tentative\">Tentative</a>", escapeHTML(d.RSVPTentURL)))
+			sb.WriteString(mailPill(d.RSVPTentURL, "Maybe", fmt.Sprintf(mailDotPattern, "#F59E0B")))
 		}
-		sb.WriteString(fmt.Sprintf("<a href=\"%s\" class=\"btn btn-decline\">Decline</a>", escapeHTML(d.RSVPDeclURL)))
+		sb.WriteString(mailPill(d.RSVPDeclURL, "No", fmt.Sprintf(mailDotPattern, "#EF4444")))
 		sb.WriteString("</div>")
 	}
 
-	sb.WriteString("</div></body></html>")
+	if d.Method == "REQUEST" && (d.GoogleCalendarURL != "" || d.OutlookCalendarURL != "" || d.ICSURL != "") {
+		sb.WriteString(fmt.Sprintf("<p style=\"margin:24px 0 12px;font-size:15px;font-weight:700;color:%s\">Add to calendar</p><div>", mailInk))
+		if d.GoogleCalendarURL != "" {
+			sb.WriteString(mailPill(d.GoogleCalendarURL, "Google", mailIcon("google", "")))
+		}
+		if d.OutlookCalendarURL != "" {
+			sb.WriteString(mailPill(d.OutlookCalendarURL, "Outlook", mailIcon("outlook", "")))
+		}
+		if d.ICSURL != "" {
+			sb.WriteString(mailPill(d.ICSURL, "Apple", mailIcon("apple", "")))
+			sb.WriteString(mailPill(d.ICSURL, "Other", mailIcon("plus", "")))
+		}
+		sb.WriteString("</div>")
+	}
+
+	sb.WriteString("<p style=\"margin:36px 0 0;font-size:12px;color:#A0A6B8\">Sent with Airsend Calendar</p>")
+	sb.WriteString("</td></tr></table></td></tr></table></body></html>")
 	return sb.String()
 }
 

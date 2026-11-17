@@ -134,7 +134,7 @@ func TestBuildInvitationMIMEHeaderInjectionAndEncoding(t *testing.T) {
 	if strings.Contains(parts["text/html"], "action=ACCEPTED") || strings.Contains(parts["text/plain"], "RSVP via web") {
 		t.Errorf("REPLY email must not contain RSVP links")
 	}
-	if !strings.Contains(parts["text/html"], "RSVP Update") {
-		t.Errorf("REPLY email should use the RSVP Update badge")
+	if !strings.Contains(parts["text/html"], "replied to your invitation") {
+		t.Errorf("REPLY email should say a guest replied")
 	}
 }
