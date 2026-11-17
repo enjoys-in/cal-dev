@@ -189,7 +189,7 @@ CalDev does not maintain direct outbound SMTP connections. Instead, it generates
 - **User Name**: Full email address (e.g., `user@domain.com`)
 - **Password**: App Password generated from web settings
 - **Server Address**: `caldev.yourdomain.com:8443`
-- **Server Path**: `/.well-known/caldav` (or `/dav/1/42/`)
+- **Server Path**: `/.well-known/caldav` (public; redirects to `/dav/`, then sign in) or `/dav/1/42/`
 
 ### Thunderbird Lightning
 - **Location**: `https://caldev.yourdomain.com:8443/dav/{tenant_id}/{user_id}/`

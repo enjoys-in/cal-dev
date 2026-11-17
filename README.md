@@ -238,7 +238,8 @@ GET /health
 
 ### CalDAV (RFC 4791)
 ```
-/.well-known/caldav                              → Discovery redirect
+/.well-known/caldav                              → Discovery redirect to /dav/ (public, RFC 6764)
+/dav/                                            → DAV root (PROPFIND → current-user-principal)
 /dav/{tenant}/{user}/                            → Principal
 /dav/{tenant}/{user}/calendars/                  → Calendar home
 /dav/{tenant}/{user}/calendars/{calendar}/       → Calendar collection
@@ -251,6 +252,7 @@ Resources are addressed by UID: a `PUT` to `{uid}.ics` must carry that same `UID
 
 ### JMAP (RFC 8620)
 ```
+GET  /.well-known/jmap → Autodiscovery redirect to /jmap/session (public, RFC 8620 §2.2)
 GET  /jmap/session    → Session resource
 POST /jmap/api        → Method calls (CalendarEvent/*, Calendar/*)
 ```

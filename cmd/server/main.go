@@ -213,9 +213,13 @@ func main() {
 	})
 
 	// ============================================================
-	// Well-Known CalDAV Discovery (RFC 6764)
+	// Well-Known Discovery — public on purpose: clients probe these before they have
+	// credentials, and each only redirects (the target does the authentication).
+	//   RFC 6764 §6   /.well-known/caldav → /dav/
+	//   RFC 8620 §2.2 /.well-known/jmap   → /jmap/session
 	// ============================================================
-	app.All("/.well-known/caldav", middleware.DAVAuth(authSvc, db), caldavHandler.WellKnown)
+	app.All("/.well-known/caldav", caldavHandler.WellKnown)
+	app.Get("/.well-known/jmap", jmapHandler.WellKnown)
 
 	// ============================================================
 	// CalDAV Routes — /dav/{tenant}/{user}/...
@@ -224,6 +228,10 @@ func main() {
 
 	// OPTIONS on all paths
 	davGroup.Options("/*", caldavHandler.Options)
+
+	// DAV context root: where /.well-known/caldav redirects. PROPFIND here returns
+	// current-user-principal so clients can find /dav/{tenant}/{user}/ after signing in.
+	davGroup.Add("PROPFIND", "/", caldavHandler.Propfind)
 
 	// Principal
 	davGroup.All("/:tenant/:user", handleDAVMethod(caldavHandler)).Name("principal")

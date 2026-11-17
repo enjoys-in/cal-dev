@@ -125,6 +125,13 @@ func (h *Handler) lockAccount(ctx context.Context, tenantID, userID int) (func()
 	}, nil
 }
 
+// WellKnown handles /.well-known/jmap (RFC 8620 §2.2): the public autodiscovery URL, which
+// redirects to the Session resource. It needs no authentication — the Session resource does.
+func (h *Handler) WellKnown(c *fiber.Ctx) error {
+	c.Set("Location", "/jmap/session")
+	return c.SendStatus(fiber.StatusMovedPermanently)
+}
+
 func (h *Handler) Session(c *fiber.Ctx) error {
 	tenantID := c.Locals("tenant_id").(int)
 	userID := c.Locals("user_id").(int)

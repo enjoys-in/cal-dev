@@ -11,7 +11,7 @@ This document provides complete endpoint specifications, authentication rules, J
 | Method | Send | Accepted on | Used by |
 |---|---|---|---|
 | **JWT** | `Authorization: Bearer <jwt>` header or `access_token` cookie | every authenticated route | Frontend apps, JMAP clients |
-| **Basic Auth** | `Authorization: Basic base64(email:app-password)` | `/dav/*`, `/feeds/*`, `/.well-known/caldav` only | CalDAV clients, ICS feeds |
+| **Basic Auth** | `Authorization: Basic base64(email:app-password)` | `/dav/*`, `/feeds/*` only | CalDAV clients, ICS feeds |
 
 `/api/*` and `/jmap/*` accept only the JWT. A token in the URL (`?access_token=`) is accepted only on `/jmap/eventsource`. Onboarding and the admin routes have their own rules (§9).
 
@@ -634,7 +634,9 @@ All JSON field names match these models exactly.
 | Method | Path | Auth | Description |
 |---|---|---|---|
 | `GET` | `/health` | None | Health check |
-| `ALL` | `/.well-known/caldav` | Basic/JWT | CalDAV discovery redirect |
+| `ALL` | `/.well-known/caldav` | None (public) | CalDAV discovery (RFC 6764): `301` → `/dav/` |
+| `GET` | `/.well-known/jmap` | None (public) | JMAP autodiscovery (RFC 8620 §2.2): `301` → `/jmap/session` |
+| `PROPFIND` | `/dav/` | Basic/JWT | DAV context root: returns `current-user-principal` |
 | `*` | `/dav/{tenant}/{user}/...` | Basic/JWT | CalDAV (WebDAV methods) |
 | `GET` | `/jmap/session` | JWT | JMAP session resource |
 | `POST` | `/jmap/api` | JWT | JMAP method calls |

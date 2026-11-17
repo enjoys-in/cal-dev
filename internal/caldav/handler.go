@@ -966,14 +966,16 @@ func (h *Handler) Unlock(c *fiber.Ctx) error {
 }
 
 // ============================================================
-// WellKnown handles /.well-known/caldav redirect
+// WellKnown handles /.well-known/caldav (RFC 6764 §6)
 // ============================================================
 
+// WellKnown is the public CalDAV discovery entry point. Clients (Apple Calendar, Thunderbird,
+// DAVx5) probe it before they have credentials, so it must not require authentication, and
+// it cannot know the user — it redirects to the DAV context path. The client then sends its
+// PROPFIND there, gets the Basic challenge, and reads current-user-principal (see propfindRoot).
 func (h *Handler) WellKnown(c *fiber.Ctx) error {
-	tenantID, _ := c.Locals("tenant_id").(int)
-	userID, _ := c.Locals("user_id").(int)
-	c.Set("Location", fmt.Sprintf("/dav/%d/%d/", tenantID, userID))
-	return c.SendStatus(301)
+	c.Set("Location", "/dav/")
+	return c.SendStatus(fiber.StatusMovedPermanently)
 }
 
 // ============================================================
