@@ -103,16 +103,14 @@ Send a standard JMAP invocation to `POST /jmap/api`:
 
 ---
 
-## 3. Redis Pub/Sub Channels
+## 3. Reminders and Email
 
-CalDev uses Redis (or Valkey) Pub/Sub to communicate asynchronously with notification daemons and external email relays.
+### 3.1 Reminders: SSE event `reminder`
+When a meeting milestone is due (15m, 10m, 5m, or 0m), CalDev sends a `reminder` event on the user's open `/jmap/eventsource` stream (the same stream that carries `state`, `availability` and `shares`). Internally the worker sends it through a Postgres `NOTIFY` on `caldev_changes`, so it reaches the user's stream on whichever server instance holds it. There is no Redis Pub/Sub channel and no separate push daemon.
 
-### 3.1 Push Notifications: `calendar:push`
-Published when a meeting milestone is due (15m, 10m, 5m, or 0m) or when a calendar event changes.
+A reminder is shown only to users with a stream open at that moment (the web client should show it as a notification). It is not stored or replayed, and there is no Web Push to a closed browser.
 
-**Channel**: `calendar:push`
-
-**Payload Schema**:
+**Event data**:
 ```json
 {
   "event_uid": "7c3a41b2-1094-4b52-b883-82ffab181041",
@@ -130,25 +128,13 @@ Published when a meeting milestone is due (15m, 10m, 5m, or 0m) or when a calend
 }
 ```
 
-**How Notification Daemons / Web Push Should Listen**:
-```python
-# Example: Python Redis Subscriber for Web Push
-import redis, json
-
-r = redis.Redis.from_url("redis://localhost:6379/0")
-pubsub = r.pubsub()
-pubsub.subscribe("calendar:push")
-
-for msg in pubsub.listen():
-    if msg["type"] == "message":
-        data = json.loads(msg["data"])
-        send_web_push(
-            user_id=data["recipient_user_id"],
-            title=data["title"],
-            body=data["body"],
-            tag=data["tag"],
-            url=data["url"]
-        )
+**Client side**:
+```js
+const es = new EventSource("/jmap/eventsource", { withCredentials: true });
+es.addEventListener("reminder", (e) => {
+  const r = JSON.parse(e.data);
+  new Notification(r.title, { body: r.body, tag: r.tag }); // `tag` de-duplicates across tabs
+});
 ```
 
 ---

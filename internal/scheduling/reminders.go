@@ -12,7 +12,6 @@ import (
 
 	"github.com/enjoys-in/cal-dev/internal/jobs"
 	"github.com/enjoys-in/cal-dev/internal/models"
-	"github.com/enjoys-in/cal-dev/internal/publisher"
 	"github.com/enjoys-in/cal-dev/internal/recurrence"
 )
 
@@ -34,6 +33,22 @@ type ReminderJobPayload struct {
 	RecipientUserID  int       `json:"recipient_user_id,omitempty"`
 	MilestoneMinutes int       `json:"milestone_minutes"`
 	OrganizerEmail   string    `json:"organizer_email,omitempty"`
+}
+
+// ReminderEvent is the data of the SSE "reminder" event the web client shows as a notification.
+type ReminderEvent struct {
+	EventUID         string `json:"event_uid"`
+	RecurrenceID     string `json:"recurrence_id,omitempty"`
+	Title            string `json:"title"`
+	Location         string `json:"location,omitempty"`
+	StartUTC         string `json:"start_utc"`
+	RecipientEmail   string `json:"recipient_email"`
+	RecipientUserID  int    `json:"recipient_user_id,omitempty"`
+	MilestoneMinutes int    `json:"milestone_minutes"` // 15, 10, 5, 0
+	Body             string `json:"body"`
+	Tag              string `json:"tag"`
+	URL              string `json:"url"`
+	Timestamp        string `json:"timestamp"`
 }
 
 // ReminderRecipient represents an individual (organizer or attendee) eligible for a reminder.
@@ -351,7 +366,7 @@ func (svc *Service) currentOccurrence(ctx context.Context, p *ReminderJobPayload
 
 // HandleCalendarReminderJob processes a due reminder job from Valkey.
 // It re-checks the event, deduplicates via reminder_deliveries and publishes the
-// notification to Redis (calendar:push). A failed publish returns an error so the job is retried.
+// notification to the SSE hub (event "reminder"). A failed send returns an error so the job is retried.
 func (svc *Service) HandleCalendarReminderJob(ctx context.Context, job *jobs.Job) error {
 	payload, err := jobs.ParsePayload[ReminderJobPayload](job)
 	if err != nil {
@@ -419,31 +434,31 @@ func (svc *Service) HandleCalendarReminderJob(ctx context.Context, job *jobs.Job
 		tag = fmt.Sprintf("cal-%s-%s-%dm", payload.EventUID, payload.RecurrenceID, payload.MilestoneMinutes)
 	}
 
-	// 4. Publish to Redis calendar:push channel
-	if svc.publisher != nil {
-		pushEvt := &publisher.PushEvent{
-			EventUID:         payload.EventUID,
-			RecurrenceID:     payload.RecurrenceID,
-			Title:            fmt.Sprintf("Meeting Reminder: %s", summary),
-			Location:         location,
-			StartUTC:         payload.StartUTC.Format(time.RFC3339),
-			RecipientEmail:   payload.RecipientEmail,
-			RecipientUserID:  payload.RecipientUserID,
-			MilestoneMinutes: payload.MilestoneMinutes,
-			Body:             body,
-			Tag:              tag,
-			URL:              "/calendar",
-			Timestamp:        time.Now().UTC().Format(time.RFC3339),
+	// 4. Hand it to the SSE hub (event "reminder" on /jmap/eventsource) via Postgres NOTIFY
+	evt, err := json.Marshal(ReminderEvent{
+		EventUID:         payload.EventUID,
+		RecurrenceID:     payload.RecurrenceID,
+		Title:            fmt.Sprintf("Meeting Reminder: %s", summary),
+		Location:         location,
+		StartUTC:         payload.StartUTC.Format(time.RFC3339),
+		RecipientEmail:   payload.RecipientEmail,
+		RecipientUserID:  payload.RecipientUserID,
+		MilestoneMinutes: payload.MilestoneMinutes,
+		Body:             body,
+		Tag:              tag,
+		URL:              "/calendar",
+		Timestamp:        time.Now().UTC().Format(time.RFC3339),
+	})
+	if err == nil {
+		err = svc.store.NotifyReminder(ctx, payload.RecipientUserID, evt)
+	}
+	if err != nil {
+		rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		if relErr := svc.store.ReleaseReminderDelivery(rctx, payload.EventUID, key, payload.RecipientEmail, payload.MilestoneMinutes, "push"); relErr != nil {
+			log.Printf("scheduling: reminder for %s will not be retried: %v", payload.RecipientEmail, relErr)
 		}
-
-		if err := svc.publisher.PublishPushEvent(ctx, pushEvt); err != nil {
-			rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-			defer cancel()
-			if relErr := svc.store.ReleaseReminderDelivery(rctx, payload.EventUID, key, payload.RecipientEmail, payload.MilestoneMinutes, "push"); relErr != nil {
-				log.Printf("scheduling: reminder for %s will not be retried: %v", payload.RecipientEmail, relErr)
-			}
-			return fmt.Errorf("publish reminder for %s: %w", payload.RecipientEmail, err)
-		}
+		return fmt.Errorf("send reminder for %s: %w", payload.RecipientEmail, err)
 	}
 
 	log.Printf("scheduling: reminder delivered for %s → %q (%dm)",

@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -107,6 +108,20 @@ func (s *Store) QueryUpcomingEventsForReminders(ctx context.Context, from, to ti
 
 // ReleaseReminderDelivery deletes a delivery row recorded by RecordReminderDelivery, so a reminder
 // whose publish failed can be delivered by the job's retry.
+// NotifyReminder hands a due reminder to the SSE hub through the 'caldev_changes' NOTIFY channel
+// (kind "reminder"). Every server instance LISTENs, so the one holding the user's stream delivers
+// it, whichever instance ran the job. payload must be a JSON object (NOTIFY limit: ~8000 bytes).
+func (s *Store) NotifyReminder(ctx context.Context, userID int, payload []byte) error {
+	msg, err := json.Marshal(map[string]interface{}{"k": "reminder", "u": userID, "p": json.RawMessage(payload)})
+	if err != nil {
+		return fmt.Errorf("store: marshal reminder notification: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `SELECT pg_notify('caldev_changes', $1)`, string(msg)); err != nil {
+		return fmt.Errorf("store: notify reminder: %w", err)
+	}
+	return nil
+}
+
 func (s *Store) ReleaseReminderDelivery(ctx context.Context, eventUID, recurrenceID, recipientEmail string, milestoneMinutes int, channel string) error {
 	if channel == "" {
 		channel = "push"

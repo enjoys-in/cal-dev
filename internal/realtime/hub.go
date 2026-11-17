@@ -66,6 +66,8 @@ type notification struct {
 	T int    `json:"t"`
 	O int    `json:"o"`
 	G int    `json:"g"`
+	// P is the ready-made event data of a "reminder" notification (see store.NotifyReminder).
+	P json.RawMessage `json:"p,omitempty"`
 }
 
 type pendingOwner struct {
@@ -245,6 +247,11 @@ func (h *Hub) handlePayload(payload string) {
 		h.scheduleOwner(n.U, n.K)
 	case "avail_share", "cal_share":
 		h.sharesChanged(n)
+	case "reminder":
+		// Straight to the user's open streams; nobody connected = nothing to show.
+		if n.U > 0 && len(n.P) > 0 {
+			h.sendToUser(n.U, Message{Event: "reminder", Data: n.P})
+		}
 	}
 }
 

@@ -1638,6 +1638,7 @@ func writeSSE(w *bufio.Writer, m realtime.Message) error {
 //   - event "state":        JMAP StateChange for the caller's own account
 //   - event "availability": busy/free status of teammates who share availability with the caller
 //   - event "shares":       a share involving the caller changed; re-read the share lists
+//   - event "reminder":     a meeting countdown (15/10/5/0 min) is due; show it as a notification
 //   - event "resync":       events may have been missed; refetch everything
 func (h *Handler) EventSource(c *fiber.Ctx) error {
 	tenantID := c.Locals("tenant_id").(int)

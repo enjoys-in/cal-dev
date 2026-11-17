@@ -22,7 +22,6 @@ import (
 	"github.com/enjoys-in/cal-dev/internal/jmap"
 	"github.com/enjoys-in/cal-dev/internal/jobs"
 	"github.com/enjoys-in/cal-dev/internal/middleware"
-	"github.com/enjoys-in/cal-dev/internal/publisher"
 	"github.com/enjoys-in/cal-dev/internal/realtime"
 	"github.com/enjoys-in/cal-dev/internal/response"
 	"github.com/enjoys-in/cal-dev/internal/scheduling"
@@ -112,8 +111,7 @@ func main() {
 
 	// Initialize services
 	authSvc := auth.NewService(db, &cfg.Auth)
-	mailPub := publisher.New(jobQueue.Client())
-	schedulingSvc := scheduling.NewService(db, jobQueue, mailPub)
+	schedulingSvc := scheduling.NewService(db, jobQueue)
 	schedulingSvc.SetSecrets(cfg.Auth.JWTSecret, cfg.Server.PublicURL())
 	if c := airsend.New(cfg.Airsend.InternalURL, cfg.Airsend.Token, cfg.Airsend.Secret, cfg.Airsend.Timeout); c != nil {
 		schedulingSvc.SetAirsendClient(c)

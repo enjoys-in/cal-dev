@@ -16,26 +16,24 @@ import (
 	"github.com/enjoys-in/cal-dev/internal/ics"
 	"github.com/enjoys-in/cal-dev/internal/jobs"
 	"github.com/enjoys-in/cal-dev/internal/models"
-	"github.com/enjoys-in/cal-dev/internal/publisher"
 	"github.com/enjoys-in/cal-dev/internal/smtp"
 	"github.com/enjoys-in/cal-dev/internal/store"
 	"github.com/google/uuid"
 )
 
 // Service implements RFC 6638 scheduling.
-// Supports direct delivery via Calendar BYO SMTP, with fallback to Redis Pub/Sub.
+// Supports direct delivery via Calendar BYO SMTP, with fallback to airsend-api for internal accounts.
 type Service struct {
 	store         *store.Store
 	queue         *jobs.Queue
-	publisher     *publisher.Publisher
-	airsend       *airsend.Client // internal accounts' calendar mail via airsend-api (nil = off)
+	airsend      *airsend.Client // internal accounts' calendar mail via airsend-api (nil = off)
 	jwtSecret     string
 	publicBaseURL string
 }
 
 // NewService creates a new scheduling service.
-func NewService(s *store.Store, q *jobs.Queue, pub *publisher.Publisher) *Service {
-	return &Service{store: s, queue: q, publisher: pub}
+func NewService(s *store.Store, q *jobs.Queue) *Service {
+	return &Service{store: s, queue: q}
 }
 
 // SetSecrets sets encryption secrets and public URL for web RSVP links.
@@ -311,7 +309,7 @@ func (svc *Service) rsvpLinks(msg *models.SchedulingMessage, event *models.Event
 }
 
 // HandleSendEmailJob is the worker handler for send_scheduling_email jobs.
-// It prioritizes calendar BYO SMTP when configured, falling back to Redis Pub/Sub for managed mode.
+// It prioritizes calendar BYO SMTP when configured, falling back to airsend-api for internal accounts.
 func (svc *Service) HandleSendEmailJob(ctx context.Context, job *jobs.Job) error {
 	payload, err := jobs.ParsePayload[jobs.SchedulingEmailPayload](job)
 	if err != nil {

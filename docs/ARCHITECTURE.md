@@ -1,6 +1,6 @@
 # CalDev Architecture Specification
 
-CalDev is a high-performance, RFC-compliant calendar server written in Go (using Fiber), backed by PostgreSQL for persistence and Valkey (Redis-compatible) for job queues and real-time pub/sub notifications.
+CalDev is a high-performance, RFC-compliant calendar server written in Go (using Fiber), backed by PostgreSQL for persistence and Valkey (Redis-compatible) for job queues. Live updates and reminders go to clients over SSE.
 
 ---
 
@@ -40,8 +40,8 @@ CalDev is a high-performance, RFC-compliant calendar server written in Go (using
 │ sync_changes           │               │  - Periodic 1h Window Sweeps    │
 │ reminder_deliveries        │               │  - Scheduling Email Generation  │
 │ scheduling_messages        │               ├─────────────────────────────────┤
-│ calendar_subscriptions          │               │ Pub/Sub Channels:               │
-│ public.mail_accounts (shared) │               │  - `calendar:push` (Realtime)   │
+│ calendar_subscriptions          │               │ Reminders: Postgres NOTIFY →    │
+│ public.mail_accounts (shared) │               │  SSE `reminder` event           │
 └───────────────────────────────┘               │  (mail: HTTP to airsend-api)    │
                                                 └────────────────┬────────────────┘
                                                                  │
@@ -119,8 +119,9 @@ Event Created / Updated ─────────────┼────�
                       │  1. Re-read the event: skip if gone,         │
                       │     cancelled, moved, or recipient declined  │
                       │  2. Claim reminder_deliveries (DEDUP) │
-                      │  3. Publish to Redis `calendar:push` channel │
-                      │     (claim released on failure → retried)    │
+                      │  3. NOTIFY → SSE `reminder` event to the     │
+                      │     user's open streams (claim released on   │
+                      │     failure → retried)                       │
                       └──────────────────────────────────────────────┘
 ```
 
@@ -167,7 +168,7 @@ writable calendar without email.                                 │
                 │                                                ▼
                 ▼                                   Job queue (Valkey), then:
 Enrolls in Server Reminders                         calendar SMTP, or a signed HTTP call
-via `calendar:push` channel.                        to airsend-api (/api/v1/internal/calendar/mail)
+(reminders arrive as SSE events).                   to airsend-api (/api/v1/internal/calendar/mail)
                                                                  │
                                                                  ▼
                                                     Airsend mail service
