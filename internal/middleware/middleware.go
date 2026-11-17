@@ -504,8 +504,10 @@ var customOrigins = sync.OnceValue(func() map[string]bool {
 })
 
 var isDevServer = sync.OnceValue(func() bool {
+	// A server is "dev" only when its public URL is explicitly a local one; unset means the
+	// production default (https://calender.airsend.in).
 	u := os.Getenv("CALDEV_PUBLIC_URL")
-	return u == "" || strings.Contains(u, "://localhost") || strings.Contains(u, "://127.0.0.1")
+	return strings.Contains(u, "://localhost") || strings.Contains(u, "://127.0.0.1")
 })
 
 // secretEqual compares a supplied secret with the expected one in constant time.

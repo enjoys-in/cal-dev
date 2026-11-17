@@ -42,7 +42,7 @@ Supports Apple Calendar, Thunderbird, Google Calendar interop, and modern JMAP c
 │ caldev_scheduling_msgs        │               ├─────────────────────────────────┤
 │ caldev_subscriptions          │               │ Pub/Sub Channels:               │
 │ public.mail_accounts (shared) │               │  - `calendar:push` (Realtime)   │
-└───────────────────────────────┘               │  - `calendar:mail` (SMTP Relay) │
+└───────────────────────────────┘               │  (mail: HTTP to airsend-api)    │
                                                 └────────────────┬────────────────┘
                                                                  │
                                                                  ▼
@@ -64,7 +64,6 @@ Comprehensive guides for development, architecture, and client/service integrati
 | [**Full API Reference**](docs/API_REFERENCE.md) | Complete endpoint specifications, data models, app passwords, subscriptions, and error codes. |
 | [**UI Integration Guide**](docs/UI_GUIDE.md) | Complete frontend manual: sign-in, JMAP calls, recurrence overrides, free/busy, and SSE stream. |
 | [**API Guide**](API_GUIDE.txt) | Detailed reference for REST, JMAP, and WebDAV routes and payloads. |
-| [**Backend Guide**](BACKEND_GUIDE.txt) | Architectural rules and conventions for Go backend development. |
 
 ## Key Features
 
@@ -73,7 +72,7 @@ Comprehensive guides for development, architecture, and client/service integrati
 - **Recurrence & Series Engine** — Full RFC 5545 recurrence (`FREQ`, `INTERVAL`, `COUNT`, `UNTIL`, `BYDAY`, `EXDATE`, `RDATE`) with single-occurrence modifications and cancellations (`RECURRENCE-ID` overrides)
 - **Server-Side Background Reminders** — Built-in background daemon evaluating upcoming events in a strict 24-hour window $[NOW(), NOW() + 24\text{ hours}]$, scheduling countdown milestone alerts (15m, 10m, 5m, 0m) via Redis `calendar:push`
 - **Dual Sweeper & Triggering** — 1-hour periodic safety sweep ticker + instant on-demand scheduling when events are created or updated
-- **Attendee Fan-Out & Role Demarcation** — Local attendees get meetings directly in their calendar via `deliverLocal`; external attendees have `.ics` invites dispatched via Redis `calendar:mail` for SMTP delivery
+- **Attendee Fan-Out & Role Demarcation** — Local attendees get meetings directly in their calendar via `deliverLocal`; external attendees have `.ics` invites sent through the calendar's own SMTP, or through airsend-api (signed HTTP) for Airsend accounts
 - **1 Calendar Per Email** — Enforces single-calendar-per-account architecture with onboarding ("Start Using Calendar") and customizable feature settings
 - **Multi-tenant** — Full tenant isolation; `mail_accounts.id` serves as both user ID and tenant ID
 - **Own accounts** — `caldev.mail_accounts`: Airsend mailboxes are copied in (same id and email) on first use while the calendar is enabled; external accounts exist only there. `public.mail_accounts` is read, never written
@@ -110,7 +109,7 @@ cal-dev/
 │   │   └── worker.go            # Worker pool with 1h maintenance sweep & retry
 │   ├── middleware/middleware.go  # Security, rate limiting, CORS, auth
 │   ├── models/models.go         # Domain models
-│   ├── publisher/               # Redis Pub/Sub publisher (calendar:push, calendar:mail)
+│   ├── publisher/               # Redis Pub/Sub publisher (calendar:push reminders)
 │   ├── realtime/                # SSE stream (/jmap/eventsource)
 │   ├── recurrence/              # Series expansion & RECURRENCE-ID overrides
 │   ├── scheduling/              # RFC 6638 fan-out, deliverLocal, & reminder scheduler
@@ -487,7 +486,7 @@ Detailed API specifications, endpoint payloads, data models, and UI integration 
 
 - [**Full API Reference**](docs/API_REFERENCE.md) — Endpoint specifications, JSON request/response structures, data models, query parameters, and error responses.
 - [**UI Integration Guide**](docs/UI_GUIDE.md) — Step-by-step frontend guide covering JMAP invocations, recurrence overrides, team free/busy availability, and real-time SSE updates.
-- [**Integration Guide**](docs/INTEGRATION_GUIDE.md) — External mail relay (Redis `calendar:mail`), push notification daemon (`calendar:push`), and CalDAV client setup.
+- [**Integration Guide**](docs/INTEGRATION_GUIDE.md) — Reminder push channel, push notification daemon (`calendar:push`), and CalDAV client setup.
 - [**Architecture Specification**](docs/ARCHITECTURE.md) — System topology, background reminders daemon, and database table schemas.
 
 ## License

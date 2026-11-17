@@ -298,3 +298,49 @@ func (s *Store) SetAccountStatus(ctx context.Context, id int, status string) err
 	}
 	return nil
 }
+
+// SearchPeople lists the active accounts viewer would pick from when inviting guests: people of
+// the viewer's own organisation (same tenant name or same email domain), matched on the start of
+// their email or name (or any part of the name). An empty q lists the first people alphabetically.
+// The viewer is not in the list.
+func (s *Store) SearchPeople(ctx context.Context, viewer *models.User, q string, limit int) ([]*models.User, error) {
+	if viewer == nil {
+		return nil, nil
+	}
+	if limit <= 0 || limit > 50 {
+		limit = 10
+	}
+	domain := ""
+	if at := strings.LastIndex(viewer.Email, "@"); at >= 0 {
+		domain = strings.ToLower(viewer.Email[at+1:])
+	}
+	tenant := strings.ToLower(strings.TrimSpace(viewer.TenantName))
+	if tenant == "" && domain == "" {
+		return nil, nil // nothing to scope the search to: never list everyone
+	}
+	like := strings.NewReplacer(`\`, `\`, `%`, `\%`, `_`, `\_`).Replace(strings.ToLower(strings.TrimSpace(q)))
+
+	rows, err := s.db.QueryContext(ctx, `SELECT `+userColumns+` FROM mail_accounts
+		WHERE id <> $1
+		  AND upper(COALESCE(status, 'ACTIVE')) = 'ACTIVE'
+		  AND ( ($2::text <> '' AND lower(tenant_name) = $2::text)
+		     OR ($3::text <> '' AND lower(split_part(email, '@', 2)) = $3::text) )
+		  AND ( $4::text = ''
+		     OR lower(email) LIKE $4::text || '%' ESCAPE '\'
+		     OR lower(name) LIKE '%' || $4::text || '%' ESCAPE '\' )
+		ORDER BY lower(COALESCE(NULLIF(name, ''), email)), email
+		LIMIT $5`, viewer.ID, tenant, domain, like, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*models.User
+	for rows.Next() {
+		u, err := scanUser(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, u)
+	}
+	return out, rows.Err()
+}

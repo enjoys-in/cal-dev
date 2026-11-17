@@ -369,7 +369,7 @@ func parseAllEvents(rawICS string, tenantID, userID int, calendarID string) ([]*
 
 		// Assemble full raw_ics containing master + all overrides
 		var fullICS strings.Builder
-		fullICS.WriteString("BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//CalDev//CalDAV Server//EN\r\n")
+		fullICS.WriteString("BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:" + ics.ProdID + "\r\n")
 		if g.masterBlock != "" {
 			fullICS.WriteString(g.masterBlock)
 		}

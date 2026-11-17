@@ -37,48 +37,16 @@ services:
       - caldev_net
     ports:
       - "8443:8443"
+    # All settings come from the .env file next to this compose file (see .env.example):
+    # database, auth, CALDEV_PUBLIC_URL, AIRSEND_INTERNAL_*, worker, ...
+    # (the image does not contain .env; compose injects it)
+    env_file:
+      - .env
+    # Only what must differ inside the container network. These win over .env.
     environment:
       SERVER_HOST: "0.0.0.0"
-      SERVER_PORT: "8443"
-      
-      # ============================================================
-      # External PostgreSQL Configuration
-      # Please update these to point to your existing PostgreSQL DB
-      # ============================================================
-      DB_HOST: "${DB_HOST:-host.docker.internal}" # Update with your external postgres host
-      DB_PORT: "${DB_PORT:-5432}"
-      DB_USER: "${DB_USER:-caldev}"
-      DB_PASSWORD: "${DB_PASSWORD:-caldev}"
-      DB_NAME: "${DB_NAME:-caldev}"
-      DB_SCHEMA: "${DB_SCHEMA:-caldev}"
-      DB_SSLMODE: disable
-      DB_MAX_OPEN_CONNS: "50"
-      DB_MAX_IDLE_CONNS: "10"
-      
-      # Valkey (Redis-compatible)
-      REDIS_URL: "redis://valkey:6379/0" # Connects internally via caldev_net network
-      
-      # Auth — use same JWT secret & issuer as your mail/other services
-      AUTH_JWT_SECRET: "${AUTH_JWT_SECRET:?set AUTH_JWT_SECRET in .env}" # never hard-code: shared with the mail services
-      AUTH_JWT_ISSUER: ENJOYS
-      AUTH_BASIC_ENABLED: "true"
-      
-      # Admin API key for user provisioning
-      ADMIN_API_KEY: "${ADMIN_API_KEY:-caldev-admin-secret-key-change-me}"
-      
-      # App header validation
-      APP_API_KEY: "${APP_API_KEY:-}"
-      APP_NAME: "AirSend"
-      APP_VERSION: "1.0.0"
-      APP_SIGNATURE: "${APP_SIGNATURE:-}"
-      
-      # Worker
-      WORKER_CONCURRENCY: "4"
-      WORKER_QUEUE_PREFIX: "caldev:jobs"
-      WORKER_RETRY_MAX: "3"
-      
-      # Server
-      TLS_ENABLED: "false"
+      SERVER_PORT: "8443"                  # matches the port mapping above
+      REDIS_URL: "redis://valkey:6379/0"   # the valkey service on caldev_net
     depends_on:
       valkey:
         condition: service_healthy

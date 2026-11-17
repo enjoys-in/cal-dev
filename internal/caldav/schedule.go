@@ -40,7 +40,7 @@ func pathMatchesUser(path string, tenantID, userID int) bool {
 // writeVFreeBusy renders busy intervals as a VCALENDAR/VFREEBUSY object.
 func writeVFreeBusy(from, to time.Time, intervals []availability.Interval, organizer, attendee string) string {
 	var b strings.Builder
-	b.WriteString("BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//CalDev//CalDAV Server//EN\r\nMETHOD:REPLY\r\nBEGIN:VFREEBUSY\r\n")
+	b.WriteString("BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:" + ics.ProdID + "\r\nMETHOD:REPLY\r\nBEGIN:VFREEBUSY\r\n")
 	b.WriteString(fmt.Sprintf("UID:%s@caldev\r\n", uuid.New().String()))
 	b.WriteString(fmt.Sprintf("DTSTAMP:%s\r\n", time.Now().UTC().Format(fbTimeFormat)))
 	if organizer != "" {

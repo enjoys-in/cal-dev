@@ -153,31 +153,15 @@ for msg in pubsub.listen():
 
 ---
 
-### 3.2 Outbound Email Invitations: `calendar:mail`
-CalDev does not maintain direct outbound SMTP connections. Instead, it generates RFC 5545 `.ics` MIME scheduling envelopes and publishes them to `calendar:mail`.
+### 3.2 Outbound Email Invitations
 
-**Channel**: `calendar:mail`
+CalDev does not use Redis for email. For every guest it creates one message (`scheduling_messages`) and sends it, in this order:
 
-**Payload Schema**:
-```json
-{
-  "message_id": "msg-8812c",
-  "tenant_id": 1,
-  "sender_id": 42,
-  "organizer_email": "organizer@example.com",
-  "recipient_email": "external-client@clientdomain.com",
-  "event_uid": "7c3a41b2-1094-4b52-b883-82ffab181041",
-  "method": "REQUEST",
-  "subject": "Invitation: Team Sprint Review @ Mon Nov 16 10:00 UTC",
-  "raw_ics": "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Enjoys//CalDev//EN\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\nUID:7c3a41b2-1094-4b52-b883-82ffab181041\r\n...",
-  "created_at": "2026-11-15T15:00:00Z"
-}
-```
+1. **The calendar's own SMTP** (BYO), when configured and active.
+2. **airsend-api** for internal Airsend accounts: a signed `POST` to `AIRSEND_INTERNAL_URL` (`https://api.airsend.in/api/v1/internal/calendar/mail`), which DKIM-signs, sends and stores the email in the sender's mailbox. The request carries a `Bearer` token (`AIRSEND_INTERNAL_TOKEN`), an HMAC signature (`AIRSEND_INTERNAL_SECRET`) and the message id as idempotency key. A failure is retried after 5m, 10m, 15m, 25m and 1h, then the message is marked `failed`.
+3. Neither available: the message is marked `unconfigured_smtp`.
 
-**How External SMTP Services Consume This**:
-1. Listen on `calendar:mail`.
-2. Wrap `raw_ics` into a multipart MIME email with `Content-Type: text/calendar; method=REQUEST; charset=UTF-8`.
-3. Dispatch via postfix, Haraka, or cloud SMTP relay.
+Each email carries the `.ics` (`METHOD:REQUEST`, `CANCEL` or `REPLY`) and, for invitations, per-guest RSVP links on `CALDEV_PUBLIC_URL`.
 
 ---
 

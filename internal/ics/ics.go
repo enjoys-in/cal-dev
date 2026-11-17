@@ -15,6 +15,9 @@ import (
 	"github.com/google/uuid"
 )
 
+// ProdID identifies Airsend Calendar as the producer of every .ics it generates (RFC 5545 PRODID).
+const ProdID = "-//Airsend//Calendar//EN"
+
 // Common ICS date-time formats.
 const (
 	ICSDateTimeUTC   = "20060102T150405Z"
@@ -71,7 +74,7 @@ func splitComponents(lines []string) []component {
 // wrapComponent renders a single component as a standalone calendar object.
 func wrapComponent(c component) string {
 	var b strings.Builder
-	b.WriteString("BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//CalDev//CalDAV Server//EN\r\n")
+	b.WriteString("BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:" + ProdID + "\r\n")
 	b.WriteString("BEGIN:" + c.kind + "\r\n")
 	for _, l := range c.lines {
 		b.WriteString(l + "\r\n")
@@ -372,7 +375,7 @@ func GenerateICS(e *models.Event) string {
 func writeCalendarHeader(b *strings.Builder) {
 	b.WriteString("BEGIN:VCALENDAR\r\n")
 	b.WriteString("VERSION:2.0\r\n")
-	b.WriteString("PRODID:-//CalDev//CalDAV Server//EN\r\n")
+	b.WriteString("PRODID:" + ProdID + "\r\n")
 	b.WriteString("CALSCALE:GREGORIAN\r\n")
 }
 
@@ -583,7 +586,7 @@ func GenerateSchedulingICS(e *models.Event, method string) string {
 	var b strings.Builder
 	b.WriteString("BEGIN:VCALENDAR\r\n")
 	b.WriteString("VERSION:2.0\r\n")
-	b.WriteString("PRODID:-//CalDev//CalDAV Server//EN\r\n")
+	b.WriteString("PRODID:" + ProdID + "\r\n")
 	b.WriteString(fmt.Sprintf("METHOD:%s\r\n", method))
 	b.WriteString("CALSCALE:GREGORIAN\r\n")
 

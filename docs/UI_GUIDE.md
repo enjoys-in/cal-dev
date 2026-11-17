@@ -68,7 +68,7 @@ plus `x-api-key` and `x-signature` if the deployment configures them. Without th
 
 ### CORS
 
-Allowed origins: `https://airsend.in`, `https://calender.airsend.in`, a fixed list of local dev ports (3000, 3001, 9500, 9503), anything in the server's `CORS_ALLOWED_ORIGINS`, and — on a dev server only (no `CALDEV_PUBLIC_URL`, or a localhost one) — any `http(s)://localhost:<port>` / `127.0.0.1:<port>`. Cookies work cross-origin only for those origins.
+Allowed origins: `https://airsend.in`, `https://calender.airsend.in`, a fixed list of local dev ports (3000, 3001, 9500, 9503), anything in the server's `CORS_ALLOWED_ORIGINS`, and — on a dev server only (`CALDEV_PUBLIC_URL` is a localhost one; unset means the default `https://calender.airsend.in`) — any `http(s)://localhost:<port>` / `127.0.0.1:<port>`. Cookies work cross-origin only for those origins.
 
 ### Error shapes
 

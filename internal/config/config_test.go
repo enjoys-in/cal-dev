@@ -67,3 +67,19 @@ func TestSchemaName(t *testing.T) {
 		}
 	}
 }
+
+func TestPublicURLDefaultAndOverride(t *testing.T) {
+	s := &ServerConfig{Port: 8443}
+	t.Setenv("CALDEV_PUBLIC_URL", "")
+	if got := s.PublicURL(); got != "https://calender.airsend.in" {
+		t.Errorf("default = %q", got)
+	}
+	t.Setenv("CALDEV_PUBLIC_URL", "https://cal.example.com/")
+	if got := s.PublicURL(); got != "https://cal.example.com" {
+		t.Errorf("override = %q (trailing slash must go)", got)
+	}
+	t.Setenv("CALDEV_PUBLIC_URL", "  ")
+	if got := s.PublicURL(); got != "https://calender.airsend.in" {
+		t.Errorf("blank = %q", got)
+	}
+}

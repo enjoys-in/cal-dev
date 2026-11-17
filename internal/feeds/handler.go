@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/enjoys-in/cal-dev/internal/ics"
 	"github.com/enjoys-in/cal-dev/internal/models"
 	"github.com/enjoys-in/cal-dev/internal/response"
 	"github.com/enjoys-in/cal-dev/internal/store"
@@ -174,7 +175,7 @@ func buildCalendarICS(cal *models.Calendar, events []*models.Event) string {
 
 	b.WriteString("BEGIN:VCALENDAR\r\n")
 	b.WriteString("VERSION:2.0\r\n")
-	b.WriteString("PRODID:-//CalDev//Calendar//EN\r\n")
+	b.WriteString("PRODID:" + ics.ProdID + "\r\n")
 	b.WriteString("CALSCALE:GREGORIAN\r\n")
 	b.WriteString("METHOD:PUBLISH\r\n")
 	b.WriteString(fmt.Sprintf("X-WR-CALNAME:%s\r\n", escapeICSValue(cal.Name)))
@@ -205,7 +206,7 @@ func buildMergedICS(calendars []*models.Calendar, events []*models.Event) string
 
 	b.WriteString("BEGIN:VCALENDAR\r\n")
 	b.WriteString("VERSION:2.0\r\n")
-	b.WriteString("PRODID:-//CalDev//AllCalendars//EN\r\n")
+	b.WriteString("PRODID:" + ics.ProdID + "\r\n")
 	b.WriteString("CALSCALE:GREGORIAN\r\n")
 	b.WriteString("METHOD:PUBLISH\r\n")
 	b.WriteString("X-WR-CALNAME:All Calendars\r\n")

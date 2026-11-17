@@ -27,7 +27,7 @@ type Config struct {
 // Airsend accounts (mail_accounts.account_origin = 'internal').
 type AirsendConfig struct {
 	// InternalURL is the full route, e.g. https://api.airsend.in/api/v1/internal/calendar/mail.
-	// Empty = off (internal accounts then use the legacy Redis calendar:mail channel).
+	// Empty = off: internal accounts then cannot send invitations (only a calendar's own SMTP can).
 	InternalURL string
 	Token       string        // Authorization: Bearer <Token>
 	Secret      string        // HMAC-SHA256 key for X-Caldev-Signature (separate from Token)
@@ -144,12 +144,17 @@ func (s *ServerConfig) Addr() string {
 	return fmt.Sprintf("%s:%d", s.Host, s.Port)
 }
 
-// PublicURL returns the public base URL of CalDev (from CALDEV_PUBLIC_URL or http://localhost:PORT).
+// DefaultPublicURL is where Airsend Calendar is served. It is used for the links in emails
+// (RSVP), feeds and the JMAP session unless CALDEV_PUBLIC_URL overrides it.
+const DefaultPublicURL = "https://calender.airsend.in"
+
+// PublicURL returns the public base URL of CalDev: CALDEV_PUBLIC_URL, or DefaultPublicURL.
+// For local development set CALDEV_PUBLIC_URL=http://localhost:8443.
 func (s *ServerConfig) PublicURL() string {
-	if u := os.Getenv("CALDEV_PUBLIC_URL"); u != "" {
+	if u := strings.TrimSpace(os.Getenv("CALDEV_PUBLIC_URL")); u != "" {
 		return strings.TrimRight(u, "/")
 	}
-	return fmt.Sprintf("http://localhost:%d", s.Port)
+	return DefaultPublicURL
 }
 
 // Load reads configuration from environment variables with sensible defaults.
@@ -261,9 +266,7 @@ func (c *Config) Validate() (fatal, warnings []string) {
 	if !c.Auth.RequireExp {
 		warnings = append(warnings, "AUTH_REQUIRE_EXP=false: tokens without an expiry are accepted forever")
 	}
-	if u := strings.ToLower(os.Getenv("CALDEV_PUBLIC_URL")); u == "" {
-		warnings = append(warnings, "CALDEV_PUBLIC_URL is not set: links in emails and feeds will point at http://localhost")
-	} else if strings.Contains(u, "://localhost") || strings.Contains(u, "://127.0.0.1") || strings.Contains(u, "://[::1]") {
+	if u := strings.ToLower(os.Getenv("CALDEV_PUBLIC_URL")); u != "" && (strings.Contains(u, "://localhost") || strings.Contains(u, "://127.0.0.1") || strings.Contains(u, "://[::1]")) {
 		warnings = append(warnings, "CALDEV_PUBLIC_URL points at localhost: links in emails and feeds will not work for other people")
 	}
 	if c.Airsend.InternalURL != "" && (c.Airsend.Token == "" || c.Airsend.Secret == "") {

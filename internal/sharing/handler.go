@@ -142,6 +142,55 @@ func (h *Handler) Lookup(c *fiber.Ctx) error {
 	})
 }
 
+// People lists teammates the caller can invite (same organisation) with their free/busy status:
+// GET /api/availability/people?q=ann&start=&end=&limit=10. A person who has not shared their
+// availability with the caller is listed without status (allowed=false), like in Lookup. The
+// window defaults to the next 24 hours; the UI passes the event's own start and end so it can
+// colour the guest red when they are busy exactly then.
+func (h *Handler) People(c *fiber.Ctx) error {
+	viewer, err := h.me(c)
+	if err != nil || viewer == nil {
+		return response.Error(c, 401, "user not found")
+	}
+	from, to, msg := parseWindow(c, 24*time.Hour, maxAvailWindow)
+	if msg != "" {
+		return response.Error(c, 400, msg)
+	}
+	limit := c.QueryInt("limit", 8)
+	people, err := h.store.SearchPeople(c.UserContext(), viewer, c.Query("q"), limit)
+	if err != nil {
+		return response.Error(c, 500, "search failed")
+	}
+
+	now := time.Now()
+	results := make([]availabilityResult, 0, len(people))
+	for _, p := range people {
+		res := availabilityResult{Email: p.Email, Name: p.Name, UserID: p.ID, Busy: []availability.Interval{}}
+		ok, err := h.avail.CanView(c.UserContext(), viewer, p)
+		if err != nil {
+			return response.Error(c, 500, "search failed")
+		}
+		if ok {
+			busy, err := h.avail.Busy(c.UserContext(), p, from, to)
+			if err != nil {
+				return response.Error(c, 500, "search failed")
+			}
+			cur := availability.StatusAt(busy, now)
+			res.Allowed = true
+			res.Current = &cur
+			if busy != nil {
+				res.Busy = busy
+			}
+		}
+		results = append(results, res)
+	}
+	return response.Success(c, "people retrieved", fiber.Map{
+		"start":   from.UTC().Format(time.RFC3339),
+		"end":     to.UTC().Format(time.RFC3339),
+		"results": results,
+	})
+}
+
 // ============================================================
 // Availability shares
 // ============================================================

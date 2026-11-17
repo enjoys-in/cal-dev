@@ -42,7 +42,7 @@ CalDev is a high-performance, RFC-compliant calendar server written in Go (using
 │ scheduling_messages        │               ├─────────────────────────────────┤
 │ calendar_subscriptions          │               │ Pub/Sub Channels:               │
 │ public.mail_accounts (shared) │               │  - `calendar:push` (Realtime)   │
-└───────────────────────────────┘               │  - `calendar:mail` (SMTP Relay) │
+└───────────────────────────────┘               │  (mail: HTTP to airsend-api)    │
                                                 └────────────────┬────────────────┘
                                                                  │
                                                                  ▼
@@ -165,11 +165,12 @@ Automatically creates or updates                 Generates RFC 5545 .ics payload
 event copy in Attendee's default                 and stores in scheduling_messages
 writable calendar without email.                                 │
                 │                                                ▼
-                ▼                                   Publish to Redis:
-Enrolls in Server Reminders                         Channel: `calendar:mail`
-via `calendar:push` channel.                                     │
+                ▼                                   Job queue (Valkey), then:
+Enrolls in Server Reminders                         calendar SMTP, or a signed HTTP call
+via `calendar:push` channel.                        to airsend-api (/api/v1/internal/calendar/mail)
+                                                                 │
                                                                  ▼
-                                                    External SMTP Service
+                                                    Airsend mail service
                                                     Delivers .ics invite email
 ```
 
@@ -180,8 +181,8 @@ via `calendar:push` channel.                                     │
 2. **External Attendees & Dispatch**:
    - CalDev creates an RFC 5545 iMIP payload (`REQUEST`, `REPLY`, or `CANCEL`) and records it in `scheduling_messages`.
    - **Bring Your Own SMTP (BYO SMTP)**: When the event's calendar has an active custom SMTP configuration (`calendar_smtp`), the background worker delivers the invitation directly via the user's custom SMTP server with full SPF, DKIM, and DMARC alignment. Emails are delivered as RFC 5322 MIME multipart messages (quoted-printable text and HTML, RFC 2047-encoded headers, optional `Reply-To`) with RSVP buttons on invitations (`REQUEST` only), and the `.ics` component. Each connection has a 60 s deadline.
-   - **Retries**: a failed send leaves the message `pending` (error recorded) and the job is retried; it is marked `failed` only after the last attempt. Connection or authentication failures mark the calendar's SMTP config `failing`, after which messages use the managed fallback until it is re-tested.
-   - **Managed Fallback**: If no BYO SMTP is configured and managed fallback is active, payloads are published to Redis channel `calendar:mail` for pickup by the centralized mail service.
+   - **Retries**: a failed send leaves the message `pending` (error recorded) and the job is retried; it is marked `failed` only after the last attempt. Connection or authentication failures mark the calendar's SMTP config `failing`, after which the message is sent through Airsend (internal accounts) until it is re-tested.
+   - **Airsend delivery**: for internal Airsend accounts without an active BYO SMTP, the worker makes a signed HTTP call to airsend-api (`AIRSEND_INTERNAL_URL`), which DKIM-signs and sends the mail. A failure is retried after 5m, 10m, 15m, 25m and 1h, then the message is marked `failed`. Without `AIRSEND_INTERNAL_URL` (and no BYO SMTP) the message is marked `unconfigured_smtp`.
    - **Web RSVP**: The email buttons open a public HMAC-signed page (`/api/public/rsvp`). Opening it only shows the choice; the recipient confirms with a button (POST), so link-scanning email security tools can't answer on their behalf. The answer updates the organizer's copy and other local attendees' copies and is pushed in real time.
 3. **Attendee Capacity & Limits**:
    - CalDev enforces an explicit limit of **3,000 attendees / recipients** per event (`MaxAttendeesPerEvent = 3000`).

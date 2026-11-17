@@ -277,6 +277,7 @@ func (q *Queue) RetryAfter(ctx context.Context, job *Job, minWait time.Duration)
 	job.Retries++
 
 	if job.Retries > job.MaxRetry {
+		log.Printf("jobs: %s/%s gave up after %d attempts, moved to dead-letter", job.Type, job.ID, job.Retries)
 		return q.sendToDeadLetter(ctx, job)
 	}
 
@@ -292,6 +293,7 @@ func (q *Queue) RetryAfter(ctx context.Context, job *Job, minWait time.Duration)
 		wait = minWait
 	}
 	score := float64(time.Now().Add(wait).Unix())
+	log.Printf("jobs: %s/%s will retry in %s (retry %d of %d)", job.Type, job.ID, wait.Round(time.Second), job.Retries, job.MaxRetry)
 
 	return q.client.ZAdd(ctx, scheduledKey, redis.Z{
 		Score:  score,

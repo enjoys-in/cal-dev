@@ -52,7 +52,11 @@ func (svc *Service) ProcessEvent(ctx context.Context, event *models.Event, metho
 		return nil // No attendees, nothing to schedule
 	}
 
-	if len(attendees) == 0 || event.Organizer == "" {
+	if len(attendees) == 0 {
+		return nil // no guests: nothing to send (normal)
+	}
+	if event.Organizer == "" {
+		log.Printf("scheduling: event %s has %d guest(s) but no organizer: no invitations sent", event.UID, len(attendees))
 		return nil
 	}
 
@@ -78,21 +82,26 @@ func (svc *Service) ProcessEvent(ctx context.Context, event *models.Event, metho
 		emails = append(emails, attendee.Email)
 	}
 	users := svc.localUsers(ctx, emails) // one lookup for all attendees
+	queued := 0
 	for _, attendee := range attendees {
 		if normEmail(attendee.Email) == organizer {
+			log.Printf("scheduling: event %s: guest %s is the organizer, no email for them", event.UID, attendee.Email)
 			continue // the organizer never invites themselves
 		}
 		// Local attendees get the event in their own calendar straight away...
 		svc.deliverLocal(ctx, event, attendee, method, users)
 		// ...and everyone also gets the standard iMIP email.
-		svc.enqueueMessage(ctx, event, attendee, method)
+		if svc.enqueueMessage(ctx, event, attendee, method) {
+			queued++
+		}
 	}
+	log.Printf("scheduling: event %s (%s): %d of %d guest(s) queued for email", event.UID, method, queued, len(attendees))
 
 	return nil
 }
 
 // enqueueMessage records one scheduling message and queues it for delivery by the mail server.
-func (svc *Service) enqueueMessage(ctx context.Context, event *models.Event, attendee models.Attendee, method string) {
+func (svc *Service) enqueueMessage(ctx context.Context, event *models.Event, attendee models.Attendee, method string) bool {
 	msg := &models.SchedulingMessage{
 		ID:             uuid.New().String(),
 		TenantID:       event.TenantID,
@@ -106,7 +115,7 @@ func (svc *Service) enqueueMessage(ctx context.Context, event *models.Event, att
 
 	if err := svc.store.CreateSchedulingMessage(ctx, msg); err != nil {
 		log.Printf("scheduling: failed to create message for %s: %v", attendee.Email, err)
-		return
+		return false
 	}
 
 	// Enqueue to Valkey for background processing
@@ -117,88 +126,12 @@ func (svc *Service) enqueueMessage(ctx context.Context, event *models.Event, att
 		}
 		if _, err := svc.queue.Enqueue(ctx, jobs.JobSendSchedulingEmail, payload); err != nil {
 			log.Printf("scheduling: failed to enqueue email job for %s: %v", attendee.Email, err)
+			return false
 		}
+		return true
 	}
-}
-
-// SendInvitation publishes a scheduling message to Redis Pub/Sub
-// for the internal mail server to pick up and deliver.
-func (svc *Service) SendInvitation(ctx context.Context, msg *models.SchedulingMessage, event *models.Event) error {
-	if svc.publisher == nil {
-		return fmt.Errorf("publisher not configured")
-	}
-
-	// Determine event type from method
-	eventType := "invitation"
-	switch msg.Method {
-	case "CANCEL":
-		eventType = "cancellation"
-	case "REPLY":
-		eventType = "reply"
-	case "REQUEST":
-		if event != nil && event.Sequence > 0 {
-			eventType = "update"
-		}
-	}
-
-	// Build attendee list from event
-	var attendees []publisher.Attendee
-	if event != nil {
-		var modelAttendees []models.Attendee
-		if err := json.Unmarshal(event.Attendees, &modelAttendees); err == nil {
-			for _, a := range modelAttendees {
-				attendees = append(attendees, publisher.Attendee{
-					Email:       a.Email,
-					DisplayName: a.DisplayName,
-					Role:        a.Role,
-					Status:      a.Status,
-				})
-			}
-		}
-	}
-
-	// Build the mail event payload
-	mailEvt := &publisher.MailEvent{
-		EventType:      eventType,
-		Method:         msg.Method,
-		TenantID:       msg.TenantID,
-		SenderID:       msg.SenderID,
-		RecipientEmail: msg.RecipientEmail,
-		EventUID:       msg.EventUID,
-		RawICS:         msg.RawICS,
-		MessageID:      msg.ID,
-		Attendees:      attendees,
-	}
-
-	// Enrich with event details if available
-	if event != nil {
-		mailEvt.Summary = event.Summary
-		mailEvt.Description = event.Description
-		mailEvt.Location = event.Location
-		mailEvt.DTStart = event.DTStart.Format(time.RFC3339)
-		if event.DTEnd != nil {
-			mailEvt.DTEnd = event.DTEnd.Format(time.RFC3339)
-		}
-		mailEvt.AllDay = event.AllDay
-		mailEvt.Organizer = event.Organizer
-		mailEvt.SenderEmail = event.Organizer
-		if strings.HasPrefix(strings.ToLower(mailEvt.SenderEmail), "mailto:") {
-			mailEvt.SenderEmail = mailEvt.SenderEmail[7:]
-		}
-	}
-
-	// A REPLY is sent by the attendee who answered, not by the organizer.
-	if msg.Method == "REPLY" && msg.SenderID > 0 {
-		if u, err := svc.store.GetUserByID(ctx, msg.SenderID); err == nil && u != nil && u.Email != "" {
-			mailEvt.SenderEmail = u.Email
-		}
-	}
-
-	if msg.Method == "REQUEST" {
-		mailEvt.RSVPAcceptURL, mailEvt.RSVPTentativeURL, mailEvt.RSVPDeclineURL = svc.rsvpLinks(msg, event)
-	}
-
-	return svc.publisher.PublishMailEvent(ctx, mailEvt)
+	log.Printf("scheduling: no job queue: the email to %s stays pending", attendee.Email)
+	return false
 }
 
 // ProcessReply handles an incoming scheduling reply (PARTSTAT update).
@@ -322,7 +255,7 @@ func generateReplyICS(event *models.Event, attendeeEmail, partstat string) strin
 	var b strings.Builder
 	b.WriteString("BEGIN:VCALENDAR\r\n")
 	b.WriteString("VERSION:2.0\r\n")
-	b.WriteString("PRODID:-//CalDev//CalDev 1.0//EN\r\n")
+	b.WriteString("PRODID:" + ics.ProdID + "\r\n")
 	b.WriteString("METHOD:REPLY\r\n")
 	b.WriteString("BEGIN:VEVENT\r\n")
 	b.WriteString(fmt.Sprintf("UID:%s\r\n", event.UID))
@@ -391,8 +324,10 @@ func (svc *Service) HandleSendEmailJob(ctx context.Context, job *jobs.Job) error
 		return fmt.Errorf("fetch pending message: %w", err)
 	}
 	if msg == nil {
+		log.Printf("scheduling: message %s is not pending (already processed or missing), nothing to send", payload.MessageID)
 		return nil // message not found or already processed
 	}
+	log.Printf("scheduling: sending %s to %s for event %s (job attempt %d)", msg.Method, msg.RecipientEmail, msg.EventUID, job.Retries+1)
 
 	// Fetch the event for enriching the mail payload
 	var event *models.Event
@@ -422,6 +357,7 @@ func (svc *Service) HandleSendEmailJob(ctx context.Context, job *jobs.Job) error
 	//    5m/10m/15m/25m/1h). External accounts (CalDev-only) have no Airsend mailbox to send from.
 	if svc.airsend != nil {
 		internal, err := svc.isInternalSender(ctx, msg)
+		log.Printf("scheduling: %s → sender account %d is %s", msg.ID, senderAccountID(msg), map[bool]string{true: "internal: sending through airsend-api", false: "not internal"}[internal])
 		if err != nil {
 			svc.recordSendFailure(ctx, job, msg, err)
 			return err
@@ -435,19 +371,8 @@ func (svc *Service) HandleSendEmailJob(ctx context.Context, job *jobs.Job) error
 		return nil
 	}
 
-	// 3. Legacy: managed mail server via Redis Pub/Sub (only when AIRSEND_INTERNAL_URL is not set)
-	if svc.publisher != nil {
-		if err := svc.SendInvitation(ctx, msg, event); err != nil {
-			svc.recordSendFailure(ctx, job, msg, err)
-			return fmt.Errorf("publish for %s: %w", msg.RecipientEmail, err)
-		}
-		svc.store.UpdateSchedulingMessageStatus(ctx, msg.ID, "sent", "")
-		log.Printf("scheduling: published %s for %s → event %s", msg.Method, msg.RecipientEmail, msg.EventUID)
-		return nil
-	}
-
-	// 4. Neither BYO SMTP nor managed mail service is configured
-	errMsg := "Calendar has no SMTP configured and managed fallback is disabled"
+	// 3. No way to send: no BYO SMTP, and Airsend delivery is not configured (AIRSEND_INTERNAL_URL)
+	errMsg := "Calendar has no SMTP configured and Airsend delivery is off (set AIRSEND_INTERNAL_URL, AIRSEND_INTERNAL_TOKEN and AIRSEND_INTERNAL_SECRET)"
 	svc.store.UpdateSchedulingMessageStatus(ctx, msg.ID, "unconfigured_smtp", errMsg)
 	log.Printf("scheduling: skipping delivery for %s: %s", msg.RecipientEmail, errMsg)
 	return nil

@@ -118,6 +118,8 @@ func main() {
 	if c := airsend.New(cfg.Airsend.InternalURL, cfg.Airsend.Token, cfg.Airsend.Secret, cfg.Airsend.Timeout); c != nil {
 		schedulingSvc.SetAirsendClient(c)
 		log.Printf("Calendar emails of internal accounts go to airsend-api (%s)", cfg.Airsend.InternalURL)
+	} else {
+		log.Printf("WARNING: AIRSEND_INTERNAL_URL is not set (check that docker-compose passes it): invitation emails of Airsend accounts cannot be sent; only calendars with their own SMTP can send")
 	}
 	syncSvc := extsync.NewService(db, jobQueue)
 
@@ -152,11 +154,9 @@ func main() {
 	// Initialize handlers
 	caldavHandler := caldav.NewHandler(db, schedulingSvc)
 	caldavHandler.SetAvailability(availSvc)
-	// Advertised in the JMAP session (apiUrl, eventSourceUrl): must be the public URL in production.
+	// Advertised in the JMAP session (apiUrl, eventSourceUrl): the public URL (CALDEV_PUBLIC_URL, or
+	// https://calender.airsend.in by default).
 	baseURL := cfg.Server.PublicURL()
-	if os.Getenv("CALDEV_PUBLIC_URL") == "" && cfg.TLS.Enabled {
-		baseURL = "https://localhost:" + fmt.Sprintf("%d", cfg.Server.Port)
-	}
 	jmapHandler := jmap.NewHandler(db, baseURL, schedulingSvc)
 	jmapHandler.SetRealtime(rtHub)
 	jmapHandler.SetAvailability(availSvc)
@@ -270,6 +270,7 @@ func main() {
 	// Free/busy of teammates who shared with you: GET /api/availability?emails=a@x,b@x&start=&end=
 	availGroup := app.Group("/api/availability", middleware.JMAPAuth(authSvc, db))
 	availGroup.Get("/", sharingHandler.Lookup)
+	availGroup.Get("/people", sharingHandler.People)
 	availGroup.Get("/shares", sharingHandler.ListAvailabilityShares)
 	availGroup.Post("/shares", sharingHandler.CreateAvailabilityShare)
 	availGroup.Delete("/shares/:user_id", sharingHandler.DeleteAvailabilityShare)

@@ -25,7 +25,7 @@ All authenticated requests set `user_id`, `tenant_id`, and `email` in the reques
 
 ## 2. CORS
 
-CORS headers (with credentials) are returned only for allowed origins: `https://airsend.in`, `https://calender.airsend.in`, a fixed list of local dev ports, anything in `CORS_ALLOWED_ORIGINS`, and — only in dev (no `CALDEV_PUBLIC_URL`, or a localhost one) — any `http(s)://localhost:<port>` / `127.0.0.1:<port>`.
+CORS headers (with credentials) are returned only for allowed origins: `https://airsend.in`, `https://calender.airsend.in`, a fixed list of local dev ports, anything in `CORS_ALLOWED_ORIGINS`, and — only in dev (`CALDEV_PUBLIC_URL` is a localhost one; unset means the default `https://calender.airsend.in`) — any `http(s)://localhost:<port>` / `127.0.0.1:<port>`.
 ```
 Access-Control-Allow-Origin: <the request's Origin>
 Access-Control-Allow-Credentials: true
