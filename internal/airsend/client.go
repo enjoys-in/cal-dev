@@ -93,7 +93,7 @@ type RSVP struct {
 // CalendarMail is the v1 request body of POST /internal/calendar/mail.
 type CalendarMail struct {
 	Version   int    `json:"version"`
-	MessageID string `json:"message_id"` // caldev_scheduling_messages.id — idempotency key
+	MessageID string `json:"message_id"` // scheduling_messages.id — idempotency key
 	Type      string `json:"type"`       // invitation | update | cancellation | reply
 	Method    string `json:"method"`     // REQUEST | CANCEL | REPLY
 	TenantID  int    `json:"tenant_id"`

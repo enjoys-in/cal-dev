@@ -18,6 +18,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -121,12 +122,21 @@ func TestCaldevSchemaAndAccounts(t *testing.T) {
 	if applied, err := s.IsMigrationApplied("migrations/008_mail_accounts_email_lower.sql"); err != nil || !applied {
 		t.Fatalf("migration history lost after the move: applied=%v err=%v", applied, err)
 	}
-	b, err := os.ReadFile(filepath.Join("..", "..", "migrations", "010_caldev_mail_accounts.sql"))
-	if err != nil {
-		t.Fatal(err)
+	for _, f := range []string{"009_drop_table_prefix.sql", "010_caldev_mail_accounts.sql"} {
+		b, err := os.ReadFile(filepath.Join("..", "..", "migrations", f))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.RunMigration(string(b)); err != nil {
+			t.Fatalf("migration %s: %v", f, err)
+		}
 	}
-	if err := s.RunMigration(string(b)); err != nil {
-		t.Fatalf("migration 010: %v", err)
+	// no table keeps the old prefix inside the schema
+	var prefixed int
+	s.db.QueryRow(`SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname = 'caldev' AND c.relkind = 'r' AND c.relname LIKE 'caldev\_%'`).Scan(&prefixed)
+	if prefixed != 0 {
+		t.Fatalf("%d tables still prefixed in schema caldev", prefixed)
 	}
 
 	var leftInPublic, events int
@@ -135,7 +145,7 @@ func TestCaldevSchemaAndAccounts(t *testing.T) {
 	if leftInPublic != 0 {
 		t.Fatalf("%d CalDev objects still in public", leftInPublic)
 	}
-	s.db.QueryRow(`SELECT count(*) FROM caldev.caldev_events`).Scan(&events)
+	s.db.QueryRow(`SELECT count(*) FROM caldev.events`).Scan(&events)
 	if events != 1 {
 		t.Fatalf("events after move = %d, want 1", events)
 	}
@@ -208,8 +218,21 @@ func TestCaldevSchemaAndAccounts(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer other.Close()
-	mustExec(t, other, `INSERT INTO caldev.caldev_events (tenant_id, user_id, calendar_id, uid, summary, dtstart, etag, raw_ics)
+	before := countChanges(t, other)
+	mustExec(t, other, `INSERT INTO caldev.events (tenant_id, user_id, calendar_id, uid, summary, dtstart, etag, raw_ics)
 		VALUES (1, 1, '11111111-1111-1111-1111-111111111111', 'ev-2@caldev', 'Review', now(), 'e2', 'BEGIN:VCALENDAR')`)
+	if after := countChanges(t, other); after <= before {
+		t.Fatalf("change-log trigger did not run after the rename (sync_changes %d → %d)", before, after)
+	}
+}
+
+func countChanges(t *testing.T, db *sql.DB) int {
+	t.Helper()
+	var n int
+	if err := db.QueryRow(`SELECT count(*) FROM caldev.sync_changes`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
 }
 
 func mustExec(t *testing.T, db *sql.DB, q string) {
@@ -232,5 +255,136 @@ func expectStatus(t *testing.T, s *Store, id int, status string) {
 	u, _ := s.GetUserByID(context.Background(), id)
 	if u == nil || u.Status != status {
 		t.Fatalf("user %d status: %+v, want %s", id, u, status)
+	}
+}
+
+// TestFullInitThenServerStartup: a database built from the raw schema/full_init.sql (no migration
+// history) must start cleanly — the original migrations are skipped, not run on top of it — and a
+// brand-new empty database must reach the same tables through the migrations.
+func TestFullInitThenServerStartup(t *testing.T) {
+	raw := os.Getenv("CALDEV_TEST_DATABASE_URL")
+	if raw == "" {
+		t.Skip("CALDEV_TEST_DATABASE_URL not set")
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	admin, err := sql.Open("postgres", raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer admin.Close()
+
+	migrationFiles := []string{
+		"migrations/001_init.sql", "migrations/002_sharing_realtime.sql", "migrations/003_recurrence_overrides.sql",
+		"migrations/004_reminders.sql", "migrations/005_calendar_byo_smtp.sql", "migrations/006_change_log_fixes.sql",
+		"migrations/007_onboarding_api_keys.sql", "migrations/008_mail_accounts_email_lower.sql",
+		"migrations/009_drop_table_prefix.sql", "migrations/010_caldev_mail_accounts.sql",
+	}
+	read := func(f string) ([]byte, error) { return os.ReadFile(filepath.Join("..", "..", f)) }
+	quiet := func(string, ...any) {}
+
+	newDB := func(prefix string) (*Store, *sql.DB, func()) {
+		name := fmt.Sprintf("%s_%d", prefix, time.Now().UnixNano())
+		if _, err := admin.Exec("CREATE DATABASE " + name); err != nil {
+			t.Fatal(err)
+		}
+		du := *u
+		du.Path = "/" + name
+		plain, err := sql.Open("postgres", du.String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		port, _ := strconv.Atoi(u.Port())
+		pass, _ := u.User.Password()
+		s, err := New(&config.DatabaseConfig{Host: u.Hostname(), Port: port, User: u.User.Username(), Password: pass,
+			DBName: name, SSLMode: "disable", Schema: "caldev", MaxOpenConns: 4, MaxIdleConns: 2})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return s, plain, func() {
+			s.Close()
+			plain.Close()
+			admin.Exec("DROP DATABASE IF EXISTS " + name + " WITH (FORCE)")
+		}
+	}
+	tableNames := func(s *Store) map[string]bool {
+		rows, err := s.db.Query(`SELECT relname FROM pg_class WHERE relnamespace = 'caldev'::regnamespace AND relkind = 'r'`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rows.Close()
+		out := map[string]bool{}
+		for rows.Next() {
+			var n string
+			rows.Scan(&n)
+			out[n] = true
+		}
+		return out
+	}
+
+	// the raw file carries no migration bookkeeping
+	sqlText, err := os.ReadFile(filepath.Join("..", "..", "schema", "full_init.sql"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(sqlText), "schema_migrations") {
+		t.Fatal("full_init.sql must not contain the migration history table")
+	}
+
+	// ── A: raw full_init.sql, then the server's startup ──
+	s, plain, done := newDB("caldev_fi")
+	defer done()
+	mustExec(t, plain, string(sqlText))
+	if names := tableNames(s); names["schema_migrations"] {
+		t.Fatal("full_init.sql created a migration history table")
+	}
+	for i := 0; i < 2; i++ { // twice: the second start changes nothing
+		if err := s.PrepareSchema("caldev"); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.ApplyMigrations(migrationFiles, migrationFiles[:8], read, quiet); err != nil {
+			t.Fatalf("startup #%d on a full_init database: %v", i+1, err)
+		}
+	}
+	names := tableNames(s)
+	for n := range names {
+		if strings.HasPrefix(n, "caldev_") {
+			t.Fatalf("a prefixed table %q appeared: the original migrations ran on a built schema", n)
+		}
+	}
+	var recorded int
+	s.db.QueryRow(`SELECT count(*) FROM schema_migrations`).Scan(&recorded)
+	if recorded != 10 {
+		t.Fatalf("migrations recorded = %d, want 10 (8 baseline + 009 + 010)", recorded)
+	}
+	mustExec(t, plain, `INSERT INTO caldev.calendars (id, tenant_id, user_id, name) VALUES ('33333333-3333-3333-3333-333333333333', 1, 1, 'c')`)
+	before := countChanges(t, plain)
+	mustExec(t, plain, `INSERT INTO caldev.events (tenant_id, user_id, calendar_id, uid, summary, dtstart, etag, raw_ics)
+		VALUES (1, 1, '33333333-3333-3333-3333-333333333333', 'x@y', 's', now(), 'e', 'ICS')`)
+	if countChanges(t, plain) <= before {
+		t.Fatal("change-log trigger did not fire on a database built from full_init.sql")
+	}
+
+	// ── B: brand-new empty database, migrations only ──
+	s2, _, done2 := newDB("caldev_mg")
+	defer done2()
+	if err := s2.PrepareSchema("caldev"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s2.ApplyMigrations(migrationFiles, migrationFiles[:8], read, quiet); err != nil {
+		t.Fatalf("migrations on an empty database: %v", err)
+	}
+	names2 := tableNames(s2)
+	for n := range names {
+		if !names2[n] {
+			t.Errorf("table %q is in full_init.sql but the migrations did not create it", n)
+		}
+	}
+	for n := range names2 {
+		if !names[n] && n != "schema_migrations" {
+			t.Errorf("table %q is created by the migrations but missing in full_init.sql", n)
+		}
 	}
 }

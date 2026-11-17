@@ -53,7 +53,7 @@ func scanEventRows(rows *sql.Rows) ([]*models.Event, error) {
 // It returns nil when the resource does not exist.
 func (s *Store) GetResource(ctx context.Context, tenantID int, calendarID, uid string) ([]*models.Event, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT `+eventColumns+` FROM caldev_events
+		`SELECT `+eventColumns+` FROM events
 		 WHERE tenant_id = $1 AND calendar_id = $2 AND uid = $3
 		 ORDER BY recurrence_id ASC`, tenantID, calendarID, uid)
 	if err != nil {
@@ -71,7 +71,7 @@ func (s *Store) GetPrimaryEventsByUIDs(ctx context.Context, tenantID int, calend
 		return out, nil
 	}
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT DISTINCT ON (uid) `+eventColumns+` FROM caldev_events
+		`SELECT DISTINCT ON (uid) `+eventColumns+` FROM events
 		 WHERE tenant_id = $1 AND calendar_id = $2 AND uid = ANY($3)
 		 ORDER BY uid, recurrence_id ASC`, tenantID, calendarID, pq.Array(uids))
 	if err != nil {
@@ -94,9 +94,9 @@ func (s *Store) GetResourcesByEventIDs(ctx context.Context, tenantID int, ids []
 		return nil, nil
 	}
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT `+eventColumns+` FROM caldev_events
+		`SELECT `+eventColumns+` FROM events
 		 WHERE tenant_id = $1 AND (calendar_id, uid) IN (
-		   SELECT calendar_id, uid FROM caldev_events WHERE tenant_id = $1 AND id = ANY($2))
+		   SELECT calendar_id, uid FROM events WHERE tenant_id = $1 AND id = ANY($2))
 		 ORDER BY calendar_id, uid, recurrence_id ASC`, tenantID, pq.Array(ids))
 	if err != nil {
 		return nil, err
@@ -104,7 +104,7 @@ func (s *Store) GetResourcesByEventIDs(ctx context.Context, tenantID int, ids []
 	return scanEventRows(rows)
 }
 
-const upsertEventSQL = `INSERT INTO caldev_events
+const upsertEventSQL = `INSERT INTO events
 	(id, tenant_id, user_id, calendar_id, uid, summary, description, location,
 	 dtstart, dtend, duration, all_day, recurrence_rule, recurrence_id, sequence,
 	 status, transparency, classification, organizer, attendees, categories,
@@ -119,7 +119,7 @@ const upsertEventSQL = `INSERT INTO caldev_events
 	 priority = EXCLUDED.priority, url = EXCLUDED.url, geo = EXCLUDED.geo, dtstamp = EXCLUDED.dtstamp,
 	 etag = EXCLUDED.etag, raw_ics = EXCLUDED.raw_ics, size_bytes = EXCLUDED.size_bytes,
 	 component_type = EXCLUDED.component_type, properties = EXCLUDED.properties
-	WHERE caldev_events.tenant_id = EXCLUDED.tenant_id
+	WHERE events.tenant_id = EXCLUDED.tenant_id
 	RETURNING id, created_at, updated_at`
 
 type queryRower interface {
@@ -167,7 +167,7 @@ func (s *Store) ReplaceResource(ctx context.Context, tenantID int, calendarID, u
 	}
 	// Delete last so the resource is never observed empty.
 	if _, err := tx.ExecContext(ctx,
-		`DELETE FROM caldev_events
+		`DELETE FROM events
 		 WHERE tenant_id = $1 AND calendar_id = $2 AND uid = $3 AND NOT (recurrence_id = ANY($4))`,
 		tenantID, calendarID, uid, pq.Array(keep)); err != nil {
 		return err
@@ -179,7 +179,7 @@ func (s *Store) ReplaceResource(ctx context.Context, tenantID int, calendarID, u
 func (s *Store) GetResourcesByCalendar(ctx context.Context, tenantID int, calendarID string) ([]*models.Event, error) {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT `+eventColumns+` FROM (
-		   SELECT DISTINCT ON (uid) `+eventColumns+` FROM caldev_events
+		   SELECT DISTINCT ON (uid) `+eventColumns+` FROM events
 		   WHERE tenant_id = $1 AND calendar_id = $2
 		   ORDER BY uid, recurrence_id ASC
 		 ) primaries ORDER BY dtstart ASC`, tenantID, calendarID)
@@ -226,7 +226,7 @@ func (s *Store) PrimaryEventsFor(ctx context.Context, tenantID int, events []*mo
 		uids = append(uids, k.uid)
 	}
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT DISTINCT ON (calendar_id, uid) `+eventColumns+` FROM caldev_events
+		`SELECT DISTINCT ON (calendar_id, uid) `+eventColumns+` FROM events
 		 WHERE tenant_id = $1 AND uid = ANY($2)
 		 ORDER BY calendar_id, uid, recurrence_id ASC`, tenantID, pq.Array(uids))
 	if err != nil {
@@ -272,7 +272,7 @@ func (s *Store) AttachOverrides(ctx context.Context, tenantID int, events []*mod
 		return events, nil
 	}
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT `+eventColumns+` FROM caldev_events
+		`SELECT `+eventColumns+` FROM events
 		 WHERE tenant_id = $1 AND uid = ANY($2) AND recurrence_id <> ''`, tenantID, pq.Array(uids))
 	if err != nil {
 		return nil, err
@@ -321,9 +321,9 @@ func (s *Store) QueryEventsWithOverrides(ctx context.Context, filter *models.Eve
 // wins, so the choice is stable. It returns nil when there is none.
 func (s *Store) FindResourceByUID(ctx context.Context, tenantID int, uid string) ([]*models.Event, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT `+eventColumns+` FROM caldev_events
+		`SELECT `+eventColumns+` FROM events
 		 WHERE tenant_id = $1 AND uid = $2 AND calendar_id = (
-		   SELECT calendar_id FROM caldev_events WHERE tenant_id = $1 AND uid = $2 ORDER BY calendar_id LIMIT 1)
+		   SELECT calendar_id FROM events WHERE tenant_id = $1 AND uid = $2 ORDER BY calendar_id LIMIT 1)
 		 ORDER BY recurrence_id ASC`, tenantID, uid)
 	if err != nil {
 		return nil, err
@@ -340,7 +340,7 @@ func (s *Store) FindResourceByUID(ctx context.Context, tenantID int, uid string)
 // It returns the number of resources repaired.
 //
 // The scan runs once: a run that completes without error records repairFlattenedMarker in
-// caldev_migrations and later calls return immediately. Every current write path (CalDAV PUT,
+// schema_migrations and later calls return immediately. Every current write path (CalDAV PUT,
 // JMAP, scheduling, subscription sync) stores one row per component, so nothing new can need it.
 func (s *Store) RepairFlattenedResources(ctx context.Context) (int, error) {
 	if done, err := s.IsMigrationApplied(repairFlattenedMarker); err != nil || done {
@@ -357,7 +357,7 @@ const repairFlattenedMarker = "repair:flattened-resources-v1"
 
 func (s *Store) repairFlattenedResources(ctx context.Context) (int, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT `+eventColumns+` FROM caldev_events
+		`SELECT `+eventColumns+` FROM events
 		 WHERE raw_ics LIKE '%BEGIN:VEVENT%BEGIN:VEVENT%' OR raw_ics LIKE '%BEGIN:VTODO%BEGIN:VTODO%'
 		 ORDER BY calendar_id, uid, recurrence_id`)
 	if err != nil {

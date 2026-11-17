@@ -20,7 +20,7 @@ type User struct {
 	UpdatedAt     time.Time `json:"updated_at" db:"updated_at"`
 }
 
-// APIKey lets an external service onboard users of one email domain (caldev_api_keys).
+// APIKey lets an external service onboard users of one email domain (api_keys).
 // Only the key's hash is stored; the key itself is returned once, at creation.
 type APIKey struct {
 	ID         string     `json:"id"`
@@ -35,7 +35,7 @@ type APIKey struct {
 }
 
 // AppPassword is a CalDAV/JMAP app-specific password (like Nextcloud app passwords).
-// Stored in caldev_app_passwords, linked to mail_accounts.
+// Stored in app_passwords, linked to mail_accounts.
 type AppPassword struct {
 	ID           string     `json:"id" db:"id"`
 	UserID       int        `json:"user_id" db:"user_id"`
@@ -55,7 +55,7 @@ type Job struct {
 	Created time.Time       `json:"created"`
 }
 
-// JobResult is stored in caldev_job_history after processing.
+// JobResult is stored in job_history after processing.
 type JobResult struct {
 	ID           string          `json:"id" db:"id"`
 	JobType      string          `json:"job_type" db:"job_type"`

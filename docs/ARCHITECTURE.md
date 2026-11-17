@@ -35,12 +35,12 @@ CalDev is a high-performance, RFC-compliant calendar server written in Go (using
 ┌───────────────────────────────┐               ┌─────────────────────────────────┐
 │     PostgreSQL 16+ Store      │               │    Valkey / Redis (Port 6379)   │
 ├───────────────────────────────┤               ├─────────────────────────────────┤
-│ caldev_calendars              │               │ Job Queue (LPUSH / BRPOP):      │
-│ caldev_events                 │               │  - Delayed Countdown Reminders  │
-│ caldev_sync_changes           │               │  - Periodic 1h Window Sweeps    │
-│ caldev_reminder_deliv.        │               │  - Scheduling Email Generation  │
-│ caldev_scheduling_msgs        │               ├─────────────────────────────────┤
-│ caldev_subscriptions          │               │ Pub/Sub Channels:               │
+│ calendars              │               │ Job Queue (LPUSH / BRPOP):      │
+│ events                 │               │  - Delayed Countdown Reminders  │
+│ sync_changes           │               │  - Periodic 1h Window Sweeps    │
+│ reminder_deliveries        │               │  - Scheduling Email Generation  │
+│ scheduling_messages        │               ├─────────────────────────────────┤
+│ calendar_subscriptions          │               │ Pub/Sub Channels:               │
 │ public.mail_accounts (shared) │               │  - `calendar:push` (Realtime)   │
 └───────────────────────────────┘               │  - `calendar:mail` (SMTP Relay) │
                                                 └────────────────┬────────────────┘
@@ -118,7 +118,7 @@ Event Created / Updated ─────────────┼────�
                       │       HandleCalendarReminderJob              │
                       │  1. Re-read the event: skip if gone,         │
                       │     cancelled, moved, or recipient declined  │
-                      │  2. Claim caldev_reminder_deliveries (DEDUP) │
+                      │  2. Claim reminder_deliveries (DEDUP) │
                       │  3. Publish to Redis `calendar:push` channel │
                       │     (claim released on failure → retried)    │
                       └──────────────────────────────────────────────┘
@@ -137,7 +137,7 @@ Event Created / Updated ─────────────┼────�
    - 5 minutes before start
    - 0 minutes (start time / "Starting now")
 4. **Delivery Deduplication**:
-   - Backed by PostgreSQL table `caldev_reminder_deliveries`:
+   - Backed by PostgreSQL table `reminder_deliveries`:
      `UNIQUE (event_uid, recurrence_id, recipient_email, milestone_minutes, channel)`.
    - The stored `recurrence_id` is `<recurrence id>@<occurrence start>`, so a meeting moved to a new time gets reminders for the new time instead of being blocked by the old ones.
    - Each delayed job has a deterministic id (tenant, calendar, UID, occurrence, start, recipient, milestone), so the hourly sweep and repeated saves replace a pending reminder instead of adding duplicates.
@@ -162,7 +162,7 @@ Organizer creates event with Attendees
                 ▼                                                ▼
      deliverLocal()                                   enqueueMessage()
 Automatically creates or updates                 Generates RFC 5545 .ics payload
-event copy in Attendee's default                 and stores in caldev_scheduling_messages
+event copy in Attendee's default                 and stores in scheduling_messages
 writable calendar without email.                                 │
                 │                                                ▼
                 ▼                                   Publish to Redis:
@@ -178,8 +178,8 @@ via `calendar:push` channel.                                     │
    - The event (including all series overrides) is immediately placed in the attendee's primary writable calendar.
    - Internal attendees automatically receive live push notifications and countdown alerts without needing an email.
 2. **External Attendees & Dispatch**:
-   - CalDev creates an RFC 5545 iMIP payload (`REQUEST`, `REPLY`, or `CANCEL`) and records it in `caldev_scheduling_messages`.
-   - **Bring Your Own SMTP (BYO SMTP)**: When the event's calendar has an active custom SMTP configuration (`caldev_calendar_smtp`), the background worker delivers the invitation directly via the user's custom SMTP server with full SPF, DKIM, and DMARC alignment. Emails are delivered as RFC 5322 MIME multipart messages (quoted-printable text and HTML, RFC 2047-encoded headers, optional `Reply-To`) with RSVP buttons on invitations (`REQUEST` only), and the `.ics` component. Each connection has a 60 s deadline.
+   - CalDev creates an RFC 5545 iMIP payload (`REQUEST`, `REPLY`, or `CANCEL`) and records it in `scheduling_messages`.
+   - **Bring Your Own SMTP (BYO SMTP)**: When the event's calendar has an active custom SMTP configuration (`calendar_smtp`), the background worker delivers the invitation directly via the user's custom SMTP server with full SPF, DKIM, and DMARC alignment. Emails are delivered as RFC 5322 MIME multipart messages (quoted-printable text and HTML, RFC 2047-encoded headers, optional `Reply-To`) with RSVP buttons on invitations (`REQUEST` only), and the `.ics` component. Each connection has a 60 s deadline.
    - **Retries**: a failed send leaves the message `pending` (error recorded) and the job is retried; it is marked `failed` only after the last attempt. Connection or authentication failures mark the calendar's SMTP config `failing`, after which messages use the managed fallback until it is re-tested.
    - **Managed Fallback**: If no BYO SMTP is configured and managed fallback is active, payloads are published to Redis channel `calendar:mail` for pickup by the centralized mail service.
    - **Web RSVP**: The email buttons open a public HMAC-signed page (`/api/public/rsvp`). Opening it only shows the choice; the recipient confirms with a button (POST), so link-scanning email security tools can't answer on their behalf. The answer updates the organizer's copy and other local attendees' copies and is pushed in real time.
@@ -192,12 +192,12 @@ via `calendar:push` channel.                                     │
 
 ## 5. Database Schema & Tables
 
-All CalDev tables live in the `public` schema with a `caldev_` prefix, next to `public.mail_accounts` (`DB_SCHEMA` is not applied):
+All CalDev tables live in their own `caldev` schema (`DB_SCHEMA`) with no name prefix (`caldev.events`, `caldev.calendars`, ...). CalDev keeps its own accounts in `caldev.mail_accounts`; the mail system's `public.mail_accounts` and `public.account_settings` are only read.
 
-- **`caldev_calendars`**: Calendar containers, color, timezone, default calendar flags, and access control.
-- **`caldev_events`**: Stores master events and individual `RECURRENCE-ID` overrides. Indexed on `(calendar_id, uid, recurrence_id)`.
-- **`caldev_reminder_deliveries`**: Deduplication log ensuring a reminder milestone is delivered at most once per user per instance.
-- **`caldev_scheduling_messages`**: Outbox for meeting invitations, replies, and cancellation payloads.
-- **`caldev_sync_changes`**: Change log behind CalDAV sync-collection and JMAP `/changes`. Written by triggers on `caldev_events` under a per-tenant advisory lock, so ids commit in order and the JMAP state (`MAX(id)`) never skips a change. Moving an event logs `deleted` in the old calendar and `created` in the new one; deleting a calendar logs nothing (migration `006`).
-- **`caldev_subscriptions`**: External read-only calendars imported from Google Calendar, Outlook, or ICS URLs.
-- **`caldev_calendar_smtp`**: Outbound BYO SMTP credentials (AES-256-GCM encrypted passwords) per calendar collection.
+- **`calendars`**: Calendar containers, color, timezone, default calendar flags, and access control.
+- **`events`**: Stores master events and individual `RECURRENCE-ID` overrides. Indexed on `(calendar_id, uid, recurrence_id)`.
+- **`reminder_deliveries`**: Deduplication log ensuring a reminder milestone is delivered at most once per user per instance.
+- **`scheduling_messages`**: Outbox for meeting invitations, replies, and cancellation payloads.
+- **`sync_changes`**: Change log behind CalDAV sync-collection and JMAP `/changes`. Written by triggers on `events` under a per-tenant advisory lock, so ids commit in order and the JMAP state (`MAX(id)`) never skips a change. Moving an event logs `deleted` in the old calendar and `created` in the new one; deleting a calendar logs nothing (migration `006`).
+- **`calendar_subscriptions`**: External read-only calendars imported from Google Calendar, Outlook, or ICS URLs.
+- **`calendar_smtp`**: Outbound BYO SMTP credentials (AES-256-GCM encrypted passwords) per calendar collection.

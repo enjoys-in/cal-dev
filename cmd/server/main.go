@@ -74,14 +74,7 @@ func main() {
 	}
 	log.Printf("Using schema %q", cfg.Database.SchemaName())
 
-	// Ensure migration tracking table exists (runs outside the main migration transaction)
-	db.RunMigration(`CREATE TABLE IF NOT EXISTS caldev_migrations (
-		id SERIAL PRIMARY KEY,
-		filename VARCHAR(512) NOT NULL UNIQUE,
-		applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-	)`)
-
-	// Run migrations in order
+	// Run migrations in order (the history table is created first, inside CalDev's schema)
 	migrationFiles := []string{
 		"migrations/001_init.sql",
 		"migrations/002_sharing_realtime.sql",
@@ -91,29 +84,16 @@ func main() {
 		"migrations/006_change_log_fixes.sql",
 		"migrations/007_onboarding_api_keys.sql",
 		"migrations/008_mail_accounts_email_lower.sql",
+		"migrations/009_drop_table_prefix.sql",
 		"migrations/010_caldev_mail_accounts.sql",
 	}
+	// The original layout: schema/full_init.sql already contains what these built. A database
+	// created from that file (no migration history) skips them; 009 onward still run, which is
+	// safe on the final shape. When full_init.sql absorbs more of the history, extend this list.
+	baselineMigrations := migrationFiles[:8]
 	// A missing or failed migration stops startup: running on a partial schema breaks later features.
-	for _, mf := range migrationFiles {
-		sqlBytes, err := os.ReadFile(mf)
-		if err != nil {
-			log.Fatalf("Migration file %s not readable (is the working directory the app root?): %v", mf, err)
-		}
-		applied, err := db.IsMigrationApplied(mf)
-		if err != nil {
-			log.Fatalf("Checking migration %s failed: %v", mf, err)
-		}
-		if applied {
-			log.Printf("Migration %s already applied, skipping", mf)
-			continue
-		}
-		if err := db.RunMigration(string(sqlBytes)); err != nil {
-			log.Fatalf("Migration %s failed: %v", mf, err)
-		}
-		log.Printf("Migration %s applied successfully", mf)
-		if err := db.RecordMigration(mf); err != nil {
-			log.Printf("Failed to record migration %s: %v", mf, err)
-		}
+	if err := db.ApplyMigrations(migrationFiles, baselineMigrations, os.ReadFile, log.Printf); err != nil {
+		log.Fatalf("Migrations failed: %v", err)
 	}
 
 	// Split resources saved before recurrence overrides had their own rows (idempotent).

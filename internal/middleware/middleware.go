@@ -354,7 +354,7 @@ func APIKeyAuth(apiKey string) fiber.Handler {
 }
 
 // OnboardAuth protects the onboarding endpoints.
-//   - External services send X-API-Key (a key from caldev_api_keys); they may onboard only users
+//   - External services send X-API-Key (a key from api_keys); they may onboard only users
 //     of the key's email domain. Sets Locals "onboard_domain".
 //   - AirSend apps send their JWT (Bearer header or access_token cookie); they may onboard only
 //     the token's own email. The account may not exist yet, so only the token is validated.

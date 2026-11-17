@@ -4,7 +4,7 @@
 --              (email is the key). Added the first time the user reaches CalDev with the
 --              calendar enabled (account_settings.calender_config.enable_calender).
 --   external = created by CalDev's onboarding API; exists only here. New ids come from
---              caldev_external_account_id_seq (starts at 1,000,000,000) so they never meet an
+--              external_account_id_seq (starts at 1,000,000,000) so they never meet an
 --              Airsend id: every CalDev table stores only the number.
 --   status   = CalDev's own switch for the calendar: ACTIVE | INACTIVE | SUSPENDED.
 --
@@ -24,8 +24,8 @@ CREATE TABLE IF NOT EXISTS mail_accounts (
 -- (on a brand-new database, migration 001 already created this table with id SERIAL — same columns)
 ALTER TABLE mail_accounts ADD COLUMN IF NOT EXISTS account_origin VARCHAR(16);
 
-CREATE SEQUENCE IF NOT EXISTS caldev_external_account_id_seq START 1000000000;
-ALTER TABLE mail_accounts ALTER COLUMN id SET DEFAULT nextval('caldev_external_account_id_seq');
+CREATE SEQUENCE IF NOT EXISTS external_account_id_seq START 1000000000;
+ALTER TABLE mail_accounts ALTER COLUMN id SET DEFAULT nextval('external_account_id_seq');
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_caldev_mail_accounts_email_lower ON mail_accounts (lower(email));
 
@@ -76,14 +76,14 @@ BEGIN
                NOW()
         FROM public.mail_accounts m
         WHERE %1$s = 'external'
-           OR m.id IN (SELECT user_id   FROM caldev_calendars
-                       UNION SELECT tenant_id FROM caldev_calendars
-                       UNION SELECT user_id   FROM caldev_events
-                       UNION SELECT user_id   FROM caldev_app_passwords
-                       UNION SELECT owner_user_id   FROM caldev_availability_shares
-                       UNION SELECT grantee_user_id FROM caldev_availability_shares
-                       UNION SELECT owner_user_id   FROM caldev_calendar_shares
-                       UNION SELECT grantee_user_id FROM caldev_calendar_shares)
+           OR m.id IN (SELECT user_id   FROM calendars
+                       UNION SELECT tenant_id FROM calendars
+                       UNION SELECT user_id   FROM events
+                       UNION SELECT user_id   FROM app_passwords
+                       UNION SELECT owner_user_id   FROM availability_shares
+                       UNION SELECT grantee_user_id FROM availability_shares
+                       UNION SELECT owner_user_id   FROM calendar_shares
+                       UNION SELECT grantee_user_id FROM calendar_shares)
         ORDER BY m.id
         ON CONFLICT DO NOTHING
     $q$, origin_expr);

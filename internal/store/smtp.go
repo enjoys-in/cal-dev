@@ -15,7 +15,7 @@ func (s *Store) GetCalendarSMTP(ctx context.Context, tenantID int, calendarID st
 	query := `SELECT id, calendar_id, tenant_id, user_id, host, port, username,
 		password_encrypted, from_email, from_name, reply_to, encryption, status,
 		last_tested_at, last_error, created_at, updated_at
-		FROM caldev_calendar_smtp
+		FROM calendar_smtp
 		WHERE tenant_id = $1 AND calendar_id = $2`
 	err := s.db.QueryRowContext(ctx, query, tenantID, calendarID).
 		Scan(&cfg.ID, &cfg.CalendarID, &cfg.TenantID, &cfg.UserID, &cfg.Host, &cfg.Port,
@@ -33,7 +33,7 @@ func (s *Store) GetCalendarSMTPByCalendarID(ctx context.Context, calendarID stri
 	query := `SELECT id, calendar_id, tenant_id, user_id, host, port, username,
 		password_encrypted, from_email, from_name, reply_to, encryption, status,
 		last_tested_at, last_error, created_at, updated_at
-		FROM caldev_calendar_smtp
+		FROM calendar_smtp
 		WHERE calendar_id = $1`
 	err := s.db.QueryRowContext(ctx, query, calendarID).
 		Scan(&cfg.ID, &cfg.CalendarID, &cfg.TenantID, &cfg.UserID, &cfg.Host, &cfg.Port,
@@ -51,7 +51,7 @@ func (s *Store) UpsertCalendarSMTP(ctx context.Context, smtp *models.CalendarSMT
 		smtp.ID = uuid.New().String()
 	}
 	now := time.Now()
-	query := `INSERT INTO caldev_calendar_smtp
+	query := `INSERT INTO calendar_smtp
 		(id, calendar_id, tenant_id, user_id, host, port, username, password_encrypted,
 		 from_email, from_name, reply_to, encryption, status, last_tested_at, last_error, created_at, updated_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $16)
@@ -59,7 +59,7 @@ func (s *Store) UpsertCalendarSMTP(ctx context.Context, smtp *models.CalendarSMT
 			host = EXCLUDED.host,
 			port = EXCLUDED.port,
 			username = EXCLUDED.username,
-			password_encrypted = CASE WHEN EXCLUDED.password_encrypted != '' THEN EXCLUDED.password_encrypted ELSE caldev_calendar_smtp.password_encrypted END,
+			password_encrypted = CASE WHEN EXCLUDED.password_encrypted != '' THEN EXCLUDED.password_encrypted ELSE calendar_smtp.password_encrypted END,
 			from_email = EXCLUDED.from_email,
 			from_name = EXCLUDED.from_name,
 			reply_to = EXCLUDED.reply_to,
@@ -79,14 +79,14 @@ func (s *Store) UpsertCalendarSMTP(ctx context.Context, smtp *models.CalendarSMT
 
 // DeleteCalendarSMTP removes the SMTP configuration for a calendar.
 func (s *Store) DeleteCalendarSMTP(ctx context.Context, tenantID int, calendarID string) error {
-	query := `DELETE FROM caldev_calendar_smtp WHERE tenant_id = $1 AND calendar_id = $2`
+	query := `DELETE FROM calendar_smtp WHERE tenant_id = $1 AND calendar_id = $2`
 	_, err := s.db.ExecContext(ctx, query, tenantID, calendarID)
 	return err
 }
 
 // UpdateCalendarSMTPTestResult records the result of a connection test or delivery attempt.
 func (s *Store) UpdateCalendarSMTPTestResult(ctx context.Context, tenantID int, calendarID string, status, lastError string) error {
-	query := `UPDATE caldev_calendar_smtp
+	query := `UPDATE calendar_smtp
 		SET status = $3, last_error = $4, last_tested_at = NOW(), updated_at = NOW()
 		WHERE tenant_id = $1 AND calendar_id = $2`
 	_, err := s.db.ExecContext(ctx, query, tenantID, calendarID, status, lastError)
@@ -96,6 +96,6 @@ func (s *Store) UpdateCalendarSMTPTestResult(ctx context.Context, tenantID int, 
 // RecordSchedulingMessageError stores the last delivery error without changing the message status,
 // so a still-pending message can be retried.
 func (s *Store) RecordSchedulingMessageError(ctx context.Context, id, errorMsg string) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE caldev_scheduling_messages SET error_message = $2 WHERE id = $1`, id, errorMsg)
+	_, err := s.db.ExecContext(ctx, `UPDATE scheduling_messages SET error_message = $2 WHERE id = $1`, id, errorMsg)
 	return err
 }

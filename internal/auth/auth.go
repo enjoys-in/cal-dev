@@ -21,7 +21,7 @@ import (
 
 // Service provides authentication functionality.
 // JWT is verified with the same secret and issuer used by the mail/other services.
-// CalDAV Basic Auth uses app-passwords stored in caldev_app_passwords.
+// CalDAV Basic Auth uses app-passwords stored in app_passwords.
 type Service struct {
 	store  *store.Store
 	config *config.AuthConfig
@@ -393,7 +393,7 @@ func ParseBasicAuth(authHeader string) (*BasicAuthResult, error) {
 
 // AuthenticateBasic authenticates a user via email + app password.
 // 1. Looks up user by email in mail_accounts
-// 2. Checks the password against caldev_app_passwords
+// 2. Checks the password against app_passwords
 // Returns (userID, tenantID, error). tenantID == userID since mail_accounts has no tenant_id.
 func (s *Service) AuthenticateBasic(ctx context.Context, email, password string) (int, int, error) {
 	// Clients send Basic credentials on every request: skip bcrypt for recently verified ones.

@@ -70,7 +70,7 @@ type MailEvent struct {
 	RSVPDeclineURL   string `json:"rsvp_decline_url,omitempty"`
 
 	// Tracking
-	MessageID string `json:"message_id"` // links to caldev_scheduling_messages.id
+	MessageID string `json:"message_id"` // links to scheduling_messages.id
 	Timestamp string `json:"timestamp"`  // ISO 8601
 }
 

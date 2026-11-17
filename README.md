@@ -35,9 +35,9 @@ Supports Apple Calendar, Thunderbird, Google Calendar interop, and modern JMAP c
 ┌───────────────────────────────┐               ┌─────────────────────────────────┐
 │     PostgreSQL 16+ Store      │               │    Valkey / Redis (Port 6379)   │
 ├───────────────────────────────┤               ├─────────────────────────────────┤
-│ caldev_calendars              │               │ Job Queue (LPUSH / BRPOP):      │
-│ caldev_events                 │               │  - Delayed Countdown Reminders  │
-│ caldev_sync_changes           │               │  - Periodic 1h Window Sweeps    │
+│ calendars              │               │ Job Queue (LPUSH / BRPOP):      │
+│ events                 │               │  - Delayed Countdown Reminders  │
+│ sync_changes           │               │  - Periodic 1h Window Sweeps    │
 │ caldev_reminder_deliv.        │               │  - Scheduling Email Generation  │
 │ caldev_scheduling_msgs        │               ├─────────────────────────────────┤
 │ caldev_subscriptions          │               │ Pub/Sub Channels:               │
@@ -191,7 +191,7 @@ cp .env.example .env
 psql -U caldev -d caldev -v ON_ERROR_STOP=1 -f schema/full_init.sql
 ```
 
-`schema/full_init.sql` creates everything in the `caldev` schema (the result of running 001–010 in order) and is safe to run again. When you add a migration, update it too and add the new filename to its `caldev_migrations` list.
+`schema/full_init.sql` is the **raw final-state** schema in the `caldev` schema: every table created once with its final columns, types and indexes (no ALTER steps), plus functions and triggers. It contains no migration history table and no list of applied migrations — when the server starts on a database built from it, it recognises that (the history is empty but the tables exist), records the original migrations 001–008 as applied by itself, and runs only the later ones. It is safe to run again. When a migration changes the schema, change the table in this file to its new final shape (don't append the change).
 
 ### 3. Demo Mode (no external dependencies)
 
@@ -292,7 +292,7 @@ POST   /api/subscriptions/:id/sync  → Trigger immediate sync
 
 ### Recurring Events & Exceptions
 
-A calendar object resource (one `.ics`, one CalDAV href) can hold a master `VEVENT` with an `RRULE` plus one `VEVENT` per changed or cancelled occurrence (same `UID`, a `RECURRENCE-ID`). Each component is stored as its own row in `caldev_events`, unique on `(calendar_id, uid, recurrence_id)` (migration `003`):
+A calendar object resource (one `.ics`, one CalDAV href) can hold a master `VEVENT` with an `RRULE` plus one `VEVENT` per changed or cancelled occurrence (same `UID`, a `RECURRENCE-ID`). Each component is stored as its own row in `events`, unique on `(calendar_id, uid, recurrence_id)` (migration `003`):
 
 - the master has `recurrence_id = ''`; an override's `recurrence_id` is the original start of that occurrence, normalised to a UTC instant (`20261116T033000Z`) or a plain date (`20261116`) for all-day series, so the same occurrence always gets the same key whatever zone the client wrote it in;
 - the primary row (master, else the earliest override) holds the **whole resource** in `raw_ics` exactly as received, so CalDAV `GET` returns it byte-for-byte; every row of a resource shares its ETag;
@@ -467,16 +467,16 @@ caldev.mail_accounts (CalDev's own accounts)
   └── status              ← CalDev's own ACTIVE | INACTIVE | SUSPENDED; must be ACTIVE to sign in.
                             internal accounts also need their Airsend mailbox ACTIVE and the calendar enabled
 
-caldev_app_passwords          CalDAV Basic-auth passwords
-caldev_calendars              calendars (owner = user_id)
-caldev_events                 one row per VEVENT/VTODO component, UNIQUE (calendar_id, uid, recurrence_id)
-caldev_sync_changes           change log behind CalDAV sync-collection and JMAP changes
-caldev_jmap_states            JMAP "Calendar" state tokens
-caldev_availability_shares    owner → grantee: free/busy visibility            (002)
-caldev_calendar_shares        owner → grantee: read-only calendar              (002)
-caldev_scheduling_messages    invitation / reply / cancel mail queue
-caldev_calendar_subscriptions external ICS feeds
-caldev_locks, caldev_job_history, caldev_migrations
+app_passwords          CalDAV Basic-auth passwords
+calendars              calendars (owner = user_id)
+events                 one row per VEVENT/VTODO component, UNIQUE (calendar_id, uid, recurrence_id)
+sync_changes           change log behind CalDAV sync-collection and JMAP changes
+jmap_states            JMAP "Calendar" state tokens
+availability_shares    owner → grantee: free/busy visibility            (002)
+calendar_shares        owner → grantee: read-only calendar              (002)
+scheduling_messages    invitation / reply / cancel mail queue
+calendar_subscriptions external ICS feeds
+locks, job_history, schema_migrations
 ```
 
 ---

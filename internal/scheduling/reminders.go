@@ -178,7 +178,7 @@ func reminderJobID(p ReminderJobPayload) string {
 	return "rem-" + hex.EncodeToString(sum[:16])
 }
 
-// deliveryKey is the recurrence_id stored in caldev_reminder_deliveries: it includes the
+// deliveryKey is the recurrence_id stored in reminder_deliveries: it includes the
 // occurrence start, so a moved meeting is reminded again for its new time.
 func deliveryKey(p *ReminderJobPayload) string {
 	return p.RecurrenceID + "@" + p.StartUTC.UTC().Format("20060102T150405Z")
@@ -350,7 +350,7 @@ func (svc *Service) currentOccurrence(ctx context.Context, p *ReminderJobPayload
 }
 
 // HandleCalendarReminderJob processes a due reminder job from Valkey.
-// It re-checks the event, deduplicates via caldev_reminder_deliveries and publishes the
+// It re-checks the event, deduplicates via reminder_deliveries and publishes the
 // notification to Redis (calendar:push). A failed publish returns an error so the job is retried.
 func (svc *Service) HandleCalendarReminderJob(ctx context.Context, job *jobs.Job) error {
 	payload, err := jobs.ParsePayload[ReminderJobPayload](job)

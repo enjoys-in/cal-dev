@@ -1,32 +1,27 @@
 -- ============================================================
--- CalDev: complete database schema in one file
+-- CalDev: the complete database schema, final state, in one file
 --
--- This is the end result of migrations 001 .. 010 (it does NOT replace them: the server still
--- applies migrations/ on startup). Use it to set up a brand-new database in one step:
+-- Creates every table with its final columns, types, defaults, indexes and constraints, plus the
+-- functions and triggers, in the `caldev` schema. Nothing here is a change step: no ALTER, no
+-- data fix. Use it to set up a brand-new database in one go:
 --
---     psql -U caldev -d caldev -v ON_ERROR_STOP=1 -f schema/full_init.sql
+--     psql -U postgres -d airsend_mail -v ON_ERROR_STOP=1 -f schema/full_init.sql
 --
--- Everything is created in the `caldev` schema (the server's default DB_SCHEMA). If you use another
--- DB_SCHEMA, replace "caldev" in the two lines after the extensions.
+-- It is the raw schema only: no migration history table, no list of applied migrations. When the
+-- server starts on a database built from this file it recognises that and skips the original
+-- migrations by itself (see Store.ApplyMigrations). Safe to run again.
 --
--- At the end it records 001..010 in caldev_migrations, so a server started afterwards sees them
--- as applied and only runs migrations added later. Safe to run again (every statement is
--- idempotent).
+-- A different schema name: replace "caldev" in CREATE SCHEMA, in SET search_path, and in the
+-- `SET search_path = caldev, public` of each function.
 --
--- Keep it current: when you add migrations/011_*.sql, update the schema above AND add its
--- filename to the caldev_migrations list at the bottom. Dropped on purpose, because migration 006
--- left it unused: the caldev_update_jmap_state() function and the three trg_caldev_events_
--- jmap_state_* triggers.
+-- Needs PostgreSQL 14+ (CREATE OR REPLACE TRIGGER). Never touches the mail system's public tables.
 --
--- Differences from running the migrations on an empty database:
---   * caldev.mail_accounts is created directly in its final shape (migration 001 makes a smaller
---     one that 010 then completes).
---   * the lower(email) index is created normally, not CONCURRENTLY (the table is new and empty,
---     and CONCURRENTLY cannot run inside the single transaction this file may be sent in).
+-- Keep it current: when a migration changes the schema, change the table here to the new final
+-- shape (do not append the change).
 -- ============================================================
 
-CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
-CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp" WITH SCHEMA public;
+CREATE EXTENSION IF NOT EXISTS "pgcrypto" WITH SCHEMA public;
 
 CREATE SCHEMA IF NOT EXISTS caldev;
 SET search_path = caldev, public;
@@ -38,9 +33,9 @@ SET search_path = caldev, public;
 --   external: created by the onboarding API, ids from 1,000,000,000 so they never meet Airsend ids
 --   status:   CalDev's own ACTIVE | INACTIVE | SUSPENDED
 -- ============================================================
-CREATE SEQUENCE IF NOT EXISTS caldev_external_account_id_seq START 1000000000;
+CREATE SEQUENCE IF NOT EXISTS external_account_id_seq START 1000000000;
 CREATE TABLE IF NOT EXISTS mail_accounts (
-    id INTEGER PRIMARY KEY DEFAULT nextval('caldev_external_account_id_seq'),
+    id INTEGER PRIMARY KEY DEFAULT nextval('external_account_id_seq'),
     name VARCHAR(255) NOT NULL DEFAULT '',
     email VARCHAR(255) NOT NULL UNIQUE,
     tenant_name VARCHAR(255) NOT NULL DEFAULT '',
@@ -60,7 +55,7 @@ CREATE INDEX IF NOT EXISTS idx_mail_accounts_email_lower ON mail_accounts (lower
 -- ============================================================
 -- App passwords (CalDAV Basic Auth: email + app password)
 -- ============================================================
-CREATE TABLE IF NOT EXISTS caldev_app_passwords (
+CREATE TABLE IF NOT EXISTS app_passwords (
     id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     user_id         INTEGER NOT NULL, -- references mail_accounts(id)
     label           VARCHAR(256) NOT NULL DEFAULT '',
@@ -70,13 +65,13 @@ CREATE TABLE IF NOT EXISTS caldev_app_passwords (
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX IF NOT EXISTS idx_caldev_app_passwords_user ON caldev_app_passwords(user_id);
+CREATE INDEX IF NOT EXISTS idx_caldev_app_passwords_user ON app_passwords(user_id);
 
 -- ============================================================
--- Onboarding API keys (007). Only the SHA-256 hash of a key is stored.
+-- Onboarding API keys. Only the SHA-256 hash of a key is stored.
 -- A key is linked to an owner email and may onboard only users of that email's domain.
 -- ============================================================
-CREATE TABLE IF NOT EXISTS caldev_api_keys (
+CREATE TABLE IF NOT EXISTS api_keys (
     id            UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     owner_email   VARCHAR(512) NOT NULL,
     domain        VARCHAR(255) NOT NULL,          -- lower-case domain the key may onboard (*@domain)
@@ -89,12 +84,12 @@ CREATE TABLE IF NOT EXISTS caldev_api_keys (
     revoked_at    TIMESTAMPTZ
 );
 
-CREATE INDEX IF NOT EXISTS idx_caldev_api_keys_owner ON caldev_api_keys(lower(owner_email));
+CREATE INDEX IF NOT EXISTS idx_caldev_api_keys_owner ON api_keys(lower(owner_email));
 
 -- ============================================================
 -- Calendars
 -- ============================================================
-CREATE TABLE IF NOT EXISTS caldev_calendars (
+CREATE TABLE IF NOT EXISTS calendars (
     id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     tenant_id       INTEGER NOT NULL, -- references mail_accounts(id)
     user_id         INTEGER NOT NULL, -- references mail_accounts(id)
@@ -115,20 +110,20 @@ CREATE TABLE IF NOT EXISTS caldev_calendars (
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX IF NOT EXISTS idx_caldev_calendars_tenant ON caldev_calendars(tenant_id);
-CREATE INDEX IF NOT EXISTS idx_caldev_calendars_user ON caldev_calendars(user_id);
-CREATE INDEX IF NOT EXISTS idx_caldev_calendars_tenant_user ON caldev_calendars(tenant_id, user_id);
+CREATE INDEX IF NOT EXISTS idx_caldev_calendars_tenant ON calendars(tenant_id);
+CREATE INDEX IF NOT EXISTS idx_caldev_calendars_user ON calendars(user_id);
+CREATE INDEX IF NOT EXISTS idx_caldev_calendars_tenant_user ON calendars(tenant_id, user_id);
 
 -- ============================================================
 -- Events (calendar objects). One row per VEVENT/VTODO component of a resource (.ics): the master
 -- has recurrence_id = '' (so it sorts first); each RECURRENCE-ID override has its own row with a
 -- normalised key (a UTC instant like 20261116T033000Z, or a plain date for all-day series).
 -- ============================================================
-CREATE TABLE IF NOT EXISTS caldev_events (
+CREATE TABLE IF NOT EXISTS events (
     id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     tenant_id       INTEGER NOT NULL, -- references mail_accounts(id)
     user_id         INTEGER NOT NULL, -- references mail_accounts(id)
-    calendar_id     UUID NOT NULL REFERENCES caldev_calendars(id) ON DELETE CASCADE,
+    calendar_id     UUID NOT NULL REFERENCES calendars(id) ON DELETE CASCADE,
     uid             VARCHAR(512) NOT NULL,
     summary         VARCHAR(1024) NOT NULL DEFAULT '',
     description     TEXT NOT NULL DEFAULT '',
@@ -160,30 +155,30 @@ CREATE TABLE IF NOT EXISTS caldev_events (
     CONSTRAINT caldev_events_component_key UNIQUE (calendar_id, uid, recurrence_id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_caldev_events_tenant ON caldev_events(tenant_id);
-CREATE INDEX IF NOT EXISTS idx_caldev_events_user ON caldev_events(user_id);
-CREATE INDEX IF NOT EXISTS idx_caldev_events_calendar ON caldev_events(calendar_id);
-CREATE INDEX IF NOT EXISTS idx_caldev_events_uid ON caldev_events(uid);
-CREATE INDEX IF NOT EXISTS idx_caldev_events_dtstart ON caldev_events(dtstart);
-CREATE INDEX IF NOT EXISTS idx_caldev_events_dtend ON caldev_events(dtend);
-CREATE INDEX IF NOT EXISTS idx_caldev_events_etag ON caldev_events(etag);
-CREATE INDEX IF NOT EXISTS idx_caldev_events_updated ON caldev_events(updated_at);
-CREATE INDEX IF NOT EXISTS idx_caldev_events_time_range ON caldev_events(calendar_id, dtstart, dtend);
-CREATE INDEX IF NOT EXISTS idx_caldev_events_component ON caldev_events(calendar_id, component_type);
-CREATE INDEX IF NOT EXISTS idx_caldev_events_tenant_calendar ON caldev_events(tenant_id, calendar_id);
+CREATE INDEX IF NOT EXISTS idx_caldev_events_tenant ON events(tenant_id);
+CREATE INDEX IF NOT EXISTS idx_caldev_events_user ON events(user_id);
+CREATE INDEX IF NOT EXISTS idx_caldev_events_calendar ON events(calendar_id);
+CREATE INDEX IF NOT EXISTS idx_caldev_events_uid ON events(uid);
+CREATE INDEX IF NOT EXISTS idx_caldev_events_dtstart ON events(dtstart);
+CREATE INDEX IF NOT EXISTS idx_caldev_events_dtend ON events(dtend);
+CREATE INDEX IF NOT EXISTS idx_caldev_events_etag ON events(etag);
+CREATE INDEX IF NOT EXISTS idx_caldev_events_updated ON events(updated_at);
+CREATE INDEX IF NOT EXISTS idx_caldev_events_time_range ON events(calendar_id, dtstart, dtend);
+CREATE INDEX IF NOT EXISTS idx_caldev_events_component ON events(calendar_id, component_type);
+CREATE INDEX IF NOT EXISTS idx_caldev_events_tenant_calendar ON events(tenant_id, calendar_id);
 -- availability lookups (time-bounded scans per owner)
-CREATE INDEX IF NOT EXISTS idx_caldev_events_owner_time ON caldev_events (tenant_id, user_id, dtstart);
+CREATE INDEX IF NOT EXISTS idx_caldev_events_owner_time ON events (tenant_id, user_id, dtstart);
 -- "all rows of this UID, master first"
-CREATE INDEX IF NOT EXISTS idx_caldev_events_resource ON caldev_events (tenant_id, calendar_id, uid, recurrence_id);
+CREATE INDEX IF NOT EXISTS idx_caldev_events_resource ON events (tenant_id, calendar_id, uid, recurrence_id);
 
 -- ============================================================
 -- Change log behind CalDAV sync-collection and JMAP /changes (written by triggers below).
 -- recurrence_id and event_id come last: they were added after the table was first created.
 -- ============================================================
-CREATE TABLE IF NOT EXISTS caldev_sync_changes (
+CREATE TABLE IF NOT EXISTS sync_changes (
     id              BIGSERIAL PRIMARY KEY,
     tenant_id       INTEGER NOT NULL, -- references mail_accounts(id)
-    calendar_id     UUID NOT NULL REFERENCES caldev_calendars(id) ON DELETE CASCADE,
+    calendar_id     UUID NOT NULL REFERENCES calendars(id) ON DELETE CASCADE,
     event_uid       VARCHAR(512) NOT NULL,
     change_type     VARCHAR(16) NOT NULL, -- 'created', 'modified', 'deleted'
     sync_token      VARCHAR(256) NOT NULL,
@@ -192,14 +187,14 @@ CREATE TABLE IF NOT EXISTS caldev_sync_changes (
     event_id        UUID
 );
 
-CREATE INDEX IF NOT EXISTS idx_caldev_sync_changes_calendar ON caldev_sync_changes(calendar_id);
-CREATE INDEX IF NOT EXISTS idx_caldev_sync_changes_token ON caldev_sync_changes(calendar_id, sync_token);
-CREATE INDEX IF NOT EXISTS idx_caldev_sync_changes_tenant ON caldev_sync_changes(tenant_id);
+CREATE INDEX IF NOT EXISTS idx_caldev_sync_changes_calendar ON sync_changes(calendar_id);
+CREATE INDEX IF NOT EXISTS idx_caldev_sync_changes_token ON sync_changes(calendar_id, sync_token);
+CREATE INDEX IF NOT EXISTS idx_caldev_sync_changes_tenant ON sync_changes(tenant_id);
 
 -- ============================================================
 -- Scheduling (invitations / replies / cancellations outbox)
 -- ============================================================
-CREATE TABLE IF NOT EXISTS caldev_scheduling_messages (
+CREATE TABLE IF NOT EXISTS scheduling_messages (
     id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     tenant_id       INTEGER NOT NULL, -- references mail_accounts(id)
     sender_id       INTEGER NOT NULL, -- references mail_accounts(id)
@@ -213,15 +208,15 @@ CREATE TABLE IF NOT EXISTS caldev_scheduling_messages (
     sent_at         TIMESTAMPTZ
 );
 
-CREATE INDEX IF NOT EXISTS idx_caldev_scheduling_tenant ON caldev_scheduling_messages(tenant_id);
-CREATE INDEX IF NOT EXISTS idx_caldev_scheduling_sender ON caldev_scheduling_messages(sender_id);
-CREATE INDEX IF NOT EXISTS idx_caldev_scheduling_status ON caldev_scheduling_messages(status);
-CREATE INDEX IF NOT EXISTS idx_caldev_scheduling_event ON caldev_scheduling_messages(event_uid);
+CREATE INDEX IF NOT EXISTS idx_caldev_scheduling_tenant ON scheduling_messages(tenant_id);
+CREATE INDEX IF NOT EXISTS idx_caldev_scheduling_sender ON scheduling_messages(sender_id);
+CREATE INDEX IF NOT EXISTS idx_caldev_scheduling_status ON scheduling_messages(status);
+CREATE INDEX IF NOT EXISTS idx_caldev_scheduling_event ON scheduling_messages(event_uid);
 
 -- ============================================================
 -- Reminder deliveries: dedup log so a reminder milestone is delivered at most once
 -- ============================================================
-CREATE TABLE IF NOT EXISTS caldev_reminder_deliveries (
+CREATE TABLE IF NOT EXISTS reminder_deliveries (
     id                BIGSERIAL PRIMARY KEY,
     tenant_id         INTEGER NOT NULL,
     event_uid         VARCHAR(512) NOT NULL,
@@ -234,12 +229,12 @@ CREATE TABLE IF NOT EXISTS caldev_reminder_deliveries (
 );
 
 CREATE INDEX IF NOT EXISTS idx_reminder_deliveries_lookup
-ON caldev_reminder_deliveries(event_uid, recurrence_id, recipient_email, milestone_minutes);
+ON reminder_deliveries(event_uid, recurrence_id, recipient_email, milestone_minutes);
 
 -- ============================================================
 -- WebDAV locks (LOCK / UNLOCK)
 -- ============================================================
-CREATE TABLE IF NOT EXISTS caldev_locks (
+CREATE TABLE IF NOT EXISTS locks (
     id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     tenant_id       INTEGER NOT NULL, -- references mail_accounts(id)
     resource_path   VARCHAR(2048) NOT NULL,
@@ -253,16 +248,16 @@ CREATE TABLE IF NOT EXISTS caldev_locks (
     expires_at      TIMESTAMPTZ NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_caldev_locks_resource ON caldev_locks(resource_path);
-CREATE INDEX IF NOT EXISTS idx_caldev_locks_token ON caldev_locks(lock_token);
-CREATE INDEX IF NOT EXISTS idx_caldev_locks_expires ON caldev_locks(expires_at);
-CREATE INDEX IF NOT EXISTS idx_caldev_locks_tenant ON caldev_locks(tenant_id);
+CREATE INDEX IF NOT EXISTS idx_caldev_locks_resource ON locks(resource_path);
+CREATE INDEX IF NOT EXISTS idx_caldev_locks_token ON locks(lock_token);
+CREATE INDEX IF NOT EXISTS idx_caldev_locks_expires ON locks(expires_at);
+CREATE INDEX IF NOT EXISTS idx_caldev_locks_tenant ON locks(tenant_id);
 
 -- ============================================================
 -- JMAP state. Only 'Calendar' is stored here (kept by trigger); the 'CalendarEvent' state is
--- MAX(caldev_sync_changes.id) for the tenant.
+-- MAX(sync_changes.id) for the tenant.
 -- ============================================================
-CREATE TABLE IF NOT EXISTS caldev_jmap_states (
+CREATE TABLE IF NOT EXISTS jmap_states (
     id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     tenant_id       INTEGER NOT NULL, -- references mail_accounts(id)
     user_id         INTEGER NOT NULL, -- references mail_accounts(id)
@@ -272,13 +267,13 @@ CREATE TABLE IF NOT EXISTS caldev_jmap_states (
     UNIQUE(tenant_id, user_id, entity_type)
 );
 
-CREATE INDEX IF NOT EXISTS idx_caldev_jmap_states_user ON caldev_jmap_states(user_id);
-CREATE INDEX IF NOT EXISTS idx_caldev_jmap_states_tenant ON caldev_jmap_states(tenant_id);
+CREATE INDEX IF NOT EXISTS idx_caldev_jmap_states_user ON jmap_states(user_id);
+CREATE INDEX IF NOT EXISTS idx_caldev_jmap_states_tenant ON jmap_states(tenant_id);
 
 -- ============================================================
 -- Background jobs (audit trail; the actual queue is in Valkey)
 -- ============================================================
-CREATE TABLE IF NOT EXISTS caldev_job_history (
+CREATE TABLE IF NOT EXISTS job_history (
     id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     job_type        VARCHAR(64) NOT NULL,
     payload         JSONB NOT NULL DEFAULT '{}',
@@ -288,18 +283,18 @@ CREATE TABLE IF NOT EXISTS caldev_job_history (
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX IF NOT EXISTS idx_caldev_job_history_type ON caldev_job_history(job_type);
-CREATE INDEX IF NOT EXISTS idx_caldev_job_history_status ON caldev_job_history(status);
-CREATE INDEX IF NOT EXISTS idx_caldev_job_history_created ON caldev_job_history(created_at);
+CREATE INDEX IF NOT EXISTS idx_caldev_job_history_type ON job_history(job_type);
+CREATE INDEX IF NOT EXISTS idx_caldev_job_history_status ON job_history(status);
+CREATE INDEX IF NOT EXISTS idx_caldev_job_history_created ON job_history(created_at);
 
 -- ============================================================
 -- Calendar subscriptions (external ICS feeds)
 -- ============================================================
-CREATE TABLE IF NOT EXISTS caldev_calendar_subscriptions (
+CREATE TABLE IF NOT EXISTS calendar_subscriptions (
     id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     tenant_id       INTEGER NOT NULL, -- references mail_accounts(id)
     user_id         INTEGER NOT NULL, -- references mail_accounts(id)
-    calendar_id     UUID NOT NULL REFERENCES caldev_calendars(id) ON DELETE CASCADE,
+    calendar_id     UUID NOT NULL REFERENCES calendars(id) ON DELETE CASCADE,
 
     -- Source configuration
     source_type     VARCHAR(32) NOT NULL DEFAULT 'ics_url',   -- ics_url, google, outlook
@@ -325,15 +320,15 @@ CREATE TABLE IF NOT EXISTS caldev_calendar_subscriptions (
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX IF NOT EXISTS idx_caldev_subscriptions_tenant ON caldev_calendar_subscriptions(tenant_id);
-CREATE INDEX IF NOT EXISTS idx_caldev_subscriptions_user ON caldev_calendar_subscriptions(user_id);
-CREATE INDEX IF NOT EXISTS idx_caldev_subscriptions_calendar ON caldev_calendar_subscriptions(calendar_id);
-CREATE INDEX IF NOT EXISTS idx_caldev_subscriptions_enabled ON caldev_calendar_subscriptions(is_enabled, last_synced_at);
+CREATE INDEX IF NOT EXISTS idx_caldev_subscriptions_tenant ON calendar_subscriptions(tenant_id);
+CREATE INDEX IF NOT EXISTS idx_caldev_subscriptions_user ON calendar_subscriptions(user_id);
+CREATE INDEX IF NOT EXISTS idx_caldev_subscriptions_calendar ON calendar_subscriptions(calendar_id);
+CREATE INDEX IF NOT EXISTS idx_caldev_subscriptions_enabled ON calendar_subscriptions(is_enabled, last_synced_at);
 
 -- ============================================================
 -- Sharing: availability (free/busy only) and read-only calendar shares
 -- ============================================================
-CREATE TABLE IF NOT EXISTS caldev_availability_shares (
+CREATE TABLE IF NOT EXISTS availability_shares (
     owner_user_id   INTEGER NOT NULL,
     grantee_user_id INTEGER NOT NULL,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -341,10 +336,10 @@ CREATE TABLE IF NOT EXISTS caldev_availability_shares (
     CHECK (owner_user_id <> grantee_user_id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_caldev_avail_shares_grantee ON caldev_availability_shares (grantee_user_id);
+CREATE INDEX IF NOT EXISTS idx_caldev_avail_shares_grantee ON availability_shares (grantee_user_id);
 
-CREATE TABLE IF NOT EXISTS caldev_calendar_shares (
-    calendar_id     UUID NOT NULL REFERENCES caldev_calendars(id) ON DELETE CASCADE,
+CREATE TABLE IF NOT EXISTS calendar_shares (
+    calendar_id     UUID NOT NULL REFERENCES calendars(id) ON DELETE CASCADE,
     owner_user_id   INTEGER NOT NULL,
     grantee_user_id INTEGER NOT NULL,
     privilege       VARCHAR(16) NOT NULL DEFAULT 'read' CHECK (privilege IN ('read')),
@@ -353,15 +348,15 @@ CREATE TABLE IF NOT EXISTS caldev_calendar_shares (
     CHECK (owner_user_id <> grantee_user_id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_caldev_calendar_shares_grantee ON caldev_calendar_shares (grantee_user_id);
-CREATE INDEX IF NOT EXISTS idx_caldev_calendar_shares_owner ON caldev_calendar_shares (owner_user_id);
+CREATE INDEX IF NOT EXISTS idx_caldev_calendar_shares_grantee ON calendar_shares (grantee_user_id);
+CREATE INDEX IF NOT EXISTS idx_caldev_calendar_shares_owner ON calendar_shares (owner_user_id);
 
 -- ============================================================
--- Calendar BYO SMTP (005): outbound mail settings per calendar, password encrypted (AES-256-GCM)
+-- Calendar BYO SMTP: outbound mail settings per calendar, password encrypted (AES-256-GCM)
 -- ============================================================
-CREATE TABLE IF NOT EXISTS caldev_calendar_smtp (
+CREATE TABLE IF NOT EXISTS calendar_smtp (
     id                  UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    calendar_id         UUID NOT NULL REFERENCES caldev_calendars(id) ON DELETE CASCADE,
+    calendar_id         UUID NOT NULL REFERENCES calendars(id) ON DELETE CASCADE,
     tenant_id           INTEGER NOT NULL,
     user_id             INTEGER NOT NULL,
     host                VARCHAR(255) NOT NULL,
@@ -381,9 +376,9 @@ CREATE TABLE IF NOT EXISTS caldev_calendar_smtp (
 );
 
 -- (redundant with uq_calendar_smtp's own index; kept so a fresh database matches a migrated one)
-CREATE INDEX IF NOT EXISTS idx_calendar_smtp_calendar ON caldev_calendar_smtp(calendar_id);
-CREATE INDEX IF NOT EXISTS idx_calendar_smtp_tenant ON caldev_calendar_smtp(tenant_id);
-CREATE INDEX IF NOT EXISTS idx_calendar_smtp_user ON caldev_calendar_smtp(user_id);
+CREATE INDEX IF NOT EXISTS idx_calendar_smtp_calendar ON calendar_smtp(calendar_id);
+CREATE INDEX IF NOT EXISTS idx_calendar_smtp_tenant ON calendar_smtp(tenant_id);
+CREATE INDEX IF NOT EXISTS idx_calendar_smtp_user ON calendar_smtp(user_id);
 
 -- ============================================================
 -- Functions
@@ -396,22 +391,22 @@ BEGIN
     NEW.updated_at = NOW();
     RETURN NEW;
 END;
-$$ LANGUAGE plpgsql;
+$$ LANGUAGE plpgsql SET search_path = caldev, public;
 
 -- Housekeeping, called by background jobs
 CREATE OR REPLACE FUNCTION caldev_cleanup_job_history()
 RETURNS void AS $$
 BEGIN
-    DELETE FROM caldev_job_history WHERE created_at < NOW() - INTERVAL '7 days';
+    DELETE FROM job_history WHERE created_at < NOW() - INTERVAL '7 days';
 END;
-$$ LANGUAGE plpgsql;
+$$ LANGUAGE plpgsql SET search_path = caldev, public;
 
 CREATE OR REPLACE FUNCTION caldev_cleanup_expired_locks()
 RETURNS void AS $$
 BEGIN
-    DELETE FROM caldev_locks WHERE expires_at < NOW();
+    DELETE FROM locks WHERE expires_at < NOW();
 END;
-$$ LANGUAGE plpgsql;
+$$ LANGUAGE plpgsql SET search_path = caldev, public;
 
 -- Event change log. Bumps the calendar's ctag/sync_token and records one change row. Does nothing
 -- when the calendar itself is being deleted (a calendar delete cascades to its events).
@@ -421,7 +416,7 @@ RETURNS void AS $$
 DECLARE
     tok TEXT;
 BEGIN
-    UPDATE caldev_calendars
+    UPDATE calendars
     SET ctag = encode(digest(uuid_generate_v4()::text, 'sha256'), 'hex'),
         sync_token = 'http://cal.example.com/sync/' || encode(digest(NOW()::text || uuid_generate_v4()::text, 'sha256'), 'hex')
     WHERE id = p_calendar
@@ -431,12 +426,12 @@ BEGIN
         RETURN; -- the calendar itself is being deleted (cascade): there is nothing left to sync
     END IF;
 
-    INSERT INTO caldev_sync_changes (tenant_id, calendar_id, event_uid, recurrence_id, event_id, change_type, sync_token)
+    INSERT INTO sync_changes (tenant_id, calendar_id, event_uid, recurrence_id, event_id, change_type, sync_token)
     VALUES (p_tenant, p_calendar, p_uid, COALESCE(p_recurrence_id, ''), p_event_id, p_change, tok);
 END;
-$$ LANGUAGE plpgsql;
+$$ LANGUAGE plpgsql SET search_path = caldev, public;
 
--- Trigger function for caldev_events. The per-tenant advisory lock is held until commit, so a
+-- Trigger function for events. The per-tenant advisory lock is held until commit, so a
 -- tenant's change rows get their ids in commit order (the JMAP state is MAX(id)). Moving an event
 -- to another calendar logs 'deleted' for the old calendar and 'created' for the new one.
 CREATE OR REPLACE FUNCTION caldev_update_calendar_ctag()
@@ -458,7 +453,7 @@ BEGIN
 
     RETURN NULL; -- AFTER trigger: the return value is ignored
 END;
-$$ LANGUAGE plpgsql;
+$$ LANGUAGE plpgsql SET search_path = caldev, public;
 
 -- JMAP "Calendar" state: bumped only when calendar metadata changes (not when the ctag/sync_token
 -- trigger touches the row after an event write).
@@ -474,7 +469,7 @@ BEGIN
         t := NEW.tenant_id; u := NEW.user_id;
     END IF;
 
-    INSERT INTO caldev_jmap_states (id, tenant_id, user_id, entity_type, state, updated_at)
+    INSERT INTO jmap_states (id, tenant_id, user_id, entity_type, state, updated_at)
     VALUES (uuid_generate_v4(), t, u, 'Calendar',
             encode(digest(NOW()::text || uuid_generate_v4()::text, 'sha256'), 'hex'), NOW())
     ON CONFLICT (tenant_id, user_id, entity_type)
@@ -482,7 +477,7 @@ BEGIN
 
     RETURN NULL;
 END;
-$$ LANGUAGE plpgsql;
+$$ LANGUAGE plpgsql SET search_path = caldev, public;
 
 -- Realtime change feed: every write that matters to a live UI emits a NOTIFY on channel
 -- 'caldev_changes'; the server LISTENs and fans out over SSE.
@@ -495,7 +490,7 @@ DECLARE
     uid  INTEGER;
     tid  INTEGER;
 BEGIN
-    IF TG_TABLE_NAME = 'caldev_events' THEN kind := 'event'; ELSE kind := 'calendar'; END IF;
+    IF TG_TABLE_NAME = 'events' THEN kind := 'event'; ELSE kind := 'calendar'; END IF;
     IF TG_OP = 'DELETE' THEN
         uid := OLD.user_id; tid := OLD.tenant_id;
     ELSE
@@ -504,7 +499,7 @@ BEGIN
     PERFORM pg_notify('caldev_changes', json_build_object('k', kind, 'u', uid, 't', tid)::text);
     RETURN NULL;
 END;
-$$ LANGUAGE plpgsql;
+$$ LANGUAGE plpgsql SET search_path = caldev, public;
 
 CREATE OR REPLACE FUNCTION caldev_notify_share_change()
 RETURNS TRIGGER AS $$
@@ -513,7 +508,7 @@ DECLARE
     oid  INTEGER;
     gid  INTEGER;
 BEGIN
-    IF TG_TABLE_NAME = 'caldev_availability_shares' THEN kind := 'avail_share'; ELSE kind := 'cal_share'; END IF;
+    IF TG_TABLE_NAME = 'availability_shares' THEN kind := 'avail_share'; ELSE kind := 'cal_share'; END IF;
     IF TG_OP = 'DELETE' THEN
         oid := OLD.owner_user_id; gid := OLD.grantee_user_id;
     ELSE
@@ -522,94 +517,58 @@ BEGIN
     PERFORM pg_notify('caldev_changes', json_build_object('k', kind, 'o', oid, 'g', gid)::text);
     RETURN NULL;
 END;
-$$ LANGUAGE plpgsql;
+$$ LANGUAGE plpgsql SET search_path = caldev, public;
 
 -- ============================================================
 -- Triggers
 -- ============================================================
 
 -- updated_at
-DROP TRIGGER IF EXISTS trg_caldev_calendars_updated_at ON caldev_calendars;
-CREATE TRIGGER trg_caldev_calendars_updated_at BEFORE UPDATE ON caldev_calendars
+CREATE OR REPLACE TRIGGER trg_caldev_calendars_updated_at BEFORE UPDATE ON calendars
     FOR EACH ROW EXECUTE FUNCTION caldev_update_updated_at_column();
 
-DROP TRIGGER IF EXISTS trg_caldev_events_updated_at ON caldev_events;
-CREATE TRIGGER trg_caldev_events_updated_at BEFORE UPDATE ON caldev_events
+CREATE OR REPLACE TRIGGER trg_caldev_events_updated_at BEFORE UPDATE ON events
     FOR EACH ROW EXECUTE FUNCTION caldev_update_updated_at_column();
 
-DROP TRIGGER IF EXISTS trg_caldev_subscriptions_updated_at ON caldev_calendar_subscriptions;
-CREATE TRIGGER trg_caldev_subscriptions_updated_at BEFORE UPDATE ON caldev_calendar_subscriptions
+CREATE OR REPLACE TRIGGER trg_caldev_subscriptions_updated_at BEFORE UPDATE ON calendar_subscriptions
     FOR EACH ROW EXECUTE FUNCTION caldev_update_updated_at_column();
 
 -- ctag / sync change log on every event write
-DROP TRIGGER IF EXISTS trg_caldev_events_ctag_insert ON caldev_events;
-CREATE TRIGGER trg_caldev_events_ctag_insert AFTER INSERT ON caldev_events
+CREATE OR REPLACE TRIGGER trg_caldev_events_ctag_insert AFTER INSERT ON events
     FOR EACH ROW EXECUTE FUNCTION caldev_update_calendar_ctag();
 
-DROP TRIGGER IF EXISTS trg_caldev_events_ctag_update ON caldev_events;
-CREATE TRIGGER trg_caldev_events_ctag_update AFTER UPDATE ON caldev_events
+CREATE OR REPLACE TRIGGER trg_caldev_events_ctag_update AFTER UPDATE ON events
     FOR EACH ROW EXECUTE FUNCTION caldev_update_calendar_ctag();
 
-DROP TRIGGER IF EXISTS trg_caldev_events_ctag_delete ON caldev_events;
-CREATE TRIGGER trg_caldev_events_ctag_delete AFTER DELETE ON caldev_events
+CREATE OR REPLACE TRIGGER trg_caldev_events_ctag_delete AFTER DELETE ON events
     FOR EACH ROW EXECUTE FUNCTION caldev_update_calendar_ctag();
 
 -- JMAP "Calendar" state
-DROP TRIGGER IF EXISTS trg_caldev_calendars_state_ins ON caldev_calendars;
-CREATE TRIGGER trg_caldev_calendars_state_ins AFTER INSERT ON caldev_calendars
+CREATE OR REPLACE TRIGGER trg_caldev_calendars_state_ins AFTER INSERT ON calendars
     FOR EACH ROW EXECUTE FUNCTION caldev_update_calendar_state();
 
-DROP TRIGGER IF EXISTS trg_caldev_calendars_state_upd ON caldev_calendars;
-CREATE TRIGGER trg_caldev_calendars_state_upd
+CREATE OR REPLACE TRIGGER trg_caldev_calendars_state_upd
     AFTER UPDATE OF name, description, color, timezone, sort_order, is_default, is_visible, is_readonly
-    ON caldev_calendars
+    ON calendars
     FOR EACH ROW EXECUTE FUNCTION caldev_update_calendar_state();
 
-DROP TRIGGER IF EXISTS trg_caldev_calendars_state_del ON caldev_calendars;
-CREATE TRIGGER trg_caldev_calendars_state_del AFTER DELETE ON caldev_calendars
+CREATE OR REPLACE TRIGGER trg_caldev_calendars_state_del AFTER DELETE ON calendars
     FOR EACH ROW EXECUTE FUNCTION caldev_update_calendar_state();
 
 -- realtime NOTIFY
-DROP TRIGGER IF EXISTS trg_caldev_events_notify ON caldev_events;
-CREATE TRIGGER trg_caldev_events_notify AFTER INSERT OR UPDATE OR DELETE ON caldev_events
+CREATE OR REPLACE TRIGGER trg_caldev_events_notify AFTER INSERT OR UPDATE OR DELETE ON events
     FOR EACH ROW EXECUTE FUNCTION caldev_notify_owner_change();
 
-DROP TRIGGER IF EXISTS trg_caldev_calendars_notify_ins ON caldev_calendars;
-CREATE TRIGGER trg_caldev_calendars_notify_ins AFTER INSERT OR DELETE ON caldev_calendars
+CREATE OR REPLACE TRIGGER trg_caldev_calendars_notify_ins AFTER INSERT OR DELETE ON calendars
     FOR EACH ROW EXECUTE FUNCTION caldev_notify_owner_change();
 
-DROP TRIGGER IF EXISTS trg_caldev_calendars_notify_upd ON caldev_calendars;
-CREATE TRIGGER trg_caldev_calendars_notify_upd
+CREATE OR REPLACE TRIGGER trg_caldev_calendars_notify_upd
     AFTER UPDATE OF name, description, color, timezone, sort_order, is_default, is_visible, is_readonly
-    ON caldev_calendars
+    ON calendars
     FOR EACH ROW EXECUTE FUNCTION caldev_notify_owner_change();
 
-DROP TRIGGER IF EXISTS trg_caldev_avail_shares_notify ON caldev_availability_shares;
-CREATE TRIGGER trg_caldev_avail_shares_notify AFTER INSERT OR DELETE ON caldev_availability_shares
+CREATE OR REPLACE TRIGGER trg_caldev_avail_shares_notify AFTER INSERT OR DELETE ON availability_shares
     FOR EACH ROW EXECUTE FUNCTION caldev_notify_share_change();
 
-DROP TRIGGER IF EXISTS trg_caldev_cal_shares_notify ON caldev_calendar_shares;
-CREATE TRIGGER trg_caldev_cal_shares_notify AFTER INSERT OR DELETE ON caldev_calendar_shares
+CREATE OR REPLACE TRIGGER trg_caldev_cal_shares_notify AFTER INSERT OR DELETE ON calendar_shares
     FOR EACH ROW EXECUTE FUNCTION caldev_notify_share_change();
-
--- ============================================================
--- Migration tracking: mark 001..008 as applied (same table and file names the server uses), so the
--- server skips them and runs only migrations added after this file was written.
--- ============================================================
-CREATE TABLE IF NOT EXISTS caldev_migrations (
-    id SERIAL PRIMARY KEY,
-    filename VARCHAR(512) NOT NULL UNIQUE,
-    applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-INSERT INTO caldev_migrations (filename) VALUES
-    ('migrations/001_init.sql'),
-    ('migrations/002_sharing_realtime.sql'),
-    ('migrations/003_recurrence_overrides.sql'),
-    ('migrations/004_reminders.sql'),
-    ('migrations/005_calendar_byo_smtp.sql'),
-    ('migrations/006_change_log_fixes.sql'),
-    ('migrations/007_onboarding_api_keys.sql'),
-    ('migrations/008_mail_accounts_email_lower.sql'),
-    ('migrations/010_caldev_mail_accounts.sql')
-ON CONFLICT (filename) DO NOTHING;

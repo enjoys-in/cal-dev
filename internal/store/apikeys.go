@@ -67,7 +67,7 @@ func (s *Store) CreateAPIKey(ctx context.Context, ownerEmail, label string, crea
 		creator = *createdBy
 	}
 	k, err := scanAPIKey(s.db.QueryRowContext(ctx,
-		`INSERT INTO caldev_api_keys (owner_email, domain, label, key_prefix, key_hash, created_by)
+		`INSERT INTO api_keys (owner_email, domain, label, key_prefix, key_hash, created_by)
 		 VALUES ($1, $2, $3, $4, $5, $6) RETURNING `+apiKeyColumns,
 		ownerEmail, domain, strings.TrimSpace(label), key[:len(apiKeyPrefix)+6], HashAPIKey(key), creator))
 	if err != nil {
@@ -79,7 +79,7 @@ func (s *Store) CreateAPIKey(ctx context.Context, ownerEmail, label string, crea
 // GetActiveAPIKey returns the non-revoked key matching the given key text, or nil.
 func (s *Store) GetActiveAPIKey(ctx context.Context, key string) (*models.APIKey, error) {
 	k, err := scanAPIKey(s.db.QueryRowContext(ctx,
-		`SELECT `+apiKeyColumns+` FROM caldev_api_keys WHERE key_hash = $1 AND revoked_at IS NULL`,
+		`SELECT `+apiKeyColumns+` FROM api_keys WHERE key_hash = $1 AND revoked_at IS NULL`,
 		HashAPIKey(key)))
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -89,13 +89,13 @@ func (s *Store) GetActiveAPIKey(ctx context.Context, key string) (*models.APIKey
 
 // TouchAPIKey records that a key was just used.
 func (s *Store) TouchAPIKey(ctx context.Context, id string) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE caldev_api_keys SET last_used_at = NOW() WHERE id = $1`, id)
+	_, err := s.db.ExecContext(ctx, `UPDATE api_keys SET last_used_at = NOW() WHERE id = $1`, id)
 	return err
 }
 
 // ListAPIKeys returns keys, newest first: all of them when ownerEmail is "", else that owner's.
 func (s *Store) ListAPIKeys(ctx context.Context, ownerEmail string) ([]*models.APIKey, error) {
-	query := `SELECT ` + apiKeyColumns + ` FROM caldev_api_keys`
+	query := `SELECT ` + apiKeyColumns + ` FROM api_keys`
 	var args []any
 	if ownerEmail != "" {
 		query += ` WHERE lower(owner_email) = lower($1)`
@@ -120,7 +120,7 @@ func (s *Store) ListAPIKeys(ctx context.Context, ownerEmail string) ([]*models.A
 // RevokeAPIKey revokes a key; when ownerEmail is not "", only a key of that owner. It reports
 // whether a key was revoked (false: no such active key).
 func (s *Store) RevokeAPIKey(ctx context.Context, id, ownerEmail string) (bool, error) {
-	query := `UPDATE caldev_api_keys SET revoked_at = NOW() WHERE id = $1 AND revoked_at IS NULL`
+	query := `UPDATE api_keys SET revoked_at = NOW() WHERE id = $1 AND revoked_at IS NULL`
 	args := []any{id}
 	if ownerEmail != "" {
 		query += ` AND lower(owner_email) = lower($2)`

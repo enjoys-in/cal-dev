@@ -17,7 +17,7 @@ func (s *Store) RecordReminderDelivery(ctx context.Context, tenantID int, eventU
 	if channel == "" {
 		channel = "push"
 	}
-	query := `INSERT INTO caldev_reminder_deliveries 
+	query := `INSERT INTO reminder_deliveries 
 		(tenant_id, event_uid, recurrence_id, recipient_email, milestone_minutes, channel)
 		VALUES ($1, $2, $3, $4, $5, $6)
 		ON CONFLICT (event_uid, recurrence_id, recipient_email, milestone_minutes, channel) DO NOTHING
@@ -49,7 +49,7 @@ func (s *Store) QueryUpcomingEventsForReminders(ctx context.Context, from, to ti
 	// Recurring masters: skip series that start after the window or whose UNTIL date has passed
 	// (UNTIL's date part is compared one day early so a local-time UNTIL is never cut short).
 	query := `SELECT ` + reminderColumns + `
-		FROM caldev_events
+		FROM events
 		WHERE status != 'CANCELLED'
 		  AND ((dtstart >= $1 AND dtstart <= $2)
 		    OR (recurrence_rule != '' AND recurrence_id = '' AND dtstart <= $2
@@ -86,9 +86,9 @@ func (s *Store) QueryUpcomingEventsForReminders(ctx context.Context, from, to ti
 	}
 
 	rows, err = s.db.QueryContext(ctx, `SELECT `+reminderColumns+`
-		FROM caldev_events
+		FROM events
 		WHERE recurrence_id != '' AND (calendar_id, uid) IN (
-		  SELECT calendar_id, uid FROM caldev_events WHERE id = ANY($1::uuid[]))`, pq.Array(masterIDs))
+		  SELECT calendar_id, uid FROM events WHERE id = ANY($1::uuid[]))`, pq.Array(masterIDs))
 	if err != nil {
 		return nil, fmt.Errorf("store: query overrides for reminders: %w", err)
 	}
@@ -111,7 +111,7 @@ func (s *Store) ReleaseReminderDelivery(ctx context.Context, eventUID, recurrenc
 	if channel == "" {
 		channel = "push"
 	}
-	_, err := s.db.ExecContext(ctx, `DELETE FROM caldev_reminder_deliveries
+	_, err := s.db.ExecContext(ctx, `DELETE FROM reminder_deliveries
 		WHERE event_uid = $1 AND recurrence_id = $2 AND recipient_email = $3 AND milestone_minutes = $4 AND channel = $5`,
 		eventUID, recurrenceID, recipientEmail, milestoneMinutes, channel)
 	if err != nil {

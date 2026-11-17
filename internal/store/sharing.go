@@ -31,7 +31,7 @@ type SharedCalendar struct {
 // CreateAvailabilityShare lets grantee see owner's free/busy. Idempotent.
 func (s *Store) CreateAvailabilityShare(ctx context.Context, ownerID, granteeID int) error {
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO caldev_availability_shares (owner_user_id, grantee_user_id)
+		`INSERT INTO availability_shares (owner_user_id, grantee_user_id)
 		 VALUES ($1, $2) ON CONFLICT DO NOTHING`, ownerID, granteeID)
 	return err
 }
@@ -39,7 +39,7 @@ func (s *Store) CreateAvailabilityShare(ctx context.Context, ownerID, granteeID 
 // DeleteAvailabilityShare revokes a share. Returns whether a row was removed.
 func (s *Store) DeleteAvailabilityShare(ctx context.Context, ownerID, granteeID int) (bool, error) {
 	res, err := s.db.ExecContext(ctx,
-		`DELETE FROM caldev_availability_shares WHERE owner_user_id = $1 AND grantee_user_id = $2`,
+		`DELETE FROM availability_shares WHERE owner_user_id = $1 AND grantee_user_id = $2`,
 		ownerID, granteeID)
 	if err != nil {
 		return false, err
@@ -52,7 +52,7 @@ func (s *Store) DeleteAvailabilityShare(ctx context.Context, ownerID, granteeID 
 func (s *Store) HasAvailabilityShare(ctx context.Context, ownerID, granteeID int) (bool, error) {
 	var ok bool
 	err := s.db.QueryRowContext(ctx,
-		`SELECT EXISTS(SELECT 1 FROM caldev_availability_shares WHERE owner_user_id = $1 AND grantee_user_id = $2)`,
+		`SELECT EXISTS(SELECT 1 FROM availability_shares WHERE owner_user_id = $1 AND grantee_user_id = $2)`,
 		ownerID, granteeID).Scan(&ok)
 	return ok, err
 }
@@ -61,7 +61,7 @@ func (s *Store) HasAvailabilityShare(ctx context.Context, ownerID, granteeID int
 func (s *Store) ListAvailabilitySharedByOwner(ctx context.Context, ownerID int) ([]ShareInfo, error) {
 	return s.queryShareInfo(ctx,
 		`SELECT sh.grantee_user_id, m.email, COALESCE(m.name, ''), sh.created_at
-		 FROM caldev_availability_shares sh
+		 FROM availability_shares sh
 		 JOIN mail_accounts m ON m.id = sh.grantee_user_id
 		 WHERE sh.owner_user_id = $1 ORDER BY m.email`, ownerID)
 }
@@ -70,7 +70,7 @@ func (s *Store) ListAvailabilitySharedByOwner(ctx context.Context, ownerID int) 
 func (s *Store) ListAvailabilitySharedWith(ctx context.Context, granteeID int) ([]ShareInfo, error) {
 	return s.queryShareInfo(ctx,
 		`SELECT sh.owner_user_id, m.email, COALESCE(m.name, ''), sh.created_at
-		 FROM caldev_availability_shares sh
+		 FROM availability_shares sh
 		 JOIN mail_accounts m ON m.id = sh.owner_user_id
 		 WHERE sh.grantee_user_id = $1 ORDER BY m.email`, granteeID)
 }
@@ -97,7 +97,7 @@ func (s *Store) ListOrgMembers(ctx context.Context, tenantName string, excludeID
 // CreateCalendarShare shares a calendar read-only. Caller must have verified ownership.
 func (s *Store) CreateCalendarShare(ctx context.Context, calendarID string, ownerID, granteeID int) error {
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO caldev_calendar_shares (calendar_id, owner_user_id, grantee_user_id, privilege)
+		`INSERT INTO calendar_shares (calendar_id, owner_user_id, grantee_user_id, privilege)
 		 VALUES ($1, $2, $3, 'read') ON CONFLICT DO NOTHING`, calendarID, ownerID, granteeID)
 	return err
 }
@@ -105,7 +105,7 @@ func (s *Store) CreateCalendarShare(ctx context.Context, calendarID string, owne
 // DeleteCalendarShare revokes a calendar share. Returns whether a row was removed.
 func (s *Store) DeleteCalendarShare(ctx context.Context, calendarID string, ownerID, granteeID int) (bool, error) {
 	res, err := s.db.ExecContext(ctx,
-		`DELETE FROM caldev_calendar_shares WHERE calendar_id = $1 AND owner_user_id = $2 AND grantee_user_id = $3`,
+		`DELETE FROM calendar_shares WHERE calendar_id = $1 AND owner_user_id = $2 AND grantee_user_id = $3`,
 		calendarID, ownerID, granteeID)
 	if err != nil {
 		return false, err
@@ -118,7 +118,7 @@ func (s *Store) DeleteCalendarShare(ctx context.Context, calendarID string, owne
 func (s *Store) ListCalendarShares(ctx context.Context, calendarID string, ownerID int) ([]ShareInfo, error) {
 	return s.queryShareInfo(ctx,
 		`SELECT sh.grantee_user_id, m.email, COALESCE(m.name, ''), sh.created_at
-		 FROM caldev_calendar_shares sh
+		 FROM calendar_shares sh
 		 JOIN mail_accounts m ON m.id = sh.grantee_user_id
 		 WHERE sh.calendar_id = $1 AND sh.owner_user_id = $2 ORDER BY m.email`, calendarID, ownerID)
 }
@@ -140,8 +140,8 @@ func scanSharedCalendar(row interface{ Scan(...any) error }) (*SharedCalendar, e
 func (s *Store) ListCalendarsSharedWith(ctx context.Context, granteeID int) ([]*SharedCalendar, error) {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT `+sharedCalendarCols+`
-		 FROM caldev_calendar_shares sh
-		 JOIN caldev_calendars c ON c.id = sh.calendar_id
+		 FROM calendar_shares sh
+		 JOIN calendars c ON c.id = sh.calendar_id
 		 JOIN mail_accounts m ON m.id = c.user_id
 		 WHERE sh.grantee_user_id = $1 ORDER BY m.email, c.name`, granteeID)
 	if err != nil {
@@ -163,8 +163,8 @@ func (s *Store) ListCalendarsSharedWith(ctx context.Context, granteeID int) ([]*
 func (s *Store) GetCalendarSharedWith(ctx context.Context, granteeID int, calendarID string) (*SharedCalendar, error) {
 	row := s.db.QueryRowContext(ctx,
 		`SELECT `+sharedCalendarCols+`
-		 FROM caldev_calendar_shares sh
-		 JOIN caldev_calendars c ON c.id = sh.calendar_id
+		 FROM calendar_shares sh
+		 JOIN calendars c ON c.id = sh.calendar_id
 		 JOIN mail_accounts m ON m.id = c.user_id
 		 WHERE sh.grantee_user_id = $1 AND sh.calendar_id = $2`, granteeID, calendarID)
 	sc, err := scanSharedCalendar(row)
